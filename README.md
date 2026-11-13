@@ -10,8 +10,6 @@ FerriteMCU is a fully Rust-based native IDE intended to make Rust development fo
 
 The current application provides a project browser, code editor, syntax highlighting, terminal, Git diff and merge tools, and local history. It uses GPUI for its native interface.
 
-![FerriteMCU interface preview](assets/ferritemcu-preview.svg)
-
 ## ESP32 development
 
 Open a Cargo project to show the ESP workflow bar. FerriteMCU includes the upstream Rust libraries
