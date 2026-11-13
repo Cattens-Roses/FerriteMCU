@@ -154,6 +154,8 @@ version = "0.1.7"
 
 [dependencies.zip]
 version = "9.0.5"
+default-features = false
+features = ["deflate-flate2"]
 
 [dev-dependencies.assert_cmd]
 version = "2.2.2"

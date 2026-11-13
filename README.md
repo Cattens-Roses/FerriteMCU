@@ -2,13 +2,15 @@
 
 <img src="assets/logo.png" alt="FerriteMCU" width="112">
 
-[![Build](https://github.com/ganses-roses/FerriteMCU/actions/workflows/build.yml/badge.svg)](https://github.com/ganses-roses/FerriteMCU/actions/workflows/build.yml)
-[![Supply-chain checks](https://github.com/ganses-roses/FerriteMCU/actions/workflows/cargo-deny.yml/badge.svg)](https://github.com/ganses-roses/FerriteMCU/actions/workflows/cargo-deny.yml)
+[![Build](https://github.com/Cattens-Roses/FerriteMCU/actions/workflows/build.yml/badge.svg)](https://github.com/Cattens-Roses/FerriteMCU/actions/workflows/build.yml)
+[![Supply-chain checks](https://github.com/Cattens-Roses/FerriteMCU/actions/workflows/cargo-deny.yml/badge.svg)](https://github.com/Cattens-Roses/FerriteMCU/actions/workflows/cargo-deny.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
 FerriteMCU is a fully Rust-based native IDE intended to make Rust development for microcontrollers approachable, in the spirit of the Arduino IDE. ESP32 development is integrated in the project editor; Raspberry Pi Pico support is planned for a later release.
 
 The current application provides a project browser, code editor, syntax highlighting, terminal, Git diff and merge tools, and local history. It uses GPUI for its native interface.
+
+![FerriteMCU interface preview](assets/ferritemcu-preview.svg)
 
 ## ESP32 development
 
@@ -40,7 +42,7 @@ Install Rust 1.96 or newer with `rustup`, plus Git. The repository pins its tool
 Clone the repository and build the workspace:
 
 ```sh
-git clone https://github.com/ganses-roses/FerriteMCU.git
+git clone https://github.com/Cattens-Roses/FerriteMCU.git
 cd FerriteMCU
 cargo build --release
 ```

@@ -26,6 +26,11 @@ ignore = [
     # Revisit on the next gpui/wayland bump.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # probe-rs 0.23 requires espflash 2.1, which brings in xmas-elf 0.9.1. Audited both crates'
+    # source: neither calls the affected HashTable::get_bucket/get_chain API, so this specific
+    # out-of-bounds read is not reachable through FerriteMCU. Updating probe-rs currently
+    # conflicts with gpui 0.2.2's exact core-foundation pin; revisit on the gpui upgrade.
+    "RUSTSEC-2025-0018",
 ]
 
 [licenses]

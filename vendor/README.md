@@ -64,8 +64,10 @@ The downloader's HTTP, proxy, streaming, charset, and HTTP/2 features stay enabl
 toolchain behavior or installation logic is changed.
 
 The patch is confined to this crate's `Cargo.toml`; compare it with the official 0.19.0 crate
-manifest when upgrading espup. Remove the `espup` patch and vendored directory when upstream
-allows selecting a non-AWS-LC TLS provider without modifying the manifest.
+manifest when upgrading espup. The ZIP dependency also disables unused optional compression
+formats while keeping deflate support for downloaded toolchains. Remove the `espup` patch and
+vendored directory when upstream allows selecting a non-AWS-LC TLS provider without modifying
+the manifest and keeps ZIP features minimal.
 
 ## lzma-sys 0.1.20
 

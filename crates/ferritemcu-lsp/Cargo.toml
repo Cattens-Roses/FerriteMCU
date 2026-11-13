@@ -15,4 +15,6 @@ url = "2"
 ureq = "3"
 flate2 = "1"
 sha2 = "0.10"
-zip = { version = "2.4.2", default-features = false, features = ["deflate-flate2", "flate2"] }
+# 9.x fixes several ZIP extraction advisories in the 2.x line. Rust-analyzer
+# release archives use deflate; the rest of zip's optional formats are unnecessary.
+zip = { version = "9.0", default-features = false, features = ["deflate-flate2"] }

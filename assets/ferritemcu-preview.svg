@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="760" viewBox="0 0 1280 760" role="img" aria-labelledby="title desc">
+  <title id="title">FerriteMCU editor preview</title>
+  <desc id="desc">Dark native IDE layout showing the project tree, Rust editor, build and flash controls, terminal, and ready status.</desc>
+  <defs>
+    <linearGradient id="accent" x1="0" x2="1"><stop stop-color="#42d392"/><stop offset="1" stop-color="#24b879"/></linearGradient>
+    <style>
+      text{font-family:Inter,"Segoe UI",sans-serif;fill:#d8dee9}.muted{fill:#8993a5}.code{font-family:Consolas,"Cascadia Code",monospace;font-size:15px}.keyword{fill:#c792ea}.type{fill:#82aaff}.fn{fill:#8bd5ca}.string{fill:#c3e88d}.comment{fill:#697386}.line{fill:#596273;font-family:Consolas,monospace;font-size:13px}
+    </style>
+  </defs>
+  <rect width="1280" height="760" rx="12" fill="#111318"/>
+  <rect width="1280" height="48" rx="12" fill="#191c23"/><rect y="36" width="1280" height="12" fill="#191c23"/>
+  <circle cx="27" cy="24" r="10" fill="#25332e"/><path d="M22 24h10M27 19v10" stroke="#51d69a" stroke-width="2"/>
+  <text x="49" y="29" font-size="16" font-weight="600">FerriteMCU</text>
+  <text x="173" y="29" font-size="13" class="muted">⌄</text>
+  <rect x="1042" y="9" width="34" height="30" rx="8" fill="url(#accent)"/><path d="m1055 16 10 8-10 8z" fill="#10251c"/>
+  <text x="1088" y="29" font-size="14" class="muted">⌄</text><path d="M1127 16h19v14h-19zM1132 33h9" stroke="#aeb7c5" fill="none" stroke-width="1.5"/>
+  <path d="M1182 23h12M1220 17v12h12" stroke="#aeb7c5" stroke-width="1.5"/><path d="M1260 18l12 12m0-12-12 12" stroke="#aeb7c5" stroke-width="1.5"/>
+  <rect y="48" width="52" height="670" fill="#171a20"/><path d="M18 78h17v14H18zM18 82h17M22 75v5M31 75v5" stroke="#8f9bad" fill="none" stroke-width="1.5"/>
+  <path d="M19 125 26 119l7 6v12H19zM22 137v-7h8v7" stroke="#697587" fill="none" stroke-width="1.5"/>
+  <path d="M19 177a8 8 0 1 1 2 6m-2-5v5h5" stroke="#697587" fill="none" stroke-width="1.5"/>
+  <path d="M20 690h14M20 696h8" stroke="#697587" stroke-width="2"/>
+  <rect x="52" y="48" width="304" height="670" fill="#191c23"/><text x="74" y="83" font-size="12" class="muted" letter-spacing="1">EXPLORER</text>
+  <path d="m74 112 5 5 5-5" stroke="#8b96a7" fill="none"/><text x="92" y="121" font-size="14" font-weight="600">blinky</text>
+  <path d="m96 146 4 4 4-4" stroke="#8b96a7" fill="none"/><text x="113" y="155" font-size="14">src</text>
+  <rect x="78" y="165" width="258" height="34" rx="6" fill="#293c53"/><text x="113" y="187" font-size="14" fill="#f0f4fa">🦀  main.rs</text>
+  <text x="113" y="222" font-size="14" class="muted">⚙  Cargo.toml</text><text x="113" y="256" font-size="14" class="muted">🔒 Cargo.lock</text>
+  <rect x="370" y="58" width="190" height="38" rx="7" fill="#252a34"/><text x="389" y="82" font-size="14">🦀  main.rs</text><text x="534" y="82" font-size="14" class="muted">×</text>
+  <rect x="370" y="105" width="894" height="566" rx="8" fill="#15171d"/>
+  <rect x="370" y="105" width="894" height="34" rx="8" fill="#1b1e26"/><rect x="370" y="130" width="894" height="9" fill="#1b1e26"/>
+  <text x="393" y="128" font-size="12" class="muted">src/main.rs</text><text x="1197" y="128" font-size="12" class="muted">Rust</text>
+  <g class="code">
+    <text x="402" y="174" class="line">1</text><text x="442" y="174"><tspan class="keyword">use</tspan><tspan> esp_hal::{</tspan><tspan class="type">delay</tspan><tspan>::Delay, gpio::Output};</tspan></text>
+    <text x="402" y="204" class="line">2</text><text x="442" y="204"><tspan class="keyword">use</tspan><tspan> esp_hal::prelude::*;</tspan></text>
+    <text x="402" y="234" class="line">3</text>
+    <text x="402" y="264" class="line">4</text><text x="442" y="264"><tspan class="keyword">fn</tspan><tspan class="fn"> main</tspan><tspan>() -&gt; ! {</tspan></text>
+    <text x="402" y="294" class="line">5</text><text x="442" y="294">    <tspan class="keyword">let</tspan><tspan> peripherals = esp_hal::init(Default::default());</tspan></text>
+    <text x="402" y="324" class="line">6</text><text x="442" y="324">    <tspan class="keyword">let mut</tspan><tspan> led = Output::new(peripherals.GPIO2, Level::Low);</tspan></text>
+    <text x="402" y="354" class="line">7</text><text x="442" y="354">    <tspan class="keyword">let mut</tspan><tspan> delay = Delay::new();</tspan></text>
+    <text x="402" y="384" class="line">8</text>
+    <text x="402" y="414" class="line">9</text><text x="442" y="414">    <tspan class="keyword">loop</tspan><tspan> {</tspan></text>
+    <text x="402" y="444" class="line">10</text><text x="442" y="444">        led.toggle();</text>
+    <text x="402" y="474" class="line">11</text><text x="442" y="474">        delay.delay_millis(500);</text>
+    <text x="402" y="504" class="line">12</text><text x="442" y="504">    }</text>
+    <text x="402" y="534" class="line">13</text><text x="442" y="534">}</text>
+    <text x="402" y="594" class="line">14</text><text x="442" y="594" class="comment">// Build, flash, debug and serial output stay inside the IDE.</text>
+  </g>
+  <rect x="52" y="676" width="1212" height="42" fill="#1a1d24"/><path d="M52 676h1212" stroke="#2b303a"/>
+  <text x="70" y="702" font-size="12" class="muted">blinky  ›  src/main.rs</text><text x="1121" y="702" font-size="12" fill="#5bd59b">●  Ready</text><text x="1201" y="702" font-size="12" class="muted">Rust</text>
+  <text x="52" y="747" font-size="12" class="muted">FerriteMCU interface preview</text>
+</svg>
