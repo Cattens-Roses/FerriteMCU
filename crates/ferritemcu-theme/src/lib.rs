@@ -364,7 +364,7 @@ impl Default for Theme {
 }
 
 impl Theme {
-    /// **FerriteMCU Light** — light counterpart to the default dark palette. Surfaces per spec
+    /// **`FerriteMCU` Light** — light counterpart to the default dark palette. Surfaces per spec
     /// (`#F6F6F7` frame, white islands, `#1D1D1F` text); accents/status/syntax take their
     /// cues from the Hoxton Mix account-app palette (action blue `#1977EC`, brand purple
     /// `#A42F89`, success/danger, the `light*`/`dark*` greys). On-white-readable variants of
@@ -715,7 +715,7 @@ pub fn overlay() -> Overlay {
 
 /// How the terminal draws, laid over the theme for this run only like
 /// [`Overlay`] and never written to `theme.json`. Each `None` is the theme's own: so
-/// `TerminalLook::default()` is FerriteMCU's terminal, and Linux's Settings → Appearance → Terminal →
+/// `TerminalLook::default()` is `FerriteMCU`'s terminal, and Linux's Settings → Appearance → Terminal →
 /// "Your terminal" fills in what it could read from the user's own terminal app. The panel
 /// chrome around a terminal always keeps the theme.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -724,7 +724,7 @@ pub struct TerminalLook {
     pub background: Option<Rgba>,
     /// Default text; `None` = `text`.
     pub foreground: Option<Rgba>,
-    /// The 16 ANSI colours (0–7 normal, 8–15 bright); a `None` slot keeps FerriteMCU's own.
+    /// The 16 ANSI colours (0–7 normal, 8–15 bright); a `None` slot keeps `FerriteMCU`'s own.
     pub ansi: [Option<Rgba>; 16],
     /// Bold text in the default colour; `None` = the default colour.
     pub bold: Option<Rgba>,
@@ -823,7 +823,7 @@ pub mod font {
     pub struct Face {
         /// Family name, as the text system knows it.
         pub family: &'static str,
-        /// Size in px; `None` keeps FerriteMCU's size for the role.
+        /// Size in px; `None` keeps `FerriteMCU`'s size for the role.
         pub size: Option<f32>,
     }
 
