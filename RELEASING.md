@@ -13,7 +13,7 @@ FerriteMCU follows [Semantic Versioning](https://semver.org/) — `MAJOR.MINOR.P
    bumps `Cargo.toml` + `Cargo.lock`, updates `CHANGELOG.md`, and computes the next
    version from the commits since the last release.
 3. When you're ready to ship, **merge the release PR**. release-please then creates
-   the `vX.Y.Z` git tag and the GitHub Release.
+   the `ferritemcu-vX.Y.Z` git tag and the GitHub Release.
 4. In the same workflow run, the `build` job packages the macOS artifacts — an
    Apple-Silicon `ferritemcu-macos.zip` and an Intel `ferritemcu-macos-x86_64.zip`, each with a
    `.sha256` — Developer ID signs, notarizes and staples them (a no-op that leaves the
@@ -24,6 +24,14 @@ FerriteMCU follows [Semantic Versioning](https://semver.org/) — `MAJOR.MINOR.P
    Release automatically.
 
 That's it. Cutting a release = merging one PR.
+
+For release-please to open or refresh its release PR automatically, GitHub Actions
+must be allowed to create pull requests in the repository. An administrator can
+enable this under **Settings → Actions → General → Workflow permissions → Allow
+GitHub Actions to create and approve pull requests**. The workflow itself requests
+only `contents: write` and `pull-requests: write`; this repository-level setting is
+also required. Until it is enabled, an administrator can open the release-please
+branch as a PR manually, and merging that PR still triggers the release workflow.
 
 The release list and latest-release metadata also power FerriteMCU's **What's New** view and
 update checker. Both use the public GitHub Releases API by default; set
@@ -52,7 +60,7 @@ release-please owns the version in two places, kept in lockstep: the root `Cargo
 `[workspace.package].version`, which the member crates inherit — the latter updated via
 the `extra-files` entry in `release-please-config.json`. The version is mirrored into the
 binary through `CARGO_PKG_VERSION`, the macOS `Info.plist`, and the Windows `.exe`
-metadata. The git tag always matches it.
+metadata. The git tag uses the `ferritemcu-v` component prefix, followed by that version.
 
 ## After a release
 
@@ -67,7 +75,7 @@ that pushing a tag by hand will **not** trigger the build — the `build` job in
 `release.yml` is gated on release-please's `release_created` output, and tags created
 with the default token don't fire it. So a manual release means doing the packaging
 yourself too: bump both `version` fields in `Cargo.toml` (and `Cargo.lock`), update
-`CHANGELOG.md`, push a `vX.Y.Z` tag and create the GitHub Release yourself, then build
+`CHANGELOG.md`, push a `ferritemcu-vX.Y.Z` tag and create the GitHub Release yourself, then build
 the artifacts locally (`TARGET=aarch64-apple-darwin ./scripts/bundle-macos.sh`, then
 again for `x86_64-apple-darwin`, zipping each `dist/FerriteMCU.app` as `ferritemcu-macos.zip` /
 `ferritemcu-macos-x86_64.zip`; on Ubuntu 22.04, `./scripts/bundle-linux.sh` renamed to
