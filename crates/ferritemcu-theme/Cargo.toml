@@ -1,0 +1,16 @@
+[package]
+name = "ferritemcu-theme"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "FerriteMCU's runtime theme (hand-editable JSON, auto-repairing). gpui-free — colours are ferritemcu-color's POD."
+
+[dependencies]
+# Colours are `ferritemcu_color::Color` (a POD), so the theme model carries no GUI dependency.
+ferritemcu-color = { path = "../ferritemcu-color" }
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

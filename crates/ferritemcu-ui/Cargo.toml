@@ -1,0 +1,16 @@
+[package]
+name = "ferritemcu-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "FerriteMCU's reusable, app-agnostic UI toolkit (gpui widgets): buttons, tabs, badges, checkboxes, the file-tree row, etc."
+
+[dependencies]
+gpui.workspace = true
+# `gpui` feature → `Color: Into<Rgba/Hsla/Fill>`, so theme colours feed gpui builders directly.
+ferritemcu-color = { path = "../ferritemcu-color", features = ["gpui"] }
+ferritemcu-theme = { path = "../ferritemcu-theme" }
+
+[lints]
+workspace = true

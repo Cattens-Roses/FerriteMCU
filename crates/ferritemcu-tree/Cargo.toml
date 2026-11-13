@@ -1,0 +1,10 @@
+[package]
+name = "ferritemcu-tree"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "File-tree model for FerriteMCU. Pure std, no GUI."
+
+[lints]
+workspace = true

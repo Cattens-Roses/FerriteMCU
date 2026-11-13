@@ -1,0 +1,42 @@
+#![deny(missing_docs)]
+//! ferritemcu-ui — reusable, app-agnostic UI building blocks (gpui widgets). Knows nothing about
+//! FerriteMCU: buttons, tab pills, badges, checkboxes, context-menu icons, colour + scrollbar maths,
+//! and the file-tree row (`tree::item<V>`, generic over the hosting view). Depends only on
+//! gpui + ferritemcu-theme.
+mod badge;
+mod button;
+mod checkbox;
+mod color;
+/// Side-by-side diff building blocks (gutter column / rows / glyphs, editor panes).
+pub mod diff;
+/// The shared find bar (terminal, editor, diff panes). Call sites use the explicit
+/// `ui::find::…`.
+pub mod find;
+mod footer;
+mod menu;
+/// Keyboard navigation for lists, trees and popups: the shared actions + key contexts.
+pub mod nav;
+mod panel;
+/// Shared list-picker mechanics (bounded nav + the selected/hover row pill). Call sites
+/// use the explicit `ui::picker::…`.
+pub mod picker;
+mod scrollbar;
+mod select;
+mod stats;
+mod tab;
+mod tip;
+/// Call sites use the explicit `ui::tree::item(…)`.
+pub mod tree;
+
+pub use badge::*;
+pub use button::*;
+pub use checkbox::*;
+pub use color::*;
+pub use footer::*;
+pub use menu::*;
+pub use panel::*;
+pub use scrollbar::*;
+pub use select::*;
+pub use stats::*;
+pub use tab::*;
+pub use tip::*;

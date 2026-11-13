@@ -1,0 +1,181 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Releases are cut by release-please (see release.yml), which owns version bumps,
+# CHANGELOG, tagging, and attaching the platform artifacts. This workflow is just
+# the CI gate + downloadable per-push build previews.
+
+env:
+  CARGO_TERM_COLOR: always
+  # Deny warnings for EVERY compile in the workflow (build/test/trim), not just the clippy
+  # step — a plain rustc warning (e.g. a feature-gated `unused_mut`) would otherwise pass.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # Fast quality gate: format, lint, tests (incl. perf_* guards), and a proof
+  # that the advertised trim build (a minimal feature set) still compiles.
+  # Run on all shipped desktop platforms so target-gated code is checked before release.
+  check:
+    name: fmt + clippy + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # gpui's Linux backend (blade/Vulkan + wayland/x11/xkb + fontconfig). macOS uses system
+      # frameworks (Metal/AppKit) — nothing to install.
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
+        # fish: the terminal's dropped-path quoting is tested against it as well as sh.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libssl-dev libzstd-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libfontconfig-dev libfreetype-dev \
+            libx11-dev libxcb1-dev libvulkan-dev \
+            clang cmake fish
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      # --workspace lints all ten member crates (without it, only the `ferritemcu` binary is linted
+      # and the libs' `unwrap_used`/`expect_used` denies never run). --all-features also lints
+      # the #[cfg(feature)]-gated paths (grammars, terminal, remote-images). --locked fails on a
+      # stale Cargo.lock instead of silently rewriting it (e.g. a release bump that missed it).
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test (includes perf_* regression guards)
+        run: cargo test --all
+
+      # We advertise that builds can ship only the grammars they want
+      # (see Cargo.toml [features]); prove a minimal set still compiles. --workspace so a
+      # feature-gated member crate can't rot.
+      - name: Trim build compiles
+        run: cargo build --workspace --no-default-features --features rust,json,toml
+
+  # MSRV gate: prove the whole workspace still builds on the pinned minimum Rust
+  # (Cargo.toml `rust-version` / rust-toolchain.toml). Catches accidental use of a
+  # too-new std/lang feature before it ships. Pinned explicitly here (not @stable)
+  # so the job fails loudly if someone bumps the floor without meaning to.
+  msrv:
+    name: MSRV 1.96 builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust 1.96 (pinned MSRV)
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # gpui's Linux backend (blade/Vulkan + wayland/x11/xkb + fontconfig).
+      - name: Install Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libssl-dev libzstd-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libfontconfig-dev libfreetype-dev \
+            libx11-dev libxcb1-dev libvulkan-dev \
+            clang cmake
+
+      - name: Build workspace on MSRV
+        run: cargo build --workspace --all-targets
+
+  build:
+    name: build (${{ matrix.name }})
+    # Manual-only. Release artifacts are built + attached by release.yml (release-please) at
+    # release time; running a 3-OS release build on every push/PR just to upload throwaway
+    # preview binaries was redundant with that (and made every PR wait on three slow builds).
+    # `workflow_dispatch` keeps an on-demand preview build available without paying per push.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos
+            os: macos-15
+            bin: ferritemcu
+          - name: linux
+            os: ubuntu-latest
+            bin: ferritemcu
+          - name: windows
+            os: windows-latest
+            bin: ferritemcu.exe
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # gpui's Linux backend (blade/Vulkan + wayland/x11/xkb + fontconfig).
+      # Same dev libs proven in the local Docker build.
+      - name: Install Linux deps
+        if: matrix.name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libssl-dev libzstd-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libfontconfig-dev libfreetype-dev \
+            libx11-dev libxcb1-dev libvulkan-dev \
+            clang cmake
+
+      - name: Build (release)
+        run: cargo build --release
+
+      # macOS ships the real .app bundle (icon + Info.plist + version), not a
+      # bare binary. scripts/bundle-macos.sh reuses the release binary we just
+      # built; ditto (not zip) is required to preserve the bundle structure.
+      - name: Package .app (macos)
+        if: matrix.name == 'macos'
+        run: |
+          ./scripts/bundle-macos.sh
+          ditto -c -k --keepParent dist/FerriteMCU.app ferritemcu-macos.zip
+
+      # Linux ships an AppImage: a single portable file with icon + .desktop.
+      - name: Package AppImage (linux)
+        if: matrix.name == 'linux'
+        run: |
+          ./scripts/bundle-linux.sh
+          mv dist/FerriteMCU-x86_64.AppImage ferritemcu-linux.AppImage
+
+      # Windows .exe already has the embedded icon + version (build.rs).
+      - name: Package zip (windows)
+        if: matrix.name == 'windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/release/${{ matrix.bin }} `
+            -DestinationPath ferritemcu-windows.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ferritemcu-${{ matrix.name }}
+          # Glob covers the per-platform extension (.zip / .AppImage).
+          path: ferritemcu-${{ matrix.name }}.*
+          if-no-files-found: error

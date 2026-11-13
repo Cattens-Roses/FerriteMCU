@@ -1,0 +1,6 @@
+# Pin the toolchain so local builds and CI agree. FerriteMCU targets Rust 1.96
+# (gpui 0.2.x + the tree-sitter 0.25 stack compile cleanly here). Bump
+# deliberately, not by drift.
+[toolchain]
+channel = "1.96"
+components = ["rustfmt", "clippy"]

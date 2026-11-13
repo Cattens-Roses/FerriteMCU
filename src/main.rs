@@ -1,0 +1,7226 @@
+//! FerriteMCU — a native Rust IDE for microcontroller development.
+//!
+//! Features: changed-files tree + side-by-side diff, per-hunk stage/revert chevrons,
+//! editable commit message, folder browse with a real syntax-highlighted editor,
+//! a fuzzy "Go to File" finder (Cmd+Shift+O), a configurable keymap with `WebStorm`
+//! and `VSCode` presets, and a re-accessible onboarding / keymap picker.
+//!
+//! Lints (unwrap/expect deny, `clippy::pedantic`) are configured centrally in
+//! `[workspace.lints]` (Cargo.toml) and opted into via `[lints] workspace = true`.
+
+// ── core shell ──
+mod app;
+mod divider;
+mod lsp;
+// Always compiled (so its unit tests run in any feature set), but only *used* behind the
+// `terminal` feature — allow dead code when that's off.
+#[cfg_attr(not(feature = "terminal"), allow(dead_code))]
+mod term_panel;
+// `TermPanel` is ungated — `TermState.panel` is always compiled (see `TermState`), so e.g.
+// `switch_mode` can reset it without a cfg. `ToggleAction` is only used by the gated glue.
+use term_panel::TermPanel;
+#[cfg(feature = "terminal")]
+use term_panel::ToggleAction;
+mod render;
+pub(crate) use divider::{full_island_w, hist_split_w, Divider, DIFF_GUTTER_W, HIST_BRANCHES_W};
+// Reusable, app-agnostic UI toolkit (its own crate). Aliased to `ui` (so `ui::tree::item`
+// resolves) and glob-re-exported so call sites use `btn_primary`/`file_badge`/… unqualified.
+pub(crate) use app::{
+    CONTENT_MIN_QUERY, CONTENT_SEARCH_DEBOUNCE, DIR_WALK_CAP, FINDER_RESULT_CAP,
+    SCROLL_CONTEXT_ROWS, STATUS_REFRESH_DEBOUNCE,
+};
+pub(crate) use ferritemcu_ui as ui;
+pub(crate) use ferritemcu_ui::{
+    badge_inner, btn_primary, btn_primary_state, btn_secondary, btn_secondary_state, checkbox_box,
+    file_badge, menu_icon, scrollbar_thumb, tab_pill,
+};
+
+// ── per-feature views (impl FerriteMCU blocks; see src/views/) ──
+mod views;
+pub(crate) use views::chrome;
+pub(crate) use views::{nav_keys, MenuEntry, NavTarget};
+
+// ── gpui-coupled widgets; re-aliased so `editor::`/`mdview::`/… paths stay unchanged ──
+mod widgets;
+use widgets::editor;
+use widgets::mdview;
+#[cfg(feature = "remote-images")]
+use widgets::remote_img;
+#[cfg(feature = "terminal")]
+use widgets::terminal;
+
+// ── small OS utilities ──
+mod platform;
+#[cfg(unix)]
+use platform::instance;
+use platform::{clipboard as os_clipboard, scratch, shellcmd};
+
+// ── workspace crates, aliased back to their old module names ──
+use ferritemcu_config::keymap;
+use ferritemcu_config::plugins;
+use ferritemcu_config::projects;
+use ferritemcu_diff as diff;
+use ferritemcu_git as git;
+use ferritemcu_markdown as markdown;
+use ferritemcu_syntax as highlight;
+use ferritemcu_theme as theme;
+use ferritemcu_tree as tree;
+use ferritemcu_update as update;
+
+use diff::{FileDiff, HunkKind};
+use editor::{CodeEditor, EditorEvent};
+use fuzzy_matcher::skim::SkimMatcherV2;
+use fuzzy_matcher::FuzzyMatcher;
+use git::{ChangedFile, FileStatus, Repo};
+use gpui::PathPromptOptions;
+use gpui::{
+    actions, div, img, prelude::*, px, svg, App, Application, Bounds, Context, Entity, FocusHandle,
+    Focusable, FontWeight, KeyBinding, Menu, MenuItem, MouseButton, Pixels, Point, ScrollHandle,
+    SharedString, Window, WindowBounds, WindowOptions,
+};
+use highlight::Lang;
+use keymap::{Keymap, Preset};
+use plugins::Plugins;
+use projects::Recents;
+use std::path::PathBuf;
+
+// Configurable app actions (keystrokes come from the keymap config).
+actions!(
+    ferritemcu,
+    [
+        GoToFile,
+        FindInFiles,
+        SaveFile,
+        DoCommit,
+        OpenKeymap,
+        ModeCommit,
+        ModeBrowse,
+        Actions,
+        NewScratch,
+        SortLines,
+        SortKeys,
+        NavBack,
+        NavForward,
+        EscapeKey,
+        ConfirmKey,
+        ToggleTerminal,
+        NewTerminalTab,
+        CloseTerminalTab,
+        ClearTerminal,
+        TerminalEnter,
+        TerminalBackspace,
+        TerminalEscape,
+        TerminalCopy,
+        TerminalPaste,
+        TerminalFind,
+        DeleteFile,
+        CloseTab,
+        DiffNextChange,
+        DiffPrevChange,
+        CopyFiles,
+        CutFiles,
+        PasteFiles,
+        GitPush,
+        GitPull
+    ]
+);
+// Context-menu keyboard navigation (fixed keys, context "ContextMenu" — the open panel).
+actions!(
+    ferritemcu_menu_nav,
+    [
+        MenuUp,
+        MenuDown,
+        MenuLeft,
+        MenuRight,
+        MenuConfirm,
+        MenuDismiss
+    ]
+);
+// File-finder navigation (fixed keys, context "FileFinder").
+actions!(
+    ferritemcu_finder,
+    [FinderUp, FinderDown, FinderConfirm, FinderClose]
+);
+// In-editor find / replace (cmd-f / cmd-r, plus cmd-g navigation).
+actions!(
+    ferritemcu_find,
+    [
+        FindInFile,
+        ReplaceInFile,
+        FindNext,
+        FindPrev,
+        CloseFind,
+        ReplaceOne,
+        ReplaceAll
+    ]
+);
+// Native menu bar actions.
+actions!(
+    ferritemcu_menu,
+    [
+        Quit,
+        ToggleFps,
+        ClearData,
+        OpenPlugins,
+        OpenProject,
+        OpenChangelog
+    ]
+);
+
+// The Linux menu bar's keys (`views::menu_bar`): F10 opens the first menu (the ☰ menu where
+// the menus sit behind the button).
+#[cfg(target_os = "linux")]
+actions!(ferritemcu_menu_bar, [MenuKey]);
+
+/// Open the menu bar's Nth menu (Alt + its title's underlined letter). Carries the index, so
+/// it's a derived `Action`.
+#[cfg(target_os = "linux")]
+#[derive(Clone, PartialEq, Default, Debug, gpui::Action)]
+#[action(namespace = ferritemcu_menu_bar, no_json)]
+struct MenuBarOpen(usize);
+
+/// The native macOS menu bar: the app menu (Settings/Plugins/Quit) + a File menu with
+/// "Open…" and a live "Recent Projects" submenu. Rebuilt whenever recents change (startup +
+/// each `open_project`) so the recent list stays current.
+fn app_menus(recents: &Recents) -> Vec<Menu> {
+    let recent_items: Vec<gpui::MenuItem> = recents
+        .paths
+        .iter()
+        .take(15)
+        .map(|p| {
+            gpui::MenuItem::action(
+                projects::name_of(p),
+                OpenRecentProject(p.to_string_lossy().into_owned()),
+            )
+        })
+        .collect();
+    let mut file_items = vec![MenuItem::action("Open…", OpenProject)];
+    if !recent_items.is_empty() {
+        file_items.push(MenuItem::separator());
+        file_items.push(MenuItem::submenu(Menu {
+            name: "Recent Projects".into(),
+            items: recent_items,
+        }));
+    }
+    vec![
+        Menu {
+            name: "FerriteMCU".into(),
+            items: vec![
+                MenuItem::action("Settings…", OpenKeymap),
+                MenuItem::action("Plugins…", OpenPlugins),
+                MenuItem::action("What's New…", OpenChangelog),
+                MenuItem::action("Toggle FPS Monitor", ToggleFps),
+                MenuItem::separator(),
+                MenuItem::action("Clear Data & Restart…", ClearData),
+                MenuItem::separator(),
+                MenuItem::action("Quit FerriteMCU", Quit),
+            ],
+        },
+        Menu {
+            name: "File".into(),
+            items: file_items,
+        },
+    ]
+}
+
+/// Dock-tile menu action: open a specific recent project by its path. Carries
+/// data, so it's a derived `Action` rather than a unit struct from `actions!`.
+#[derive(Clone, PartialEq, Default, Debug, gpui::Action)]
+#[action(namespace = ferritemcu, no_json)]
+struct OpenRecentProject(String);
+
+/// Build the macOS Dock right-click menu: a "Recent Projects" submenu
+/// (WebStorm-style), most-recent first. Empty when there are no recents.
+/// Rebuilt on startup and whenever a project opens, so it stays current.
+fn dock_menu(recents: &Recents) -> Vec<gpui::MenuItem> {
+    let items: Vec<gpui::MenuItem> = recents
+        .paths
+        .iter()
+        .take(15)
+        .map(|p| {
+            gpui::MenuItem::action(
+                projects::name_of(p),
+                OpenRecentProject(p.to_string_lossy().into_owned()),
+            )
+        })
+        .collect();
+    if items.is_empty() {
+        return Vec::new();
+    }
+    vec![gpui::MenuItem::submenu(gpui::Menu {
+        name: "Recent Projects".into(),
+        items,
+    })]
+}
+
+/// The menu bar's titles on Linux, in order; `menu_bar_menus` fills them.
+#[cfg(target_os = "linux")]
+const MENU_BAR: [&str; 3] = ["File", "View", "Help"];
+
+/// A menu bar title's access key (Alt + it opens the menu): its first letter.
+#[cfg(target_os = "linux")]
+fn menu_bar_access_key(title: &str) -> char {
+    title
+        .chars()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+/// The menus of the menu bar on Linux (`views::menu_bar`): the macOS menu bar's items, laid
+/// out the way Linux IDEs do — the app menu's Settings, Plugins, Clear Data and Quit join
+/// File, the FPS monitor is under View and What's New under Help. Same items and actions
+/// (`menu_bar_holds_every_menu_bar_item` keeps the two in step).
+#[cfg(target_os = "linux")]
+fn menu_bar_menus(recents: &Recents) -> Vec<Menu> {
+    let [file, view, help] = MENU_BAR;
+    let mut file_items = vec![MenuItem::action("Open…", OpenProject)];
+    // The "Recent Projects" submenu (none without recents), as in the macOS File menu.
+    let recent = dock_menu(recents);
+    if !recent.is_empty() {
+        file_items.push(MenuItem::separator());
+        file_items.extend(recent);
+    }
+    file_items.extend([
+        MenuItem::separator(),
+        MenuItem::action("Settings…", OpenKeymap),
+        MenuItem::action("Plugins…", OpenPlugins),
+        MenuItem::separator(),
+        MenuItem::action("Clear Data & Restart…", ClearData),
+        MenuItem::separator(),
+        MenuItem::action("Quit FerriteMCU", Quit),
+    ]);
+    vec![
+        Menu {
+            name: file.into(),
+            items: file_items,
+        },
+        Menu {
+            name: view.into(),
+            items: vec![MenuItem::action("Toggle FPS Monitor", ToggleFps)],
+        },
+        Menu {
+            name: help.into(),
+            items: vec![MenuItem::action("What's New…", OpenChangelog)],
+        },
+    ]
+}
+
+/// Read what Shift + each symbol key types on the active keyboard layout
+/// (`platform::keyboard_layout`, off the UI thread: it may ask the X server or `gsettings`),
+/// hand it to the keymap and re-bind every shortcut from the saved keymap.
+#[cfg(target_os = "linux")]
+fn learn_keyboard_layout(cx: &mut App) {
+    let active = cx.keyboard_layout().name().to_string();
+    let read = cx
+        .background_executor()
+        .spawn(async move { platform::keyboard_layout::shifted_map(&active) });
+    cx.spawn(async move |cx| {
+        let map = read.await;
+        cx.update(|cx| {
+            keymap::set_layout_shifted(map);
+            apply_keymap(cx, &Keymap::load().0);
+        })
+        .ok();
+    })
+    .detach();
+}
+
+/// The keys that step a find bar to the next / previous match, as its tooltips show them —
+/// the in-editor find binds them below, and the terminal's find shares them.
+pub(crate) const FIND_STEP_KEYS: (&str, &str) = if cfg!(target_os = "macos") {
+    ("↩ / ⌘G", "⇧↩ / ⇧⌘G")
+} else {
+    ("Enter / F3", "Shift+Enter / Shift+F3")
+};
+
+/// Clear and (re)apply all key bindings from a keymap config.
+fn apply_keymap(cx: &mut App, km: &Keymap) {
+    cx.clear_key_bindings();
+    editor::bind_keys(cx);
+    mdview::bind_keys(cx);
+    // Lists, trees + popup lists: ↑↓←→ ⏎ space ⇧F10 ⎋ (issue #81).
+    ui::nav::bind_nav_keys(cx);
+    cx.bind_keys([
+        KeyBinding::new("up", FinderUp, Some("FileFinder")),
+        KeyBinding::new("down", FinderDown, Some("FileFinder")),
+        KeyBinding::new("enter", FinderConfirm, Some("FileFinder")),
+        KeyBinding::new("escape", FinderClose, Some("FileFinder")),
+        KeyBinding::new("up", MenuUp, Some("ContextMenu")),
+        KeyBinding::new("down", MenuDown, Some("ContextMenu")),
+        KeyBinding::new("left", MenuLeft, Some("ContextMenu")),
+        KeyBinding::new("right", MenuRight, Some("ContextMenu")),
+        KeyBinding::new("enter", MenuConfirm, Some("ContextMenu")),
+        KeyBinding::new("space", MenuConfirm, Some("ContextMenu")),
+        KeyBinding::new("escape", MenuDismiss, Some("ContextMenu")),
+    ]);
+    bind_app(cx, km, "go_to_file", GoToFile);
+    bind_app(cx, km, "find_in_files", FindInFiles);
+    bind_app(cx, km, "save", SaveFile);
+    bind_app(cx, km, "commit", DoCommit);
+    bind_app(cx, km, "mode_commit", ModeCommit);
+    bind_app(cx, km, "mode_browse", ModeBrowse);
+    bind_app(cx, km, "open_keymap", OpenKeymap);
+    bind_app(cx, km, "actions", Actions);
+    bind_app(cx, km, "new_scratch", NewScratch);
+    bind_app(cx, km, "sort_lines", SortLines);
+    bind_app(cx, km, "sort_keys", SortKeys);
+    bind_app(cx, km, "nav_back", NavBack);
+    bind_app(cx, km, "nav_forward", NavForward);
+    bind_app(cx, km, "push", GitPush);
+    bind_app(cx, km, "pull", GitPull);
+    // Escape: close any open modal, else cancel the Commit view (fixed key).
+    cx.bind_keys([KeyBinding::new("escape", EscapeKey, Some("FerriteMCU"))]);
+    // Enter: confirm the open confirmation dialog (currently the Delete overlay) —
+    // IDE default-button behavior. No dialog open → no-op. "FerriteMCU" context, so the
+    // editors/finder/terminal keep their own Enter.
+    cx.bind_keys([KeyBinding::new("enter", ConfirmKey, Some("FerriteMCU"))]);
+    // Backspace: delete the selected Browse-tree file/folder (fixed key). Bound to the
+    // "FerriteMCU" context, NOT globally, so the deeper editor/commit-box/terminal Backspace
+    // bindings win whenever one of those is focused — this only fires at the app root.
+    // ⌘⌫ deletes too (issue #61 — Finder's delete shortcut; muscle memory says both work).
+    // Safe at the root: the editor binds cmd-backspace to DeleteToHome in its own deeper
+    // context, so this only fires when no editor/terminal is focused.
+    cx.bind_keys([
+        KeyBinding::new("backspace", DeleteFile, Some("FerriteMCU")),
+        KeyBinding::new("secondary-backspace", DeleteFile, Some("FerriteMCU")),
+    ]);
+    // File-tree cut/copy/paste (issue #67). Scoped to the "FerriteMCU" root, so the deeper
+    // "CodeEditor" copy/cut/paste bindings win whenever an editor is focused — these only
+    // fire at the app root (a tree row selected, no editor focused).
+    cx.bind_keys([
+        KeyBinding::new("secondary-c", CopyFiles, Some("FerriteMCU")),
+        KeyBinding::new("secondary-x", CutFiles, Some("FerriteMCU")),
+        KeyBinding::new("secondary-v", PasteFiles, Some("FerriteMCU")),
+    ]);
+    // Jump between diff changes (Alt+↓ / Alt+↑). Global so they fire while the diff editor is
+    // focused; no-op when no diff is showing.
+    cx.bind_keys([
+        KeyBinding::new("alt-down", DiffNextChange, None),
+        KeyBinding::new("alt-up", DiffPrevChange, None),
+    ]);
+    // Standard quit shortcut (not user-configurable).
+    cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
+    // The Linux menu bar (`views::menu_bar`): F10 opens its first menu (or the ☰ menu), Alt +
+    // a title's underlined letter opens that menu. In a terminal both stay the shell's (htop
+    // and mc quit on F10, Alt+F / Alt+B move by word).
+    #[cfg(target_os = "linux")]
+    {
+        let access = |title: &str| format!("alt-{}", menu_bar_access_key(title));
+        cx.bind_keys([KeyBinding::new("f10", MenuKey, Some("FerriteMCU"))]);
+        cx.bind_keys(
+            MENU_BAR.iter().enumerate().map(|(i, title)| {
+                KeyBinding::new(&access(title), MenuBarOpen(i), Some("FerriteMCU"))
+            }),
+        );
+        #[cfg(feature = "terminal")]
+        cx.bind_keys(
+            std::iter::once("f10".to_string())
+                .chain(MENU_BAR.iter().map(|title| access(title)))
+                .map(|k| KeyBinding::new(&k, gpui::NoAction, Some("Terminal"))),
+        );
+    }
+    // Close the active editor tab (standard ⌘W; not user-configurable). Global (no context) so
+    // it fires no matter what's focused — editor, tree, commit box, terminal.
+    cx.bind_keys([KeyBinding::new("secondary-w", CloseTab, None)]);
+    // Toggle the bottom terminal panel (fixed key, IDE-standard); ⌘T = new tab while the
+    // terminal is focused (scoped to its key context so it doesn't shadow elsewhere).
+    #[cfg(feature = "terminal")]
+    let term = |key: &str| format!("{TERMINAL_MOD}-{key}");
+    // ⌘K clears the terminal; "Terminal" context (depth) beats the "FerriteMCU"-scoped commit. Linux
+    // leaves Clear unbound: Ctrl+L / Ctrl+U already clear in the shell, and Ctrl+Shift+K stays
+    // Push (the WebStorm preset) even with the terminal focused.
+    #[cfg(all(
+        feature = "terminal",
+        not(any(target_os = "linux", target_os = "freebsd"))
+    ))]
+    cx.bind_keys([KeyBinding::new(&term("k"), ClearTerminal, Some("Terminal"))]);
+    #[cfg(feature = "terminal")]
+    cx.bind_keys([
+        KeyBinding::new("ctrl-`", ToggleTerminal, None),
+        KeyBinding::new(&term("t"), NewTerminalTab, Some("Terminal")),
+        // ⌘W closes the active terminal tab when the terminal is focused (iTerm-style);
+        // scoped to "Terminal" so it shadows the editor-tab ⌘W (`CloseTab`).
+        KeyBinding::new(&term("w"), CloseTerminalTab, Some("Terminal")),
+        // Enter / backspace / escape are app shortcuts in "FerriteMCU". gpui
+        // dispatches binding ACTIONS *before* on_key_down and an action stops propagation by
+        // default, so on_key_down never runs once a binding matches — meaning a no-op here would
+        // swallow the key (nothing reaches the PTY). So these route to actions whose handlers
+        // (on TerminalView) write the raw byte to the shell, exactly like the editor binds
+        // backspace to its own buffer action. The "Terminal" context (depth) shadows "FerriteMCU".
+        KeyBinding::new("enter", TerminalEnter, Some("Terminal")),
+        KeyBinding::new("backspace", TerminalBackspace, Some("Terminal")),
+        // ⌘⌫ is DeleteFile in "FerriteMCU" (issue #61); in the terminal it must act as a plain
+        // backspace, not delete the tree-selected file out from under a typing user.
+        KeyBinding::new("secondary-backspace", TerminalBackspace, Some("Terminal")),
+        KeyBinding::new("escape", TerminalEscape, Some("Terminal")),
+        // ⌘C / ⌘V copy and paste in the terminal — the root binds them to the file tree's
+        // copy / paste, which would swallow them.
+        KeyBinding::new(&term("c"), TerminalCopy, Some("Terminal")),
+        KeyBinding::new(&term("v"), TerminalPaste, Some("Terminal")),
+    ]);
+    // In-editor find / replace (fixed keys). ⌘G / ⇧⌘G cycle the matches on macOS; elsewhere
+    // that is F3 / Shift+F3 (both IDE keymaps on Linux), and Ctrl+Shift+G is the VS Code
+    // keymap's Commit view.
+    let (next, prev) = if cfg!(target_os = "macos") {
+        ("cmd-g", "cmd-shift-g")
+    } else {
+        ("f3", "shift-f3")
+    };
+    cx.bind_keys([
+        KeyBinding::new("secondary-f", FindInFile, None),
+        KeyBinding::new("secondary-r", ReplaceInFile, None),
+        KeyBinding::new(next, FindNext, None),
+        KeyBinding::new(prev, FindPrev, None),
+        KeyBinding::new("escape", CloseFind, Some("FindBar")),
+        KeyBinding::new("enter", FindNext, Some("FindBar")),
+        KeyBinding::new("shift-enter", FindPrev, Some("FindBar")),
+    ]);
+    // ⌘F (Ctrl+Shift+F elsewhere — Ctrl+F is the shell's) in a terminal searches its own
+    // scrollback. After the context-less ⌘F above, which ties with it on depth (later wins).
+    #[cfg(feature = "terminal")]
+    cx.bind_keys([KeyBinding::new(
+        &format!("{TERMINAL_MOD}-f"),
+        TerminalFind,
+        Some("Terminal"),
+    )]);
+    // In the terminal's find box ("Terminal" one level up) the context-less ⌘W / ⌘F outrank
+    // the terminal's keys and would close an editor tab or open the editor's find (Ctrl+F too,
+    // off macOS); these tie with them on depth instead and win as the later bindings. Off
+    // macOS Ctrl+Shift+C / V copy and paste the query, not the shell's selection / clipboard.
+    #[cfg(feature = "terminal")]
+    {
+        let in_box = Some("Terminal > CodeInput");
+        cx.bind_keys([
+            KeyBinding::new(&term("f"), TerminalFind, in_box),
+            KeyBinding::new("secondary-f", TerminalFind, in_box),
+            KeyBinding::new(&term("w"), CloseTerminalTab, in_box),
+            KeyBinding::new(&term("c"), editor::Copy, in_box),
+            KeyBinding::new(&term("v"), editor::Paste, in_box),
+        ]);
+    }
+    // Off macOS the app's shortcuts are on Ctrl, and so are the shell's keys (Ctrl+C
+    // interrupts, Ctrl+W rubs out a word, Ctrl+R searches history…). In a terminal, Ctrl+letter
+    // goes to the shell: a `NoAction` in the "Terminal" context masks every app binding on it,
+    // and the terminal's own keys take Shift instead (`TERMINAL_MOD`), like gnome-terminal.
+    // Bound last, since a context-less binding (Ctrl+Q, Ctrl+W) ties on depth and the later
+    // binding wins a tie.
+    #[cfg(feature = "terminal")]
+    if !cfg!(target_os = "macos") {
+        cx.bind_keys(
+            ('a'..='z')
+                .map(|c| KeyBinding::new(&format!("ctrl-{c}"), gpui::NoAction, Some("Terminal"))),
+        );
+    }
+}
+
+/// The modifier of the terminal's own shortcuts (new / close tab, clear, copy, paste): ⌘ on
+/// macOS; Ctrl+Shift elsewhere, where plain Ctrl+letter belongs to the shell.
+#[cfg(feature = "terminal")]
+const TERMINAL_MOD: &str = if cfg!(target_os = "macos") {
+    "cmd"
+} else {
+    "ctrl-shift"
+};
+
+fn bind_app<A: gpui::Action>(cx: &mut App, km: &Keymap, name: &str, action: A) {
+    if let Some(k) = km.key_for(name) {
+        // Scope to the "FerriteMCU" root context (NOT global/None) so a deeper widget context —
+        // "Terminal", "CodeEditor" — cleanly overrides the same key by dispatch depth. A
+        // context-less binding gets *max* depth and would tie with (and sometimes beat) the
+        // widget binding (e.g. ⌘K commit shadowing the terminal's Clear). "FerriteMCU" is always in
+        // the focus stack (the root carries it), so these still fire everywhere else.
+        cx.bind_keys([KeyBinding::new(
+            &keymap::platform_key(&k),
+            action,
+            Some("FerriteMCU"),
+        )]);
+    }
+}
+
+/// Activity-rail width = button (38) + a frame-gap margin each side, so the icon sits with
+/// equal gap to the window edge (left) and the island (right). The islands begin at this x.
+const RAIL_W: f32 = 38.0 + theme::FRAME_GAP * 2.0;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Commit,
+    Browse,
+    History,
+}
+
+/// Which window hosts the find/replace bar: the main window or one of the native modals.
+/// The bar renders only in its host, over the editor it searches.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FindHost {
+    Main,
+    Modal(ModalKind),
+}
+
+/// The two tabs of the git (Commit) view: staging working changes vs pushing committed ones.
+#[derive(Clone, Copy, PartialEq)]
+enum GitTab {
+    Commit,
+    Push,
+}
+
+/// How the history view diffs the selected commit.
+#[derive(Clone, Copy, PartialEq)]
+enum CompareMode {
+    /// This commit vs its parent — what the commit changed (read-only).
+    Before,
+    /// This commit vs your working tree — editable.
+    Local,
+    /// The parent (before this commit) vs your working tree — editable.
+    BeforeLocal,
+}
+
+impl CompareMode {
+    const ALL: [CompareMode; 3] = [
+        CompareMode::Before,
+        CompareMode::Local,
+        CompareMode::BeforeLocal,
+    ];
+
+    /// Short label for the dropdown trigger chip.
+    fn label(self) -> &'static str {
+        match self {
+            CompareMode::Before => "Compare to previous commit",
+            CompareMode::Local => "Compare with Local",
+            CompareMode::BeforeLocal => "Compare before with Local",
+        }
+    }
+
+    /// One-line explanation shown in the dropdown menu (clears up the taxonomy).
+    fn desc(self) -> &'static str {
+        match self {
+            CompareMode::Before => "This commit vs its parent — what the commit changed",
+            CompareMode::Local => "This commit vs your working tree — editable",
+            CompareMode::BeforeLocal => {
+                "The parent (before this commit) vs your working tree — editable"
+            }
+        }
+    }
+
+    /// Stable element-id key (independent of the display label).
+    fn key(self) -> &'static str {
+        match self {
+            CompareMode::Before => "cmp-before",
+            CompareMode::Local => "cmp-local",
+            CompareMode::BeforeLocal => "cmp-before-local",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum FinderMode {
+    Files,
+    Actions,
+    /// New Scratch File language picker (results index into `scratch::LANGS`).
+    Scratch,
+    /// Find in Files: full-text content search (results in `content_results`).
+    Content,
+}
+
+/// One hit in the Find-in-Files content search.
+#[derive(Clone)]
+pub(crate) struct ContentHit {
+    pub path: PathBuf,
+    pub line: u32,
+    pub text: String,
+}
+
+/// One entry in the Cmd+Shift+A actions palette.
+#[derive(Clone, Copy)]
+enum PaletteAction {
+    GoToFile,
+    FindInFiles,
+    NewScratch,
+    CommitView,
+    BrowseView,
+    HistoryView,
+    SelectInTree,
+    Rollback,
+    Settings,
+    RevealInFinder,
+    RevealInTerminal,
+    Plugins,
+    Fonts,
+    SortLines,
+    SortKeys,
+    NavBack,
+    NavForward,
+    LocalHistory,
+    ClearLocalHistory,
+    Changelog,
+    Push,
+    Pull,
+    Fetch,
+}
+
+/// Action-finder entries: (label, action, keymap-action name for the shortcut
+/// chip — `""` when the action has no bindable key and so shows none).
+const PALETTE: &[(&str, PaletteAction, &str)] = &[
+    ("Select in File View", PaletteAction::SelectInTree, ""),
+    (views::REVEAL_IN_FILES, PaletteAction::RevealInFinder, ""),
+    (
+        views::REVEAL_IN_TERMINAL,
+        PaletteAction::RevealInTerminal,
+        "",
+    ),
+    ("Sort Lines", PaletteAction::SortLines, "sort_lines"),
+    ("Sort Object Keys", PaletteAction::SortKeys, "sort_keys"),
+    ("Back (previous file)", PaletteAction::NavBack, "nav_back"),
+    (
+        "Forward (next file)",
+        PaletteAction::NavForward,
+        "nav_forward",
+    ),
+    ("Go to File", PaletteAction::GoToFile, "go_to_file"),
+    ("Find in Files", PaletteAction::FindInFiles, "find_in_files"),
+    ("New Scratch File", PaletteAction::NewScratch, "new_scratch"),
+    (
+        "Commit / Git view",
+        PaletteAction::CommitView,
+        "mode_commit",
+    ),
+    (
+        "Browse / Code view",
+        PaletteAction::BrowseView,
+        "mode_browse",
+    ),
+    ("Git History (log)", PaletteAction::HistoryView, ""),
+    ("Push…", PaletteAction::Push, "push"),
+    ("Pull (Update Project)", PaletteAction::Pull, "pull"),
+    ("Fetch", PaletteAction::Fetch, ""),
+    ("Rollback changes", PaletteAction::Rollback, ""),
+    ("Local History", PaletteAction::LocalHistory, ""),
+    ("Clear Local History", PaletteAction::ClearLocalHistory, ""),
+    ("Settings / Keymap", PaletteAction::Settings, "open_keymap"),
+    ("Manage Plugins", PaletteAction::Plugins, ""),
+    ("Preview Fonts", PaletteAction::Fonts, ""),
+    ("What's New (Changelog)", PaletteAction::Changelog, ""),
+];
+
+/// What a right-click context menu was opened on.
+#[derive(Clone)]
+enum MenuTarget {
+    /// A path in the Browse tree (`bool` = `is_dir`), or the open editor file.
+    BrowseFile(PathBuf, bool),
+    /// Right-click inside the editor pane — git commands plus the buffer sort
+    /// ops. The bools (computed at menu-open, so the menu never parses per
+    /// frame) gate the items: `.0` = selection spans ≥2 lines (Sort Lines),
+    /// `.1` = caret inside a JSON/JS/TS object (Sort Object Keys).
+    EditorGit(PathBuf, bool, bool),
+    /// A path (file or folder) in the Commit tree — `bool` = `is_dir`.
+    CommitPath(PathBuf, bool),
+    /// A changed file in the Rollback modal, by index into `files` (→ View Diff).
+    RollbackFile(usize),
+    /// A file in the Push modal, by index into `push_files` (→ View Diff).
+    PushFile(usize),
+    /// An open editor tab, by index into `open_tabs`.
+    Tab(usize),
+    /// The tab-bar overflow chooser (`▾`): a flat list of every open tab to jump to.
+    TabList,
+    /// A commit row in the History list (by index into `history.commits`) — its menu offers
+    /// the same compare modes as the header dropdown.
+    HistoryCompare(usize),
+    /// A file row in the History changed-files tree (by index into `history.files`) — same
+    /// compare modes, applied with that file kept selected.
+    HistoryFile(usize),
+    /// A timeline row in the Local History window — Revert This Change and After
+    /// (acts on the selected row; right-click selects before opening the menu).
+    LhRow,
+    /// A row in the Local History changed-files panel (`bool` = `is_dir`) — revert just
+    /// that file / that folder's files to their state at the selected snapshot.
+    LhPath(PathBuf, bool),
+    /// A branch leaf in the branch popup — offers Checkout + Merge into current.
+    Branch(String),
+    /// The title strip's menu button (off macOS): the menu bar's items (`app_menus`).
+    AppMenu,
+    /// The Nth menu of the menu bar on Linux (`menu_bar_menus`).
+    #[cfg(target_os = "linux")]
+    MenuBar(usize),
+    /// The title bar's project crumb: the open projects and Open….
+    Projects,
+    /// Build / debug actions behind the titlebar's flash dropdown.
+    EmbeddedActions,
+}
+
+struct ContextMenu {
+    at: Point<Pixels>,
+    target: MenuTarget,
+    /// Which flyout submenu is expanded, if any (file/editor menu — New / Git). Only one
+    /// opens at a time.
+    submenu: Option<Submenu>,
+    /// The rows, built when the menu opened (see `views/context_menu.rs`).
+    entries: Vec<MenuEntry>,
+    /// Highlighted top-level row (keyboard or hover).
+    hl: Option<usize>,
+    /// Highlighted row inside the open submenu — `Some` once the keyboard is in it.
+    sub_hl: Option<usize>,
+}
+
+/// A context-menu flyout submenu (the "New ▸" / "Git ▸" rows).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Submenu {
+    New,
+    Git,
+    /// The Nth submenu of the in-window app menu (Recent Projects; see `chrome`).
+    App(usize),
+}
+
+/// Snapshot of a scroll view's `(pane_w, vp_w, vp_h, max_w, max_h)` used to debounce the
+/// one-frame scrollbar reframe (see `FerriteMCU::with_scrollbars`).
+pub(crate) type ScrollDims = (Pixels, Pixels, Pixels, Pixels, Pixels);
+
+/// An in-progress scrollbar-thumb drag. Carries the `ScrollHandle` so the shared scrollbar
+/// helper drives whichever view is being dragged (editor, tree, …).
+#[derive(Clone)]
+pub(crate) struct SbDrag {
+    pub handle: ScrollHandle,
+    pub horizontal: bool,
+    pub start_cursor: f32,
+    pub start_off: f32,
+}
+
+/// Which scrollable view a `with_scrollbars` call is for — keys its reframe-dims slot.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SbView {
+    Editor,
+    Tree,
+    MdEditor,
+    MdPreview,
+    Diff,
+    /// The diff's single shared horizontal scrollbar.
+    DiffH,
+}
+
+/// An open "name this file" prompt (the small modal with a text input).
+#[derive(Clone)]
+enum NamePrompt {
+    /// Create a new file inside this directory (rel path; `""` = repo root).
+    NewFile(PathBuf),
+    /// Create a new folder inside this directory (rel path; `""` = repo root).
+    NewFolder(PathBuf),
+    /// Rename this existing file (rel path) to the typed name in its own folder.
+    Rename(PathBuf),
+    /// Generate a new ESP project with esp-generate.
+    NewEspProject,
+}
+
+/// Per-project UI state stashed when switching to another open-project tab, so switching back
+/// restores the project exactly as you left it (which file is open, the editor tabs, the tree
+/// expansion, the active mode). The *active* project's state lives in the `FerriteMCU` fields
+/// directly; this only holds the inactive tabs' snapshots.
+struct ProjectSession {
+    mode: Mode,
+    open_path: Option<PathBuf>,
+    open_tabs: Vec<PathBuf>,
+    preview_tab: Option<PathBuf>,
+    selected: Option<usize>,
+    expanded: std::collections::HashSet<PathBuf>,
+}
+
+/// The History (git log) view's state, grouped out of the `FerriteMCU` god-struct into its own
+/// sub-state. Defined at the crate root so its fields stay reachable from the `history`
+/// feature module (exactly like `FerriteMCU`'s own fields). Built via [`HistoryView::new`], which
+/// also wires the three search boxes' live-filter subscriptions.
+struct HistoryView {
+    /// Revision being logged — a branch name, or "HEAD" for the current branch.
+    rev: String,
+    /// Path the log is scoped to (a folder/file), or `None` for the whole repo. Set when
+    /// the history view is opened from a Browse-tree folder's right-click menu.
+    path: Option<PathBuf>,
+    /// Commits shown in the log list (newest first).
+    commits: Vec<git::Commit>,
+    /// The commit graph, one row per entry of `commits` (laid out when they load).
+    graph: Vec<git::graph::GraphRow>,
+    /// Graph column width in lanes — the widest row, capped (see `history::MAX_LANES`).
+    graph_lanes: usize,
+    /// Selected commit index into `commits`.
+    selected: Option<usize>,
+    /// Files changed by the selected commit under the current compare mode.
+    files: Vec<ChangedFile>,
+    /// Selected file index into `files`.
+    file_selected: Option<usize>,
+    /// Folder tree of `files` (right pane of the history panel).
+    files_tree: tree::Tree,
+    /// Expanded dirs in the history files tree.
+    files_expanded: std::collections::HashSet<PathBuf>,
+    /// Search box filtering the history files tree.
+    files_query: Entity<CodeEditor>,
+    /// Height (px) of the history bottom panel (drag the top edge to resize).
+    panel_h: f32,
+    /// When true the history bottom panel is minimised to just its toolbar (the header
+    /// chevron toggles it), giving the diff the full height.
+    panel_collapsed: bool,
+    /// What the selected commit is diffed against.
+    compare: CompareMode,
+    /// Compare-mode dropdown open in the history view.
+    compare_open: bool,
+    /// Keyboard highlight in the compare-mode dropdown (index into `CompareMode::ALL`).
+    compare_hl: Option<usize>,
+    /// The open compare-mode dropdown's focus (it takes ↑↓ ⏎ ⎋).
+    compare_focus: FocusHandle,
+    /// Branch-picker dropdown open in the history view.
+    branch_open: bool,
+    /// Keyboard highlight in the branch dropdown (index into `history_rev_items`; reset as
+    /// the search changes).
+    rev_hl: Option<usize>,
+    /// Local branches for the history branch picker (loaded when the dropdown opens).
+    locals: Vec<String>,
+    /// Remote-tracking branches for the history branch picker.
+    remotes: Vec<String>,
+    /// Search box filtering the history branch dropdown.
+    branch_query: Entity<CodeEditor>,
+    /// Search box filtering the commit list (subject / author / hash).
+    commit_query: Entity<CodeEditor>,
+    /// Scroll position of the commit list.
+    scroll: ScrollHandle,
+    /// Fraction (0..1) of the history panel width given to the commit-list pane on the left
+    /// (resizable); the changed-files pane fills the rest on the right. Defaults to 2/3.
+    commit_frac: f32,
+    /// Keyboard focus of the commit list (↑↓ walk commits, → / ⏎ into the files pane).
+    list_focus: FocusHandle,
+    /// Keyboard focus of the changed-files tree (← on a top-level row returns to commits).
+    files_focus: FocusHandle,
+    /// The files tree's keyboard cursor when it's on a FOLDER (`None` = on the selected file).
+    files_dir_cursor: Option<PathBuf>,
+    /// Scroll position of the changed-files tree (keeps the keyboard cursor in view).
+    files_scroll: ScrollHandle,
+    /// Expanded folder keys in the branches sidebar (`branch_rows` keys). Every folder opens
+    /// when the branches load, minus the ones in `branches_collapsed`.
+    branches_expanded: std::collections::HashSet<String>,
+    /// Folders the user collapsed in the branches sidebar — kept across reloads.
+    branches_collapsed: std::collections::HashSet<String>,
+}
+
+impl HistoryView {
+    /// Build the initial history state and wire the three search boxes' live-filter
+    /// subscriptions (each repaints `FerriteMCU` when its query changes while the relevant view /
+    /// dropdown is active).
+    fn new(cx: &mut Context<FerriteMCU>) -> Self {
+        let branch_query = cx.new(|cx| CodeEditor::single_line(cx, "Search branches…"));
+        cx.subscribe(&branch_query, |this, _e, ev, cx| {
+            if matches!(ev, EditorEvent::Changed) && this.history.branch_open {
+                this.history.rev_hl = None;
+                cx.notify();
+            }
+        })
+        .detach();
+        let commit_query = cx.new(|cx| CodeEditor::single_line(cx, "Search commits…"));
+        cx.subscribe(&commit_query, |this, _e, ev, cx| {
+            if matches!(ev, EditorEvent::Changed) && this.mode == Mode::History {
+                cx.notify();
+            }
+        })
+        .detach();
+        let files_query = cx.new(|cx| CodeEditor::single_line(cx, "Search files…"));
+        cx.subscribe(&files_query, |this, _e, ev, cx| {
+            if matches!(ev, EditorEvent::Changed) && this.mode == Mode::History {
+                cx.notify();
+            }
+        })
+        .detach();
+        Self {
+            rev: "HEAD".to_string(),
+            path: None,
+            commits: Vec::new(),
+            graph: Vec::new(),
+            graph_lanes: 0,
+            selected: None,
+            files: Vec::new(),
+            file_selected: None,
+            files_tree: tree::Tree::default(),
+            files_expanded: std::collections::HashSet::new(),
+            files_query,
+            panel_h: 320.0,
+            panel_collapsed: false,
+            compare: CompareMode::Local,
+            compare_open: false,
+            compare_hl: None,
+            compare_focus: cx.focus_handle(),
+            branch_open: false,
+            rev_hl: None,
+            locals: Vec::new(),
+            remotes: Vec::new(),
+            branch_query,
+            commit_query,
+            scroll: ScrollHandle::new(),
+            commit_frac: 2.0 / 3.0,
+            list_focus: cx.focus_handle(),
+            files_focus: cx.focus_handle(),
+            files_dir_cursor: None,
+            files_scroll: ScrollHandle::new(),
+            branches_expanded: std::collections::HashSet::new(),
+            branches_collapsed: std::collections::HashSet::new(),
+        }
+    }
+}
+
+/// Settings → Keymap's shortcut editor, grouped out of the `FerriteMCU` god-struct.
+struct KeymapEditor {
+    /// The action waiting for its new shortcut (`None` = not recording).
+    recording: Option<&'static str>,
+    /// Captures the next keystroke app-wide while recording; dropping it stops capturing.
+    intercept: Option<gpui::Subscription>,
+    /// One status line about the last change ("⌘⇧O moved from Go to File", …).
+    note: Option<String>,
+    /// Filters the shortcut table by action name or keystroke.
+    query: Entity<CodeEditor>,
+    /// A "Reset to <preset>" waiting for confirmation — nothing changes until it's confirmed.
+    confirm: Option<Preset>,
+    /// Focused while recording, so modifier presses reach the section's listener.
+    focus: FocusHandle,
+    /// Modifiers held right now while recording — previewed (translucent) in the row as the
+    /// shortcut is built, IDE-style.
+    held: gpui::Modifiers,
+}
+
+impl KeymapEditor {
+    /// A closed editor; the search box repaints the Settings window as it changes.
+    fn new(cx: &mut Context<FerriteMCU>) -> Self {
+        let query = cx.new(|cx| CodeEditor::single_line(cx, "Search shortcuts…"));
+        cx.subscribe(&query, |this, _e, ev, cx| {
+            if matches!(ev, EditorEvent::Changed) && this.settings_win.is_some() {
+                cx.notify();
+            }
+        })
+        .detach();
+        Self {
+            recording: None,
+            intercept: None,
+            note: None,
+            query,
+            confirm: None,
+            focus: cx.focus_handle(),
+            held: gpui::Modifiers::default(),
+        }
+    }
+}
+
+/// The branch-switcher popup's state (bottom-right status-bar chip → dropdown), grouped out
+/// of the `FerriteMCU` god-struct. Defined at the crate root so its fields stay reachable from the
+/// feature modules. `current_branch` deliberately stays on `FerriteMCU` — it's repo state read all
+/// over (refresh/history/status bar), not popup UI.
+struct BranchPopup {
+    /// Local branch names, recency order.
+    list: Vec<String>,
+    /// Remote-only branches (short name, e.g. "feature-x") that have no local head yet —
+    /// shown under a "Remote" section so freshly-fetched branches are checkout-able.
+    remotes: Vec<String>,
+    /// Whether the branch dropdown is open.
+    popup_open: bool,
+    /// Search / new-branch-name box (doubles as the create-branch name field).
+    query: Entity<CodeEditor>,
+    /// Expanded nodes in the branch tree (section keys like "sec:recent" and folder
+    /// keys like "sec:local/feat").
+    expanded: std::collections::HashSet<String>,
+    /// Per-branch `(ahead, behind)` vs the current HEAD — the popup's count badges.
+    /// Gathered in the background ON POPUP OPEN (one `rev-list` per branch), never on
+    /// the render path (same pattern as the worktree popup's changed-file counts).
+    counts: std::collections::HashMap<String, (usize, usize)>,
+    /// Guards `counts` against a superseded gather (bumped per popup open).
+    counts_gen: u64,
+    /// Keyboard highlight over [New Branch, Pull, ...tree rows] (`None` until an arrow key;
+    /// reset as the search changes).
+    hl: Option<usize>,
+    /// Scroll position of the popup's list (keeps the highlight in view).
+    scroll: ScrollHandle,
+}
+
+impl BranchPopup {
+    /// Build initial branch-popup state + wire the search box's live-filter subscription
+    /// (repaints `FerriteMCU` while the popup is open).
+    fn new(cx: &mut Context<FerriteMCU>) -> Self {
+        let query = cx.new(|cx| CodeEditor::single_line(cx, "Search / new branch name"));
+        cx.subscribe(&query, |this, _e, ev, cx| {
+            if matches!(ev, EditorEvent::Changed) && this.branch.popup_open {
+                this.branch.hl = None;
+                cx.notify();
+            }
+        })
+        .detach();
+        Self {
+            list: Vec::new(),
+            remotes: Vec::new(),
+            popup_open: false,
+            query,
+            expanded: std::collections::HashSet::new(),
+            counts: std::collections::HashMap::new(),
+            counts_gen: 0,
+            hl: None,
+            scroll: ScrollHandle::new(),
+        }
+    }
+}
+
+/// The worktree-switcher popup's state (status-bar chip → dropdown, next to the branch
+/// chip), grouped out of the `FerriteMCU` god-struct like `BranchPopup`. The worktree list comes
+/// from the refresh snapshot (one `git worktree list` per refresh, off the UI thread); the
+/// per-worktree changed-file counts are gathered only when the popup opens — one `git
+/// status` per linked worktree, never on the render path.
+struct WorktreePopup {
+    /// Whether the dropdown is open.
+    popup_open: bool,
+    /// All worktrees of the open repo, main first (from the last refresh snapshot).
+    /// Length ≤ 1 ⇔ no linked worktrees ⇔ the chip is hidden.
+    list: Vec<git::Worktree>,
+    /// Changed-file count per worktree path, filled asynchronously on popup open
+    /// (missing entry = still loading). Keyed by the worktree's root path.
+    counts: std::collections::HashMap<PathBuf, usize>,
+    /// Bumped on each popup open so a stale background count-gather can't overwrite
+    /// a newer one.
+    counts_gen: u64,
+    /// Keyboard highlight (index into `list`).
+    hl: Option<usize>,
+    /// The open popup's focus — it takes the keyboard (↑↓ ⏎ ⎋).
+    focus: FocusHandle,
+}
+
+impl WorktreePopup {
+    fn new(cx: &mut App) -> Self {
+        Self {
+            popup_open: false,
+            list: Vec::new(),
+            counts: std::collections::HashMap::new(),
+            counts_gen: 0,
+            hl: None,
+            focus: cx.focus_handle(),
+        }
+    }
+}
+
+/// The in-editor find/replace bar's state, grouped out of the `FerriteMCU` god-struct. Targets
+/// whichever editor was focused when it opened (`target`). Built via [`FindBar::new`], which
+/// wires the query box's live re-search subscription.
+struct FindBar {
+    /// Whether the find bar is open.
+    open: bool,
+    /// Whether the replace row is shown.
+    replace: bool,
+    /// The editor being searched — the focused one when the bar opened (file editor, any
+    /// diff/merge/compare/local-history pane). `None` until first opened.
+    target: Option<Entity<CodeEditor>>,
+    /// The window the bar (and `target`) lives in.
+    host: FindHost,
+    /// `target`'s `content_gen` at the last scan, so a burst of change events for text
+    /// already scanned (Replace All emits one per replacement) re-scans nothing.
+    scanned_gen: u64,
+    /// Re-scans when `target`'s text changes (a file switch, an edit, a reload).
+    target_sub: Option<gpui::Subscription>,
+    /// Search box.
+    query: Entity<CodeEditor>,
+    /// Replace box.
+    replace_query: Entity<CodeEditor>,
+    /// Byte ranges of the current matches in the target editor.
+    matches: Vec<std::ops::Range<usize>>,
+    /// Index of the active match within `matches`.
+    idx: usize,
+}
+
+impl FindBar {
+    /// Build the find/replace bar (both single-line inputs use the `FindBar` key context for
+    /// their enter/escape bindings) and wire the query box's live re-search subscription.
+    fn new(cx: &mut Context<FerriteMCU>) -> Self {
+        let query = cx.new(|cx| {
+            let mut e = CodeEditor::single_line(cx, "Find");
+            e.ctx_override = Some("FindBar");
+            e
+        });
+        let replace_query = cx.new(|cx| {
+            let mut e = CodeEditor::single_line(cx, "Replace");
+            e.ctx_override = Some("FindBar");
+            e
+        });
+        cx.subscribe(&query, |this, _e, ev, cx| {
+            if matches!(ev, EditorEvent::Changed) && this.find.open {
+                this.recompute_find(cx);
+            }
+        })
+        .detach();
+        Self {
+            open: false,
+            replace: false,
+            target: None,
+            host: FindHost::Main,
+            scanned_gen: 0,
+            target_sub: None,
+            query,
+            replace_query,
+            matches: Vec::new(),
+            idx: 0,
+        }
+    }
+}
+
+/// The Go-to-File / Find-in-Files / Actions overlay's state (one overlay, several modes),
+/// grouped out of the `FerriteMCU` god-struct. Built via [`Finder::new`], which wires the query
+/// box's change subscription (in-memory fuzzy match inline, `git grep` content search
+/// debounced on a background thread).
+struct Finder {
+    /// Whether the overlay is open.
+    open: bool,
+    /// Files (Go to File) vs Content (Find in Files) vs Actions palette — same overlay.
+    mode: FinderMode,
+    /// Search box.
+    query: Entity<CodeEditor>,
+    /// Fuzzy file-path results (Files mode).
+    results: Vec<PathBuf>,
+    /// Content-search hits (Content mode).
+    content_results: Vec<ContentHit>,
+    /// Matching palette-action indices (Actions mode).
+    action_results: Vec<usize>,
+    /// Highlighted result row.
+    selected: usize,
+    /// Bumped on every Find-in-Files keystroke; the debounced background `git grep` only
+    /// applies its results when its captured generation still matches (drops stale searches).
+    search_gen: u64,
+}
+
+impl Finder {
+    /// Build the finder overlay + wire the query box's change subscription: Content mode
+    /// debounces a background `git grep`, every other mode is an inline fuzzy match.
+    fn new(cx: &mut Context<FerriteMCU>) -> Self {
+        let query = cx.new(|cx| CodeEditor::single_line(cx, "Type to search files…"));
+        cx.subscribe(&query, |this, _e, ev, cx| {
+            if matches!(ev, EditorEvent::Changed) && this.finder.open {
+                if this.finder.mode == FinderMode::Content {
+                    this.schedule_content_search(cx);
+                } else {
+                    this.recompute_finder(cx);
+                    cx.notify();
+                }
+            }
+        })
+        .detach();
+        Self {
+            open: false,
+            mode: FinderMode::Files,
+            query,
+            results: Vec::new(),
+            content_results: Vec::new(),
+            action_results: Vec::new(),
+            selected: 0,
+            search_gen: 0,
+        }
+    }
+}
+
+/// The first-run / reopened keymap-picker overlay's state, grouped out of the `FerriteMCU`
+/// god-struct (see `render_onboarding`).
+struct Onboarding {
+    /// Whether the picker overlay is open.
+    open: bool,
+    /// True until the user has picked a keymap — the picker can't be dismissed while set.
+    forced: bool,
+    /// Show the recommended language packs before first-run keymap setup.
+    recommended_plugins: bool,
+    /// A persistence error keeps the plugin choice visible so it can be retried.
+    plugins_error: Option<String>,
+    /// The preset currently highlighted in the picker (confirmed via Continue).
+    choice: Preset,
+    /// Pending state of the "Install shell command" checkbox in the picker;
+    /// applied (symlink created) when the user confirms with Continue.
+    install_cmd: bool,
+    /// Last shell-command install error, shown under the checkbox.
+    shell_cmd_error: Option<String>,
+}
+
+/// The bottom terminal panel's state, grouped out of the `FerriteMCU` god-struct. The control
+/// state (`panel`) is always compiled — it's the pure, unit-tested open/close/toggle/focus
+/// state machine (see `src/term_panel.rs`) — so always-compiled code (e.g. `switch_mode`'s
+/// un-maximize) can touch it without a `cfg` gate. Only the PTY-backed tab views + the
+/// panel height live behind the `terminal` feature, centralising the gates here instead of
+/// scattering them across the `FerriteMCU` struct + constructor.
+struct TermState {
+    /// Control state of the panel — open / active / maximized / focus-pending.
+    panel: TermPanel,
+    /// One PTY-backed `TerminalView` entity per tab, left→right in open order.
+    #[cfg(feature = "terminal")]
+    tabs: Vec<Entity<terminal::TerminalView>>,
+    /// Height (px) of the terminal panel, drag-resizable via its top divider.
+    #[cfg(feature = "terminal")]
+    height: f32,
+}
+
+impl TermState {
+    fn new() -> Self {
+        Self {
+            // Starts closed; the persisted "maximized" preference is restored when it opens
+            // (act_toggle_terminal), so the default (all-false) is correct here.
+            panel: TermPanel::default(),
+            #[cfg(feature = "terminal")]
+            tabs: Vec::new(),
+            #[cfg(feature = "terminal")]
+            height: 260.0,
+        }
+    }
+}
+
+/// Linux's own-look choices in Settings → Appearance, grouped out of the `FerriteMCU` god-struct.
+/// They're kept in `ui.json`, next to the other display prefs, and read again at start.
+#[cfg(target_os = "linux")]
+struct DesktopLook {
+    /// Theme → Match desktop: draw with the desktop's fonts and colours (a `theme::Overlay`).
+    match_desktop: bool,
+    /// Terminal → Your terminal: the terminal draws with the user's own terminal
+    /// app's colours and font (a `theme::TerminalLook`); off is FerriteMCU's own terminal.
+    own_terminal: bool,
+    /// The terminal app Your terminal last read (its name, for the note under the choice).
+    terminal_app: Option<&'static str>,
+    /// Text → Your desktop's: glyphs drawn as the desktop draws text (antialiasing, hinting);
+    /// off is FerriteMCU's own smooth text. Takes effect at start (`platform::desktop::text`).
+    desktop_text: bool,
+    /// What the desktop's text rendering read as when Your desktop's was picked in Settings,
+    /// for the note under the choice until a restart applies it.
+    text_read: Option<platform::desktop::text::DesktopText>,
+}
+
+#[cfg(target_os = "linux")]
+impl DesktopLook {
+    /// The saved choices. A `ui.json` from before the Terminal or Text choice existed gives Your
+    /// terminal and Your desktop's text exactly when Match desktop is on, as turning Match
+    /// desktop on now does.
+    fn load() -> Self {
+        let match_desktop = load_ui_bool("match_desktop", false);
+        Self {
+            match_desktop,
+            own_terminal: load_ui_bool("own_terminal_look", match_desktop),
+            terminal_app: None,
+            desktop_text: load_ui_bool("desktop_text", match_desktop),
+            text_read: None,
+        }
+    }
+}
+
+struct BrowseView {
+    /// Rust LSP state is retained independently for every tab, including inactive tabs.
+    lsp_documents: std::collections::HashMap<PathBuf, LspDocumentState>,
+    lsp_active: Option<PathBuf>,
+    lsp_root: Option<PathBuf>,
+    lsp_client: Option<lsp::Client>,
+    lsp_status: lsp::Status,
+    /// All tracked+untracked files (git) or the filesystem walk (non-git) — the tree's data.
+    all_files: Vec<PathBuf>,
+    /// User-created folders still EMPTY on disk — file-derived trees can't see them,
+    /// so they're merged into the tree explicitly (pruned once they gain a file or
+    /// disappear; cleared on project switch).
+    extra_dirs: Vec<PathBuf>,
+    /// The lazy dir→children folder-tree model built from `all_files`.
+    tree: tree::Tree,
+    /// Directories currently expanded in the tree.
+    expanded: std::collections::HashSet<PathBuf>,
+    /// Width of the file-tree pane, drag-resizable via the divider.
+    tree_width: f32,
+    /// True when the file tree is minimized to a thin strip (the `−` button).
+    tree_collapsed: bool,
+    /// The active editor tab (`None` = nothing open).
+    open_path: Option<PathBuf>,
+    /// Open editor tabs, left→right in open order. `open_path` = the active one.
+    open_tabs: Vec<PathBuf>,
+    /// VS Code-style *preview* tab: at most one tab is temporary, shown in italics. A
+    /// single-click in the tree opens here, reusing this same slot for the next single-click;
+    /// a double-click (or editing the file) promotes it to a permanent tab (`= None`).
+    preview_tab: Option<PathBuf>,
+    /// Project-scoped scratch files (absolute paths, outside the repo), shown in the tree.
+    scratches: Vec<PathBuf>,
+    /// Scroll position of the (horizontally scrollable) tab strip, so opening a
+    /// tab that's off-screen can scroll it into view.
+    tab_scroll: ScrollHandle,
+    /// Highlighted row in the tree (file OR folder); drives the breadcrumb.
+    /// Distinct from `open_path` so selecting a folder doesn't change the editor.
+    selected_path: Option<PathBuf>,
+    /// Cmd-clicked FILE rows (ordered). Exactly two → the right-click menu
+    /// offers "Compare Selected" (issue #42). Cleared by any plain click.
+    multi_selected: Vec<PathBuf>,
+    /// Visited-file history for ⌘⌥←/⌘⌥→ back/forward navigation.
+    nav_history: Vec<PathBuf>,
+    /// Current position in `nav_history` (points at the open file's entry).
+    nav_index: usize,
+    /// True while back/forward itself opens a file, so the open doesn't record
+    /// a new history entry (which would truncate the forward branch).
+    nav_suppress: bool,
+    /// Import targets the external-defs index was last computed for — the
+    /// cheap change gate (recompute only when the buffer's import set changes).
+    ext_defs_targets: Vec<String>,
+    /// Generation counter for the external-defs background job (stale results
+    /// from a superseded compute are dropped).
+    ext_defs_gen: u64,
+    /// Scroll position of the tree, so "Select Opened File in Tree" can scroll an
+    /// off-screen row into view.
+    tree_scroll: ScrollHandle,
+    /// The file editor entity.
+    editor: Entity<CodeEditor>,
+    /// Scroll handle for the editor pane — drives the hover scrollbars.
+    editor_scroll: ScrollHandle,
+    /// Vertical scroll handle for the markdown split's code (left) pane.
+    md_editor_scroll: ScrollHandle,
+    /// Vertical scroll handle for the markdown split's rendered preview (right) pane.
+    md_preview_scroll: ScrollHandle,
+    /// Persistent selectable rendered-markdown view (holds the preview's text selection).
+    md_view: Option<gpui::Entity<mdview::MarkdownView>>,
+    /// Editor pane width (px) of the markdown side-by-side split (drag-resizable).
+    md_editor_w: f32,
+    /// Cut/Copy clipboard for the file tree (issue #67). `None` = nothing copied; a paste
+    /// then falls back to the OS clipboard (Finder file copies, image data).
+    clipboard: Option<TreeClip>,
+    /// Keyboard focus of the file tree (arrows walk/fold it, ⏎ opens — issue #81).
+    tree_focus: FocusHandle,
+}
+
+#[derive(Default)]
+struct LspDocumentState {
+    path: PathBuf,
+    version: i64,
+    last_synced_text: String,
+    diagnostics: Vec<lsp::Diagnostic>,
+    open: bool,
+    latest_requests: std::collections::HashMap<lsp::RequestMethod, u64>,
+}
+
+/// A pending cut/copy of tree paths (issue #67). `cut` moves on paste; otherwise it copies.
+#[derive(Clone)]
+struct TreeClip {
+    /// The rel paths that were cut/copied.
+    paths: Vec<PathBuf>,
+    /// True for a cut (paste moves + clears the clipboard); false for a copy.
+    cut: bool,
+}
+
+impl BrowseView {
+    /// Build the file editor + wire its autosave subscription: every real edit persists to
+    /// disk immediately (no Save button). Gated on `dirty` so loading a file (`set_content`
+    /// emits `Changed` with `dirty=false`) doesn't rewrite it.
+    fn new(cx: &mut Context<FerriteMCU>) -> Self {
+        // No placeholder: an empty open file should read as empty, not show prompt text.
+        let editor = cx.new(|cx| CodeEditor::new(cx, String::new(), Lang::PlainText, ""));
+        cx.subscribe(&editor, |this, _e, ev, cx| match ev {
+            EditorEvent::Changed if this.browse.editor.read(cx).dirty => {
+                // Editing a preview (temporary) tab promotes it to a permanent tab — VS Code
+                // behaviour, so the edit survives the next single-click elsewhere.
+                if this.browse.preview_tab.is_some()
+                    && this.browse.preview_tab == this.browse.open_path
+                {
+                    this.browse.preview_tab = None;
+                }
+                this.sync_lsp_change(cx);
+                this.autosave(cx);
+                // Import lines changed → re-index the imported files' definitions
+                // (cheap target-set comparison; the compute itself is background).
+                this.refresh_external_defs(cx);
+            }
+            // ⌘-click on an import link → resolve against the project file list
+            // and open the target (issue #26).
+            EditorEvent::OpenImport(link) => this.open_import_link(link.clone(), cx),
+            // ⌘-click on a USE of an imported symbol → open its file and land
+            // on the definition.
+            EditorEvent::OpenSymbol { link, name } => {
+                this.open_import_symbol(link.clone(), name.clone(), cx);
+            }
+            // ⌘-click on a pre-resolved external definition (imported-files
+            // index) → open the file at the definition.
+            EditorEvent::OpenDefinition { path, range } => {
+                this.open_definition_at(path.clone(), range.clone(), cx);
+            }
+            EditorEvent::CompletionRequested(offset) => {
+                this.request_lsp(lsp::RequestMethod::Completion, *offset)
+            }
+            EditorEvent::DefinitionRequested(offset) => {
+                this.request_lsp(lsp::RequestMethod::Definition, *offset)
+            }
+            EditorEvent::FormatRequested => this.request_lsp(lsp::RequestMethod::Formatting, 0),
+            EditorEvent::HoverRequested(offset) => {
+                if let Some(offset) = offset {
+                    this.request_lsp(lsp::RequestMethod::Hover, *offset);
+                } else {
+                    if let Some(path) = this.browse.lsp_active.as_ref() {
+                        if let Some(doc) = this.browse.lsp_documents.get_mut(path) {
+                            doc.latest_requests.remove(&lsp::RequestMethod::Hover);
+                        }
+                    }
+                    this.browse
+                        .editor
+                        .update(cx, |e, cx| e.set_lsp_hover(None, cx));
+                }
+            }
+            EditorEvent::Changed => {}
+        })
+        .detach();
+        Self {
+            lsp_documents: std::collections::HashMap::new(),
+            lsp_active: None,
+            lsp_root: None,
+            lsp_client: None,
+            lsp_status: lsp::Status::Off,
+            all_files: Vec::new(),
+            extra_dirs: Vec::new(),
+            tree: tree::Tree::default(),
+            // Root folder starts expanded so the tree shows on open.
+            expanded: std::collections::HashSet::from([PathBuf::new()]),
+            tree_width: 320.0,
+            tree_collapsed: false,
+            open_path: None,
+            open_tabs: Vec::new(),
+            preview_tab: None,
+            scratches: Vec::new(),
+            tab_scroll: ScrollHandle::new(),
+            selected_path: None,
+            multi_selected: Vec::new(),
+            nav_history: Vec::new(),
+            nav_index: 0,
+            nav_suppress: false,
+            ext_defs_targets: Vec::new(),
+            ext_defs_gen: 0,
+            tree_scroll: ScrollHandle::new(),
+            editor,
+            editor_scroll: ScrollHandle::new(),
+            md_editor_scroll: ScrollHandle::new(),
+            md_preview_scroll: ScrollHandle::new(),
+            md_view: None,
+            md_editor_w: 480.0,
+            clipboard: None,
+            tree_focus: cx.focus_handle(),
+        }
+    }
+}
+
+/// The Commit view's state, grouped out of the `FerriteMCU` god-struct: the changed-files
+/// checkbox tree, the commit-message editor, and the view chrome. The changed-files *data*
+/// (`files`/`selected`) stays on `FerriteMCU` — it's repo status written by `refresh` and read
+/// by Browse (tab colors) and rollback too, not commit-view-private UI.
+struct CommitView {
+    /// Changed files highlighted as a group in the commit list (e.g. after a folder
+    /// "Commit" picks every change under it). Cleared on a plain single-file click.
+    focus: std::collections::HashSet<PathBuf>,
+    /// Changed files as a folder tree.
+    tree: tree::Tree,
+    /// Expanded dirs in that tree.
+    expanded: std::collections::HashSet<PathBuf>,
+    /// Which changed files are checked-to-commit.
+    checked: std::collections::HashSet<PathBuf>,
+    /// Per-file hunks unticked in the diff gutter (by hunk index) — those changes stay out
+    /// of the commit (partial commit). Absent/empty = the whole file commits. Cleared per
+    /// file on re-diff (indices shift with edits) and wholesale after a commit.
+    excluded_hunks: std::collections::HashMap<PathBuf, std::collections::HashSet<usize>>,
+    /// The commit-message editor, and its box's scroll (a long message scrolls in the box).
+    editor: Entity<CodeEditor>,
+    msg_scroll: ScrollHandle,
+    /// Set by `enter_commit`; `render_commit` consumes it to focus the commit-message input
+    /// on the next frame (deferred so the editor element is in the tree first), so opening
+    /// the Commit view drops the caret straight into the message box.
+    focus_msg: bool,
+    /// Changed-files filter (single-line search above the file list).
+    search: Entity<CodeEditor>,
+    /// True when the changed-files panel is minimized to a thin strip (its `−` button),
+    /// giving the side-by-side diff the full width.
+    collapsed: bool,
+    /// True while a `git commit` is in flight (disables the button, shows "Committing…").
+    committing: bool,
+    /// A hunk revert may have left nothing to commit: the next status read
+    /// (`apply_snapshot`) leaves the Commit view if so.
+    exit_if_clean: bool,
+    /// Why "Initialize Git Repository" asked first: the confirmation's (title, text).
+    init_warning: Option<(&'static str, &'static str)>,
+    /// Keyboard focus of the changed-files tree (arrows, space ticks, ⏎ — issue #81).
+    tree_focus: FocusHandle,
+    /// The tree's keyboard cursor when it's on a FOLDER (`None` = on the selected file).
+    dir_cursor: Option<PathBuf>,
+    /// Scroll position of the changed-files tree (keeps the keyboard cursor in view).
+    tree_scroll: ScrollHandle,
+    /// Keyboard focus of the Push tab's file list.
+    push_focus: FocusHandle,
+}
+
+impl CommitView {
+    /// Build the commit-message editor + the changed-files search box (with its live-filter
+    /// subscription).
+    fn new(cx: &mut Context<FerriteMCU>) -> Self {
+        let msg_scroll = ScrollHandle::new();
+        let editor = cx.new(|cx| {
+            let mut e = CodeEditor::new(cx, String::new(), Lang::PlainText, "Commit message…");
+            e.soft_wrap = true; // wrap long commit messages instead of running off the box
+            e.set_scroll_handle(msg_scroll.clone());
+            e
+        });
+        let search = cx.new(|cx| CodeEditor::single_line(cx, "Search files…"));
+        cx.subscribe(&search, |_this, _e, ev, cx| {
+            if matches!(ev, EditorEvent::Changed) {
+                cx.notify();
+            }
+        })
+        .detach();
+        Self {
+            focus: std::collections::HashSet::new(),
+            tree: tree::Tree::default(),
+            expanded: std::collections::HashSet::new(),
+            checked: std::collections::HashSet::new(),
+            excluded_hunks: std::collections::HashMap::new(),
+            editor,
+            msg_scroll,
+            focus_msg: false,
+            search,
+            collapsed: false,
+            committing: false,
+            exit_if_clean: false,
+            init_warning: None,
+            tree_focus: cx.focus_handle(),
+            dir_cursor: None,
+            tree_scroll: ScrollHandle::new(),
+            push_focus: cx.focus_handle(),
+        }
+    }
+}
+
+/// The side-by-side diff panes' state, grouped out of the `FerriteMCU` god-struct: the two
+/// editor entities (left = base, read-only; right = working copy, editable + live-saving),
+/// the diffed file, the computed diff model, and the pane geometry. (Syntax colouring lives
+/// in each editor, highlighted as its content is set.)
+/// Shared by the commit view, the history view, the push modal, and the Show-Diff window.
+struct DiffPanes {
+    /// The computed line/word diff between `base` and the right pane.
+    current: Option<FileDiff>,
+    /// Base (before) pane — read-only, line numbers on the right toward the gutter.
+    left: Entity<CodeEditor>,
+    /// Working (after) pane — editable; edits debounce into `diff_autosave`.
+    right: Entity<CodeEditor>,
+    /// The file the panes are showing (`None` disables the autosave — e.g. binary files).
+    path: Option<PathBuf>,
+    /// Selected file is an image → previewed as an image instead of a text diff. Kept
+    /// separate from `path` (which stays `None` for binary files) so the diff autosave
+    /// never fires and truncates the image to empty.
+    image: Option<PathBuf>,
+    /// Read-only diff (push/history views) — suppresses the gutter chevrons + autosave.
+    readonly: bool,
+    /// Base (HEAD/index) text of the diffed file, kept so we can re-diff live as the
+    /// right (working) pane is edited without re-reading git each keystroke.
+    base: String,
+    /// Shared 2D scroll for BOTH panes (single element each → gpui axis-locks the wheel;
+    /// both panes track it → aligned in both axes).
+    scroll: ScrollHandle,
+    /// Left pane's fraction of the diff island width (the draggable center divider sets it).
+    split: f32,
+    /// Bumped on every right-pane edit; the debounced autosave only fires when its captured
+    /// generation still matches (so we don't spawn `git status` + re-diff per keystroke).
+    edit_gen: u64,
+}
+
+impl DiffPanes {
+    /// Build both diff editors and wire the right (working) pane's debounced autosave:
+    /// typing fires `Changed` per keystroke, but the save + `git status` + full re-diff are
+    /// expensive (subprocess!), so they only run after the last keystroke settles.
+    fn new(cx: &mut Context<FerriteMCU>) -> Self {
+        let left = cx.new(|cx| {
+            let mut e = CodeEditor::read_only(cx, String::new(), Lang::PlainText);
+            e.gutter_right = true;
+            e
+        });
+        let right = cx.new(|cx| CodeEditor::new(cx, String::new(), Lang::PlainText, ""));
+        cx.subscribe(&right, |this, _e, ev, cx| {
+            if matches!(ev, EditorEvent::Changed) && this.diff.right.read(cx).dirty {
+                this.diff.edit_gen = this.diff.edit_gen.wrapping_add(1);
+                let gen = this.diff.edit_gen;
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(app::DIFF_EDIT_DEBOUNCE)
+                        .await;
+                    this.update(cx, |this, cx| {
+                        if this.diff.edit_gen == gen {
+                            this.diff_autosave(cx);
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        })
+        .detach();
+        Self {
+            current: None,
+            left,
+            right,
+            path: None,
+            image: None,
+            readonly: false,
+            base: String::new(),
+            scroll: ScrollHandle::new(),
+            split: 0.5,
+            edit_gen: 0,
+        }
+    }
+}
+
+/// Which pair of merge sides the resolve window is comparing. `MergeView3` = the default
+/// 3-pane merge; the rest are `IntelliJ`'s "Compare Contents" 2-pane modes (Left = yours,
+/// Middle = the live result, Right = theirs, Base = the common ancestor).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MergeCompare {
+    /// The 3-pane merge view (yours | result | theirs).
+    MergeView3,
+    LeftMiddle,
+    RightMiddle,
+    LeftRight,
+    BaseLeft,
+    BaseMiddle,
+    BaseRight,
+}
+
+impl MergeCompare {
+    /// Dropdown order + labels (the 3-pane view first, then the 2-pane pairs).
+    pub(crate) const ALL: &'static [(MergeCompare, &'static str)] = &[
+        (MergeCompare::MergeView3, "Merge (3-pane)"),
+        (MergeCompare::LeftMiddle, "Left and Middle"),
+        (MergeCompare::RightMiddle, "Right and Middle"),
+        (MergeCompare::LeftRight, "Left and Right"),
+        (MergeCompare::BaseLeft, "Base and Left"),
+        (MergeCompare::BaseMiddle, "Base and Middle"),
+        (MergeCompare::BaseRight, "Base and Right"),
+    ];
+}
+
+/// Merge-conflict resolution state: the in-progress banner, the conflicts-list stage
+/// (files + what each side did), and the 3-pane resolve stage (ours | result | theirs,
+/// each its own read-only `CodeEditor` sharing one scroll).
+struct MergeView {
+    /// `MERGE_HEAD`'s friendly name from the last [`app::RepoSnapshot`] — `Some` = a merge
+    /// is in progress (ours or an external `git merge`/`pull`), drives the banner.
+    in_progress: Option<String>,
+    /// Branch named when the merge was initiated from the branch popup — the label used
+    /// before the next snapshot lands (and the friendlier of the two).
+    source: Option<String>,
+    /// Conflicted files of the in-progress merge + what each side did (the list columns).
+    files: Vec<git::ConflictEntry>,
+    /// Files already resolved + staged from the window this session.
+    resolved: std::collections::HashSet<PathBuf>,
+    /// Selected row of the conflicts LIST stage (drives Accept Yours/Theirs/Merge…).
+    list_sel: Option<usize>,
+    /// Index into `files` of the file open in the RESOLVE stage (`None` = list stage).
+    selected: Option<usize>,
+    /// The 3-way model for the selected file.
+    model: Option<ferritemcu_diff::merge::Merge3>,
+    /// Per-chunk resolution state, indexed by chunk (every non-stable chunk consults it —
+    /// clean chunks start pending; the "apply non-conflicting" toolbar bulk-applies them).
+    res: Vec<ferritemcu_diff::merge::Resolution>,
+    /// Each chunk's line range in the CURRENT result text (recomputed with `res` — see
+    /// `reload_merge_result`), so the render pass never rebuilds the result.
+    res_ranges: Vec<std::ops::Range<usize>>,
+    /// Cached index stages of the selected file (1/2/3) — feeds the model, the whole-file
+    /// accepts, and the Compare Contents pairs without re-shelling git.
+    base_text: String,
+    /// See `base_text` (stage 2 — ours).
+    ours_text: String,
+    /// See `base_text` (stage 3 — theirs).
+    theirs_text: String,
+    /// How lines are compared (exact / trim / ignore-all-whitespace).
+    ws: ferritemcu_diff::merge::WhitespaceMode,
+    /// The whitespace dropdown.
+    ws_sel: ui::SelectState,
+    /// Which contents the resolve stage is showing (3-pane merge or a 2-pane pair).
+    compare: MergeCompare,
+    /// The Compare Contents dropdown.
+    compare_sel: ui::SelectState,
+    /// Left pane: the current branch's version ("yours").
+    ours: Entity<CodeEditor>,
+    /// Center pane: the live merge result (rebuilt as conflicts are resolved).
+    result: Entity<CodeEditor>,
+    /// Right pane: the incoming branch's version ("theirs").
+    theirs: Entity<CodeEditor>,
+    /// The two panes of a Compare Contents pair (kept separate from the merge panes so
+    /// switching back to the 3-pane view never reloads/clobbers them).
+    cmp_l: Entity<CodeEditor>,
+    /// See `cmp_l`.
+    cmp_r: Entity<CodeEditor>,
+    /// Shared 2D scroll for the three merge panes (keeps the aligned rows in sync).
+    scroll: ScrollHandle,
+    /// Shared scroll for the two compare panes.
+    cmp_scroll: ScrollHandle,
+    /// A merge / abort / commit git op in flight (disables the window's buttons).
+    busy: bool,
+    /// Transient success note ("Merged X into Y", "Already up to date") — a neutral
+    /// banner (the op-error banner is for failures), dismissed by its × button.
+    note: Option<String>,
+}
+
+impl MergeView {
+    fn new(cx: &mut Context<FerriteMCU>) -> Self {
+        let mk = |cx: &mut Context<FerriteMCU>| {
+            cx.new(|cx| {
+                let mut e = CodeEditor::read_only(cx, String::new(), Lang::PlainText);
+                e.line_numbers = true;
+                e
+            })
+        };
+        Self {
+            in_progress: None,
+            source: None,
+            files: Vec::new(),
+            resolved: std::collections::HashSet::new(),
+            list_sel: None,
+            selected: None,
+            model: None,
+            res: Vec::new(),
+            res_ranges: Vec::new(),
+            base_text: String::new(),
+            ours_text: String::new(),
+            theirs_text: String::new(),
+            // Default to ignoring whitespace: formatting-only divergence shouldn't read
+            // as a conflict (switchable per-file from the toolbar dropdown).
+            ws: ferritemcu_diff::merge::WhitespaceMode::IgnoreAll,
+            ws_sel: ui::SelectState::new(cx),
+            compare: MergeCompare::MergeView3,
+            compare_sel: ui::SelectState::new(cx),
+            ours: mk(cx),
+            result: mk(cx),
+            theirs: mk(cx),
+            cmp_l: mk(cx),
+            cmp_r: mk(cx),
+            scroll: ScrollHandle::new(),
+            cmp_scroll: ScrollHandle::new(),
+            busy: false,
+            note: None,
+        }
+    }
+}
+
+/// Self-update state, grouped out of the `FerriteMCU` god-struct: the newer release on offer, the
+/// in-flight download, and when GitHub was last asked (a window refocus rechecks once stale).
+#[derive(Default)]
+struct SelfUpdate {
+    /// A newer release found on GitHub (drives the update banner); `None` = up to date / unknown.
+    available: Option<update::Release>,
+    /// True while a download-swap is in flight (disables the button, shows progress).
+    updating: bool,
+    /// When the last release check started; `None` = never.
+    checked_at: Option<std::time::Instant>,
+    /// The version whose banner was dismissed — a recheck only re-raises a newer one.
+    dismissed: Option<String>,
+}
+
+/// Remote-sync state (push/pull/fetch vs `origin`), grouped out of the `FerriteMCU` god-struct:
+/// the ahead/behind counts, the in-flight operation flags, and what a push would send.
+/// Named `SyncState` (not `Sync`) so it doesn't shadow the `std::marker::Sync` trait.
+struct SyncState {
+    /// Commits ahead of the push base — the status-bar Push badge. `None` = unborn HEAD.
+    ahead: Option<usize>,
+    /// Commits behind the upstream — the status-bar Pull badge. `None` = no upstream.
+    behind: Option<usize>,
+    /// True while a push is in flight (disables the button, shows "Pushing…").
+    pushing: bool,
+    /// True while a pull is in flight.
+    pulling: bool,
+    /// True while a fetch is in flight.
+    fetching: bool,
+    /// Last push/pull failure message (also carried into the op-error banner).
+    push_msg: Option<String>,
+    /// Files a push would send (the Push tab's list + count badge), kept live by `refresh`.
+    push_files: Vec<ChangedFile>,
+    /// The revision a push is measured against (see `Repo::push_base`).
+    push_base: String,
+    /// Selected file index in the Push tab's list.
+    push_selected: Option<usize>,
+    /// Folder tree of `push_files` (Push tab + Push window), rebuilt by `set_push_files`.
+    push_tree: tree::Tree,
+    /// Expanded dirs in the push tree (`""` = the root row).
+    push_expanded: std::collections::HashSet<PathBuf>,
+    /// The push tree's keyboard cursor when it's on a FOLDER (`None` = on the selected file).
+    push_dir_cursor: Option<PathBuf>,
+    /// Scroll position of the push tree (keeps the keyboard cursor in view).
+    push_scroll: ScrollHandle,
+}
+
+impl SyncState {
+    fn new() -> Self {
+        Self {
+            ahead: None,
+            behind: None,
+            pushing: false,
+            pulling: false,
+            fetching: false,
+            push_msg: None,
+            push_files: Vec::new(),
+            push_base: String::new(),
+            push_selected: None,
+            push_tree: tree::Tree::default(),
+            push_expanded: std::collections::HashSet::new(),
+            push_dir_cursor: None,
+            push_scroll: ScrollHandle::new(),
+        }
+    }
+
+    /// Replace the files a push would send. The tree is only rebuilt (fully expanded, like
+    /// the Commit tree) when the set of paths changes, so a periodic refresh doesn't undo
+    /// the user's folder collapses.
+    fn set_push_files(&mut self, files: Vec<ChangedFile>) {
+        let same = files.len() == self.push_files.len()
+            && files
+                .iter()
+                .zip(&self.push_files)
+                .all(|(a, b)| a.path == b.path);
+        self.push_files = files;
+        if same {
+            return;
+        }
+        let paths: Vec<PathBuf> = self.push_files.iter().map(|f| f.path.clone()).collect();
+        self.push_tree = tree::Tree::build(&paths);
+        self.push_dir_cursor = None;
+        self.push_expanded.clear();
+        self.push_expanded.insert(PathBuf::new());
+        for p in &paths {
+            for anc in p.ancestors().skip(1) {
+                self.push_expanded.insert(anc.to_path_buf());
+            }
+        }
+    }
+}
+
+/// FPS monitor state (toggled from the FerriteMCU menu), grouped out of the `FerriteMCU` god-struct:
+/// smoothed frames-per-second + the throttled snapshot the overlay displays.
+struct Fps {
+    /// Whether the FPS overlay is shown (persisted across launches).
+    show: bool,
+    /// Smoothed frames-per-second, updated every frame.
+    value: f32,
+    /// Throttled snapshot of `value` — the number the overlay displays, held steady for a
+    /// readable beat rather than re-rendering a blurred number every frame.
+    shown: f32,
+    /// Time of the previous frame (drives the per-frame delta).
+    last: Option<std::time::Instant>,
+    /// Throttle timer for the `shown` snapshot (~5/sec).
+    shown_at: Option<std::time::Instant>,
+}
+
+struct FerriteMCU {
+    /// None = no project open → the Projects landing view.
+    repo_root: Option<PathBuf>,
+    /// `(project root, its git toplevel)` from the last status read — what `repo()` opens
+    /// without re-running `git rev-parse`. The toplevel is `None` for a plain folder.
+    repo_top: Option<(PathBuf, Option<PathBuf>)>,
+    /// Roots of every open project, in tab order. The active one == `repo_root`. Project tabs
+    /// render only when this holds more than one. Empty ⇔ `repo_root` is None (landing view).
+    open_projects: Vec<PathBuf>,
+    /// Saved per-project UI state for the *inactive* tabs (keyed by root). See `ProjectSession`.
+    project_sessions: std::collections::HashMap<PathBuf, ProjectSession>,
+    mode: Mode,
+    focus_handle: FocusHandle,
+    keymap: Keymap,
+    plugins: Plugins,
+    /// Packs the user dismissed via "Ignore extension" (session-only, suppresses the banner).
+    ignored_packs: std::collections::HashSet<&'static str>,
+
+    // Projects landing
+    recents: Recents,
+    project_search: Entity<CodeEditor>,
+    /// Keyboard highlight in the Projects landing list (index into the filtered recents).
+    projects_hl: Option<usize>,
+
+    // Commit mode
+    files: Vec<ChangedFile>,
+    /// Per-file `(added, removed)` line counts (numstat), refreshed with `files`. Files
+    /// absent here (binaries) just render without the count.
+    stats: std::collections::HashMap<PathBuf, (usize, usize)>,
+    /// `files` lists only the first `git::UNTRACKED_CAP` untracked files — more exist
+    /// (the status bar says so).
+    untracked_capped: bool,
+    selected: Option<usize>,
+    /// Commit view (checkbox tree, message editor, chrome) — grouped into one sub-struct
+    /// (see `CommitView`).
+    commit: CommitView,
+    /// Side-by-side diff panes (both editors, the diff model + cached spans, geometry) —
+    /// grouped into one sub-struct (see `DiffPanes`).
+    diff: DiffPanes,
+    /// The single in-flight divider drag, if any: which divider + the grab offset captured at
+    /// mouse-down (cursor coord minus the divider's position). One field for every divider —
+    /// see `Divider` and `FerriteMCU::drag_divider`.
+    divider_drag: Option<(Divider, f32)>,
+    /// Active scrollbar-thumb drag (which scroll handle, axis, grab cursor, grab offset).
+    /// Carries the `ScrollHandle` so the shared scrollbar works on any scrollable view.
+    sb_drag: Option<SbDrag>,
+    /// Per-view snapshot of the dims the scrollbars were last drawn with, so a layout change
+    /// schedules exactly one follow-up frame (scroll metrics are only known *after* a paint, so
+    /// the first frame after open/resize is stale). Keyed by view; converges, no redraw loop.
+    scroll_dims: std::collections::HashMap<SbView, ScrollDims>,
+    /// One-shot: has the Projects search box been auto-focused since the landing appeared?
+    /// Reset while a project is open, so returning to the landing re-focuses search.
+    projects_search_focused: bool,
+
+    // Browse mode — folder tree + editor tabs + file editor + markdown split, all grouped
+    // into one sub-struct (see `BrowseView`).
+    browse: BrowseView,
+
+    // In-editor find / replace bar — all its state grouped into one sub-struct (see `FindBar`).
+    // Targets whichever editor was focused when it opened (`find.target`).
+    find: FindBar,
+    /// FPS monitor state — grouped into one sub-struct (see `Fps`).
+    fps: Fps,
+
+    // Overlays
+    /// Go-to-File / Find-in-Files / Actions overlay state — grouped into one sub-struct
+    /// (see `Finder`).
+    finder: Finder,
+    /// First-run / reopened keymap-picker overlay — grouped into one sub-struct
+    /// (see `Onboarding`).
+    onboarding: Onboarding,
+    /// Language-pack manager: a native modal window (like Rollback/Push), + its search box.
+    plugins_win: Option<gpui::WindowHandle<ModalWindow>>,
+    plugins_query: Entity<CodeEditor>,
+    /// Font specimen modal window: the bundled families at each weight, large preview lines.
+    fonts_win: Option<gpui::WindowHandle<ModalWindow>>,
+    /// "Clear Data & Restart" confirmation — a native modal window (native-menu action).
+    clear_data_win: Option<gpui::WindowHandle<ModalWindow>>,
+    /// "Clear Local History" confirmation — wipes the open project's snapshot store.
+    clear_lh_win: Option<gpui::WindowHandle<ModalWindow>>,
+    /// "Initialize Git Repository" confirmation, for a home folder or a huge one.
+    git_init_win: Option<gpui::WindowHandle<ModalWindow>>,
+    /// "What's New" changelog — a native modal window mirroring GitHub Releases (issue #71).
+    changelog_win: Option<gpui::WindowHandle<ModalWindow>>,
+    /// Its state: the fetched release list, the selected row, and the markdown pane.
+    changelog: ChangelogView,
+    /// Settings — a native modal window with a category sidebar (Appearance/Keymap/…).
+    settings_win: Option<gpui::WindowHandle<ModalWindow>>,
+    /// Which Settings category the sidebar has selected.
+    settings_section: SettingsSection,
+    /// Whether the Rust language plugin may launch rust-analyzer for Cargo projects.
+    rust_analyzer_enabled: bool,
+    /// The Appearance → Theme select dropdown.
+    settings_theme: ui::SelectState,
+    /// Appearance → Match desktop and Terminal (Linux).
+    #[cfg(target_os = "linux")]
+    desktop_look: DesktopLook,
+    /// The Keymap section's shortcut editor (recording state + last change's note).
+    keymap_editor: KeymapEditor,
+    /// Cached `(path, registered family name)` for the open font file's preview.
+    font_preview: Option<(PathBuf, SharedString)>,
+    /// Contents of `crash.log` if the previous run crashed — drives the report banner.
+    pending_crash: Option<String>,
+    /// A native folder picker is open (Open / New Project / Add space): another press waits
+    /// for it, since off macOS the picker doesn't block FerriteMCU (`FerriteMCU::prompt_folder`).
+    folder_picker_open: bool,
+    /// Last failed git operation (commit/push/rollback/branch/checkout/status), surfaced
+    /// in a dismissible banner so a silent failure never looks like success. Cleared on
+    /// the next successful `refresh`. `None` = no outstanding error.
+    op_error: Option<String>,
+    /// An operation error raised alongside a `refresh` (rollback/pull/fetch/push/branch),
+    /// stashed here instead of `op_error` because `refresh` is now asynchronous: the
+    /// background status read clears `op_error` on success, which would wipe a message set
+    /// synchronously right after. `apply_snapshot` re-applies this once, after the clear, so
+    /// the message survives exactly that refresh cycle (matching the old synchronous order).
+    pending_error: Option<String>,
+    /// Open right-click context menu, if any.
+    context_menu: Option<ContextMenu>,
+    /// The open menu panel's focus (it takes the keyboard while open — issue #81).
+    menu_focus: FocusHandle,
+    /// A menu just opened: focus it on the hosting window's next render.
+    menu_focus_pending: bool,
+    /// What had focus before the menu took it — restored when the menu closes.
+    menu_return_focus: Option<FocusHandle>,
+    /// The main window's bounds, refreshed each frame in `impl Render for FerriteMCU`.
+    main_window_bounds: Option<gpui::WindowBounds>,
+    /// The main window's title-bar state (client-side decorations off macOS), refreshed each
+    /// frame in `impl Render for FerriteMCU`.
+    chrome: chrome::WindowChrome,
+    /// True when the main window is showing the full-screen Show-Diff view (rollback/push diff).
+    /// It replaces the normal mode content and reuses the inline `render_diff`, so it inherits
+    /// all editor functionality (find, divider drag, scroll). Escape / the Back button exits.
+    diff_view_open: bool,
+    /// Rollback — its own native OS window (real titlebar + traffic lights). `None` closed.
+    rollback_win: Option<gpui::WindowHandle<ModalWindow>>,
+    /// "Create New Branch" dialog — its own native window. The name is typed into
+    /// `branch_query` (reused), with these toggles.
+    new_branch_win: Option<gpui::WindowHandle<ModalWindow>>,
+    /// ESP board and serial settings — their own native utility window.
+    esp_board_win: Option<gpui::WindowHandle<ModalWindow>>,
+    new_branch_checkout: bool,
+    new_branch_overwrite: bool,
+    rollback_checked: std::collections::HashSet<PathBuf>,
+    rollback_delete_added: bool,
+    /// Delete-confirmation modal: the (path, `is_dir`) pending deletion.
+    delete_target: Option<(PathBuf, bool)>,
+    /// New-file / rename modal state + its single-line name input.
+    name_prompt: Option<NamePrompt>,
+    name_input: Entity<CodeEditor>,
+
+    // Branch switcher (bottom-right status bar + popup)
+    /// Whether the open project is inside a git working tree. `false` for a plain folder —
+    /// the UI hides every git action (branch chip, git menu items, commit/history) and the
+    /// git views explain why instead of offering broken buttons (issue #66).
+    is_git: bool,
+    /// Current branch name (repo state — read by refresh/history/status bar, hence kept
+    /// directly on `FerriteMCU` rather than in `BranchPopup`).
+    current_branch: Option<String>,
+    /// Branch-switcher popup state (list/remotes/open/query/expanded — see `BranchPopup`).
+    branch: BranchPopup,
+    /// Worktree-switcher popup state (status-bar chip → dropdown — see `WorktreePopup`).
+    worktree: WorktreePopup,
+    /// Bumped on every edit; a debounced task only refreshes git status once this
+    /// stops changing (so typing stays snappy but status/tab colors catch up).
+    refresh_gen: u64,
+    /// Remote-sync state (ahead/behind, in-flight push/pull/fetch flags, what a push would
+    /// send) — grouped into one sub-struct (see `SyncState`).
+    sync: SyncState,
+    /// Push confirmation — its own native OS window (`None` closed).
+    push_win: Option<gpui::WindowHandle<ModalWindow>>,
+    /// Which tab the git (Commit) view is showing — staging changes or pushing commits.
+    git_tab: GitTab,
+
+    /// Self-update — the update banner's state (see `SelfUpdate`).
+    self_update: SelfUpdate,
+
+    // History (git log) view — all its state grouped into one sub-struct (see `HistoryView`).
+    history: HistoryView,
+
+    /// Merge-conflict resolution — its own native window (`ModalKind::Merge`).
+    merge_win: Option<gpui::WindowHandle<ModalWindow>>,
+    /// Merge state (in-progress banner + the 3-pane resolve window — see `MergeView`).
+    merge: MergeView,
+
+    /// Compare-two-files — its own native window (`ModalKind::Compare`).
+    compare_win: Option<gpui::WindowHandle<ModalWindow>>,
+    /// Compare state (paths + aligned panes — see `CompareView`).
+    compare: CompareView,
+
+    /// Local History — its own native window (`ModalKind::LocalHistory`).
+    local_history_win: Option<gpui::WindowHandle<ModalWindow>>,
+    /// Local-history state: config + the project store + the window (see `LocalHistoryView`).
+    lh: LocalHistoryView,
+
+    /// Filesystem watcher on the open project (`FSEvents` on macOS). Its callback forwards
+    /// to a debounced `schedule_status_refresh`, so an external create/edit updates git
+    /// status + feeds local history without a window refocus. Dropping it stops watching,
+    /// so it's kept alive here for the project's lifetime (see `sync_fs_watcher`).
+    fs_watcher: Option<notify::RecommendedWatcher>,
+    /// The project `fs_watcher` is rooted at — a mismatch with `repo_root` re-arms it.
+    watch_root: Option<PathBuf>,
+    /// Why the OS refused to watch `watch_root` (Linux: e.g. the inotify watch limit), so
+    /// the status bar can say live refresh is off. `None` while watching normally.
+    watch_off: Option<SharedString>,
+
+    // Bottom terminal panel — control state + (feature-gated) PTY tab views, grouped into
+    // one sub-struct (see `TermState`).
+    term: TermState,
+    /// ESP target selection and asynchronous tool-operation state.
+    embedded: EmbeddedState,
+}
+
+/// In-IDE state for Espressif target operations. Kept separate from git/editor session state.
+struct EmbeddedState {
+    chip: &'static str,
+    ports: Vec<String>,
+    selected_port: Option<String>,
+    board_picker_open: bool,
+    port_picker_open: bool,
+    advanced_open: bool,
+    advanced_picker: Option<EmbeddedAdvancedPicker>,
+    release_build: bool,
+    flash_baud_rate: u32,
+    monitor_baud_rate: u32,
+    monitor_after_flash: bool,
+    busy: Option<String>,
+    message: String,
+    monitor_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl Default for EmbeddedState {
+    fn default() -> Self {
+        Self {
+            chip: "esp32c3",
+            ports: Vec::new(),
+            selected_port: None,
+            board_picker_open: false,
+            port_picker_open: false,
+            advanced_open: false,
+            advanced_picker: None,
+            release_build: false,
+            flash_baud_rate: 460_800,
+            monitor_baud_rate: 115_200,
+            monitor_after_flash: false,
+            busy: None,
+            message: "ESP tools ready".into(),
+            monitor_stop: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EmbeddedAdvancedPicker {
+    BuildProfile,
+    FlashBaud,
+    MonitorBaud,
+}
+
+/// Which native modal a `ModalWindow` is showing. Each delegates its body back into `FerriteMCU`
+/// (the data + actions live there); the window is just a host with a native titlebar.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModalKind {
+    Rollback,
+    Push,
+    NewBranch,
+    Plugins,
+    Fonts,
+    ClearData,
+    Settings,
+    /// ESP board and serial-port configuration in its own native window.
+    EspBoard,
+    /// 3-pane merge-conflict resolution (yours | result | theirs).
+    Merge,
+    /// Two-file side-by-side compare with an apply gutter (issue #42).
+    Compare,
+    /// Per-file local-history timeline + snapshot ↔ current diff (issue #7).
+    LocalHistory,
+    /// "Clear Local History" confirmation (destructive — wipes the project's store).
+    ClearLocalHistory,
+    /// "Initialize Git Repository" in a home folder or a huge one — asks first.
+    ConfirmGitInit,
+    /// "What's New": the published releases + their notes (issue #71).
+    Changelog,
+}
+
+/// Changelog-window state (issue #71): the GitHub release list, which one is showing, and
+/// the markdown pane its notes render into. Fetched lazily on first open (see
+/// `views/changelog.rs`); a failure leaves `error` set and the list empty.
+struct ChangelogView {
+    /// Published releases, newest first.
+    notes: Vec<update::ReleaseNote>,
+    /// Index into `notes` of the release being shown.
+    selected: usize,
+    /// A fetch is in flight (shows "Loading releases…").
+    loading: bool,
+    /// Why the last fetch failed / why there's nothing to show (shows Retry + a GitHub link).
+    error: Option<String>,
+    /// The selected release's notes, rendered as selectable markdown.
+    body: Entity<mdview::MarkdownView>,
+}
+
+impl ChangelogView {
+    fn new(cx: &mut Context<FerriteMCU>) -> Self {
+        Self {
+            notes: Vec::new(),
+            selected: 0,
+            loading: false,
+            error: None,
+            body: cx.new(|cx| mdview::MarkdownView::new("", None, cx)),
+        }
+    }
+}
+
+/// Compare-two-files state (issue #42): the chosen paths, the computed diff, and
+/// two read-only aligned panes sharing one scroll — the merge Compare Contents
+/// pattern, plus a center gutter that applies hunks either direction.
+struct CompareView {
+    /// Left file (repo-relative, or absolute for scratches).
+    left_path: Option<PathBuf>,
+    /// Right file.
+    right_path: Option<PathBuf>,
+    /// The current diff (left = old, right = new). `None` until both sides load.
+    diff: Option<FileDiff>,
+    /// Left pane (read-only; applying writes files and reloads).
+    left: Entity<CodeEditor>,
+    /// Right pane.
+    right: Entity<CodeEditor>,
+    /// Shared scroll for both panes + the gutter.
+    scroll: ScrollHandle,
+}
+
+impl CompareView {
+    fn new(cx: &mut Context<FerriteMCU>) -> Self {
+        let mk = |cx: &mut Context<FerriteMCU>| {
+            cx.new(|cx| {
+                let mut e = CodeEditor::read_only(cx, String::new(), Lang::PlainText);
+                e.line_numbers = true;
+                e
+            })
+        };
+        Self {
+            left_path: None,
+            right_path: None,
+            diff: None,
+            left: mk(cx),
+            right: mk(cx),
+            scroll: ScrollHandle::new(),
+        }
+    }
+}
+
+/// Local-history state (issue #7): the persisted config, the open project's snapshot
+/// store (shared with background record tasks), the save-burst flush state, and the
+/// Local History window (timeline + snapshot ↔ current aligned panes — the compare
+/// pattern). See `views/local_history.rs` for all the logic.
+struct LocalHistoryView {
+    /// Persisted settings (enabled / retention / throttle — `history.json`).
+    cfg: ferritemcu_config::history::HistoryCfg,
+    /// The open project's snapshot store. `None` = disabled or no project. Shared with
+    /// background record tasks (all disk writes happen off the UI thread).
+    store: Option<std::sync::Arc<std::sync::Mutex<ferritemcu_local_history::Store>>>,
+    /// The project `store` belongs to — a mismatch with `repo_root` triggers a re-open.
+    store_root: Option<PathBuf>,
+    /// Paths saved since the last flush; snapshotted together when the throttle fires.
+    pending: std::collections::HashSet<PathBuf>,
+    /// Whether a throttle flush timer is already armed.
+    flush_scheduled: bool,
+    /// An external-change scan is running (`lh_scan_external`) — scans never overlap.
+    scanning: bool,
+    /// A refresh asked for a scan while one ran; it runs again when that one finishes.
+    rescan: bool,
+    /// The file the Local History window is showing.
+    path: Option<PathBuf>,
+    /// Its timeline, newest first.
+    events: Vec<ferritemcu_local_history::Event>,
+    /// Selected timeline row.
+    selected: usize,
+    /// Files changed at or since the selected snapshot (distinct paths of
+    /// `events[0..=selected]` still differing from their state at it, sorted) — the
+    /// bottom "changed files" panel. Every listed file has a working revert.
+    files: Vec<PathBuf>,
+    /// `files` as a tree (folders + files, the Browse-tree model).
+    files_tree: tree::Tree,
+    /// Expanded dirs in the changed-files panel (reset to all-expanded on recompute).
+    files_expanded: std::collections::HashSet<PathBuf>,
+    /// The changed-files panel's selection — the file the diff panes + restores target.
+    /// `None` falls back to the selected event's own file.
+    file_selected: Option<PathBuf>,
+    /// The targeted file is missing from disk (deleted since the snapshot) — the
+    /// header says "Deleted" instead of an empty "Current" pane.
+    current_missing: bool,
+    /// Snapshot (old) → current (new) diff for the selected row.
+    diff: Option<FileDiff>,
+    /// Left pane — the snapshot (read-only).
+    left: Entity<CodeEditor>,
+    /// Right pane — the current file (read-only; restores write the file and re-diff).
+    right: Entity<CodeEditor>,
+    /// Shared scroll for both panes + the gutter.
+    scroll: ScrollHandle,
+}
+
+impl LocalHistoryView {
+    fn new(cx: &mut Context<FerriteMCU>) -> Self {
+        let mk = |cx: &mut Context<FerriteMCU>| {
+            cx.new(|cx| {
+                let mut e = CodeEditor::read_only(cx, String::new(), Lang::PlainText);
+                e.line_numbers = true;
+                e
+            })
+        };
+        Self {
+            cfg: ferritemcu_config::history::HistoryCfg::load(),
+            store: None,
+            store_root: None,
+            pending: std::collections::HashSet::new(),
+            flush_scheduled: false,
+            scanning: false,
+            rescan: false,
+            path: None,
+            events: Vec::new(),
+            selected: 0,
+            files: Vec::new(),
+            files_tree: tree::Tree::default(),
+            files_expanded: std::collections::HashSet::new(),
+            file_selected: None,
+            current_missing: false,
+            diff: None,
+            left: mk(cx),
+            right: mk(cx),
+            scroll: ScrollHandle::new(),
+        }
+    }
+}
+
+/// Which category the Settings window's sidebar has selected. Drives `render_settings_body`'s
+/// content pane.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettingsSection {
+    Appearance,
+    Keymap,
+    LanguagePacks,
+    LanguageServer,
+    LocalHistory,
+}
+
+impl SettingsSection {
+    /// Sidebar order + labels.
+    pub(crate) const ALL: &'static [(SettingsSection, &'static str)] = &[
+        (SettingsSection::Appearance, "Appearance"),
+        (SettingsSection::Keymap, "Keymap"),
+        (SettingsSection::LanguagePacks, "Language Packs"),
+        (SettingsSection::LanguageServer, "Language Server"),
+        (SettingsSection::LocalHistory, "Local History"),
+    ];
+}
+
+/// A separate native OS window hosting one of FerriteMCU's modals (Rollback / Push / …). It holds
+/// the `FerriteMCU` entity, observes it (so checkbox/refresh changes repaint), and builds its body
+/// by delegating into `FerriteMCU` — `ferritemcu.update(..)` is safe here because the window is opened
+/// from a spawned task (never during a `FerriteMCU` update), so there's no re-entrant lease.
+struct ModalWindow {
+    ferritemcu: Entity<FerriteMCU>,
+    kind: ModalKind,
+    focus: FocusHandle,
+    /// The window's title, for the title strip it draws under client-side decorations.
+    title: SharedString,
+    /// A press on that strip a drag would move the window from (see `chrome::drag_area`).
+    drag_armed: std::rc::Rc<chrome::DragState>,
+}
+
+impl ModalWindow {
+    fn new(
+        ferritemcu: Entity<FerriteMCU>,
+        kind: ModalKind,
+        title: SharedString,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        cx.observe(&ferritemcu, |_, _, cx| cx.notify()).detach();
+        // A find bar hosted here goes with the window (it would otherwise linger "open"
+        // with nowhere to render, eating the main window's Escape).
+        let host_of = ferritemcu.clone();
+        cx.on_release(move |_, cx| {
+            host_of.update(cx, |k, kcx| {
+                k.find_host_closed(FindHost::Modal(kind), kcx);
+                // Closing Settings mid-record must not leave the keystroke capture running.
+                if kind == ModalKind::Settings {
+                    k.stop_key_recording();
+                }
+            });
+        })
+        .detach();
+        Self {
+            ferritemcu,
+            kind,
+            focus: cx.focus_handle(),
+            title,
+            drag_armed: std::rc::Rc::default(),
+        }
+    }
+}
+
+impl Focusable for ModalWindow {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl Render for ModalWindow {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let ferritemcu = self.ferritemcu.clone();
+        let kind = self.kind;
+        // A context menu opened in this window takes the keyboard (issue #81).
+        ferritemcu.update(cx, |k, kcx| {
+            k.focus_menu_if_pending(Some(kind), window, kcx);
+        });
+        let body = ferritemcu.update(cx, |k, kcx| match kind {
+            ModalKind::Rollback => k.render_rollback_body(kcx),
+            ModalKind::Push => k.render_push_body(kcx),
+            ModalKind::NewBranch => k.render_new_branch_body(kcx),
+            ModalKind::Plugins => k.render_plugins_body(kcx),
+            ModalKind::Fonts => k.render_fonts_body(kcx),
+            ModalKind::ClearData => k.render_clear_data_body(kcx),
+            ModalKind::Settings => k.render_settings_body(kcx),
+            ModalKind::EspBoard => k.render_esp_board_body(kcx),
+            ModalKind::Merge => k.render_merge_body(kcx),
+            ModalKind::Compare => k.render_compare_body(kcx),
+            ModalKind::LocalHistory => k.render_local_history_body(kcx),
+            ModalKind::ClearLocalHistory => k.render_clear_local_history_body(kcx),
+            ModalKind::ConfirmGitInit => k.render_confirm_git_init_body(kcx),
+            ModalKind::Changelog => k.render_changelog_body(kcx),
+        });
+        // ⌘F over a pane here: the body floats the find bar over its panes (`find_bar`).
+        let host = FindHost::Modal(kind);
+        // Drawing its own decorations (Wayland), the window gets a title strip with a close
+        // button, and resize handles along its edges (see `chrome`).
+        let client = chrome::client_decorations(window);
+        let body = match client {
+            Some(_) => div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(chrome::modal_title_strip(
+                    self.title.clone(),
+                    &self.drag_armed,
+                ))
+                .child(div().flex_1().min_h_0().child(body))
+                .into_any_element(),
+            None => body,
+        };
+        div()
+            .track_focus(&self.focus)
+            .key_context("Modal")
+            .size_full()
+            // ⌘F / ⌘R / ⌘G & co. resolve against this window's panes. The handlers are
+            // `FerriteMCU`'s; the bar's own Escape/Enter fire from its "FindBar" key context
+            // (dispatched before `on_key_down`, so Escape closes the bar, not the window).
+            .on_action(cx.listener(move |this, _: &FindInFile, w, cx| {
+                this.ferritemcu
+                    .update(cx, |k, kcx| k.open_find(host, false, w, kcx));
+            }))
+            .on_action(cx.listener(move |this, _: &ReplaceInFile, w, cx| {
+                this.ferritemcu
+                    .update(cx, |k, kcx| k.open_find(host, true, w, kcx));
+            }))
+            .on_action(cx.listener(|this, a: &FindNext, w, cx| {
+                this.ferritemcu.update(cx, |k, kcx| k.find_next(a, w, kcx));
+            }))
+            .on_action(cx.listener(|this, a: &FindPrev, w, cx| {
+                this.ferritemcu.update(cx, |k, kcx| k.find_prev(a, w, kcx));
+            }))
+            .on_action(cx.listener(|this, a: &CloseFind, w, cx| {
+                this.ferritemcu.update(cx, |k, kcx| k.close_find(a, w, kcx));
+            }))
+            .on_action(cx.listener(|this, a: &ReplaceOne, w, cx| {
+                this.ferritemcu
+                    .update(cx, |k, kcx| k.replace_one(a, w, kcx));
+            }))
+            .on_action(cx.listener(|this, a: &ReplaceAll, w, cx| {
+                this.ferritemcu
+                    .update(cx, |k, kcx| k.replace_all(a, w, kcx));
+            }))
+            .bg(theme::get().panel_bg)
+            .text_color(theme::get().text)
+            .font_family(theme::font::ui_family())
+            .text_size(px(theme::get().ui_font_size))
+            // Escape closes (cancels) the window; Enter triggers a confirm-style dialog's
+            // primary action, IDE default-button style (see `FerriteMCU::modal_confirm`).
+            .on_key_down(
+                cx.listener(move |this, ev: &gpui::KeyDownEvent, window, cx| {
+                    match ev.keystroke.key.as_str() {
+                        "escape" => window.remove_window(),
+                        "enter" => this
+                            .ferritemcu
+                            .update(cx, |k, kcx| k.modal_confirm(kind, kcx)),
+                        _ => {}
+                    }
+                }),
+            )
+            .child(body)
+            .when(client.is_some(), |d| {
+                d.relative().children(chrome::resize_handles(client))
+            })
+    }
+}
+
+/// Make a user-typed branch name git-safe (`git check-ref-format` rules), so typing a commit
+/// subject like `fix: thing here` yields the valid `fix-thing-here` instead of being rejected.
+/// Whitespace and every character git forbids in a ref (`~ ^ : ? * [ \` + control chars)
+/// become single hyphens (runs collapsed); the `@{` and `..` sequences are removed; and
+/// leading/trailing `/ . -` plus a trailing `.lock` are trimmed. Internal `/` is preserved so
+/// namespaced names (`feat/x`) still work.
+fn slugify_branch(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_dash = false;
+    for ch in name.trim().chars() {
+        let forbidden = ch.is_whitespace()
+            || matches!(ch, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+            || (ch as u32) < 0x20
+            || ch == '\x7f';
+        if forbidden {
+            // Collapse any run of forbidden chars to one hyphen.
+            if !prev_dash {
+                out.push('-');
+                prev_dash = true;
+            }
+        } else {
+            out.push(ch);
+            prev_dash = false;
+        }
+    }
+    // git also forbids the `@{` and `..` sequences anywhere in a ref, and `//`.
+    out = out.replace("@{", "-");
+    while out.contains("..") {
+        out = out.replace("..", ".");
+    }
+    while out.contains("//") {
+        out = out.replace("//", "/");
+    }
+    // No leading/trailing `/ . -`; strip a trailing `.lock` (also disallowed).
+    let mut s = out.trim_matches(['/', '.', '-']).to_string();
+    if let Some(stripped) = s.strip_suffix(".lock") {
+        s = stripped.trim_end_matches(['/', '.', '-']).to_string();
+    }
+    s
+}
+
+fn status_color(s: FileStatus) -> ferritemcu_color::Color {
+    match s {
+        FileStatus::Added => theme::get().status_added,
+        FileStatus::Modified | FileStatus::Renamed => theme::get().status_modified,
+        FileStatus::Deleted => theme::get().status_deleted,
+        FileStatus::Untracked => theme::get().status_untracked,
+        FileStatus::Conflict => theme::get().status_conflict,
+    }
+}
+
+impl Focusable for FerriteMCU {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+/// A flattened row of the branch tree.
+struct BranchRow {
+    label: String,
+    depth: usize,
+    node: BranchNode,
+}
+enum BranchNode {
+    /// A section root ("Recent"/"Local") or a `/`-segment folder.
+    Folder {
+        key: String,
+        expanded: bool,
+        section: bool,
+    },
+    /// A checkout-able branch; `full` is the complete ref name.
+    Leaf { full: String },
+}
+
+/// Build the branch tree: "Recent" + "Local" sections as roots, with `/` in branch
+/// names forming nested folders. `force_open` (search active) reveals everything.
+fn branch_rows(
+    recent: &[String],
+    all: &[String],
+    remotes: &[String],
+    expanded: &std::collections::HashSet<String>,
+    force_open: bool,
+) -> Vec<BranchRow> {
+    let mut rows = Vec::new();
+    for (label, key, list) in [
+        ("Recent", "sec:recent", recent),
+        ("Local", "sec:local", all),
+        ("Remote", "sec:remote", remotes),
+    ] {
+        if list.is_empty() {
+            continue;
+        }
+        let open = force_open || expanded.contains(key);
+        rows.push(BranchRow {
+            label: label.into(),
+            depth: 0,
+            node: BranchNode::Folder {
+                key: key.into(),
+                expanded: open,
+                section: true,
+            },
+        });
+        if open {
+            let items: Vec<(String, String)> =
+                list.iter().map(|b| (b.clone(), b.clone())).collect();
+            emit_branch_level(&mut rows, items, key, 1, expanded, force_open);
+        }
+    }
+    rows
+}
+
+/// Recursively emit one level: `items` are (remaining-suffix, full-name) pairs.
+fn emit_branch_level(
+    rows: &mut Vec<BranchRow>,
+    items: Vec<(String, String)>,
+    key_prefix: &str,
+    depth: usize,
+    expanded: &std::collections::HashSet<String>,
+    force_open: bool,
+) {
+    use std::collections::BTreeMap;
+    let mut folders: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    let mut leaves: Vec<(String, String)> = Vec::new();
+    for (suffix, full) in items {
+        match suffix.split_once('/') {
+            Some((head, rest)) => folders
+                .entry(head.to_string())
+                .or_default()
+                .push((rest.to_string(), full)),
+            None => leaves.push((suffix, full)),
+        }
+    }
+    // Folders first (sorted by BTreeMap), then leaves.
+    for (seg, kids) in folders {
+        let key = format!("{key_prefix}/{seg}");
+        let open = force_open || expanded.contains(&key);
+        rows.push(BranchRow {
+            label: seg,
+            depth,
+            node: BranchNode::Folder {
+                key: key.clone(),
+                expanded: open,
+                section: false,
+            },
+        });
+        if open {
+            emit_branch_level(rows, kids, &key, depth + 1, expanded, force_open);
+        }
+    }
+    leaves.sort_by_key(|a| a.0.to_lowercase());
+    for (suffix, full) in leaves {
+        rows.push(BranchRow {
+            label: suffix,
+            depth,
+            node: BranchNode::Leaf { full },
+        });
+    }
+}
+
+/// Raster image types we preview inline (rendered with `img()` instead of the
+/// text editor). SVG stays a text/icon file — it has its own vector path.
+fn is_image(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "avif" | "tiff" | "tif"
+    )
+}
+
+/// Font files preview in their own typeface (gated by the "font" plugin) rather than loading
+/// binary bytes into the text editor.
+fn is_font_file(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str(),
+        "ttf" | "otf" | "ttc" | "otc"
+    )
+}
+
+/// Extract a font's display family name from its bytes (Typographic Family, id 16, preferred;
+/// else Family, id 1) so the preview can register + render it. `None` if it won't parse.
+fn font_family_name(bytes: &[u8]) -> Option<String> {
+    let face = ttf_parser::Face::parse(bytes, 0).ok()?;
+    let mut fallback = None;
+    for name in face.names() {
+        match name.name_id {
+            16 => {
+                if let Some(s) = name.to_string() {
+                    return Some(s);
+                }
+            }
+            1 if fallback.is_none() => fallback = name.to_string(),
+            _ => {}
+        }
+    }
+    fallback
+}
+
+/// Sentinel path for the virtual "Scratches" tree folder. The leading control char keeps
+/// it from ever matching a real file path (used only for tree grouping + expand state).
+fn scratch_group_path() -> PathBuf {
+    PathBuf::from("\u{1}Scratches")
+}
+
+// The FerriteMCU config directory (`~/.config/ferritemcu`, XDG-respecting) holds every persisted file:
+// plugins.json, keymap.json, theme.json, projects.json, ui.json. Removing it is the full
+// "clear data" reset (uninstalls all plugins + drops all cached settings).
+use ferritemcu_config::store::config_dir;
+
+/// Tiny persisted UI prefs (`~/.config/ferritemcu/ui.json`), e.g. the FPS-monitor toggle.
+fn ui_settings_path() -> PathBuf {
+    ferritemcu_config::store::config_path("ui.json")
+}
+/// Read one boolean key from `ui.json` (missing file/key → `default`).
+fn load_ui_bool(key: &str, default: bool) -> bool {
+    std::fs::read_to_string(ui_settings_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get(key).and_then(serde_json::Value::as_bool))
+        .unwrap_or(default)
+}
+/// Set one boolean key in `ui.json`, preserving the file's other keys (read-modify-write so
+/// e.g. saving the terminal pref never clobbers `show_fps`).
+fn save_ui_bool(key: &str, val: bool) {
+    let p = ui_settings_path();
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut v = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(key.to_string(), serde_json::Value::Bool(val));
+    }
+    let _ = std::fs::write(&p, v.to_string());
+}
+fn load_show_fps() -> bool {
+    load_ui_bool("show_fps", false)
+}
+fn save_show_fps(v: bool) {
+    save_ui_bool("show_fps", v);
+}
+
+/// One visual row of the aligned side-by-side diff. `old`/`new` index into each
+/// side's lines (`None` = filler/blank).
+struct DiffRow {
+    old: Option<usize>,
+    new: Option<usize>,
+}
+
+/// Flatten a `FileDiff` into aligned rows. Equal regions advance both sides
+/// together; each hunk pairs its old/new lines and pads the shorter side so the
+/// two panes stay vertically in sync (and the center gutter lines up).
+fn aligned_rows(d: &FileDiff) -> Vec<DiffRow> {
+    let mut rows = Vec::new();
+    let (mut o, mut n) = (0usize, 0usize);
+    for h in &d.hunks {
+        while o < h.old_range.start && n < h.new_range.start {
+            rows.push(DiffRow {
+                old: Some(o),
+                new: Some(n),
+            });
+            o += 1;
+            n += 1;
+        }
+        let (ol, nl) = (h.old_range.len(), h.new_range.len());
+        for i in 0..ol.max(nl) {
+            rows.push(DiffRow {
+                old: (i < ol).then(|| h.old_range.start + i),
+                new: (i < nl).then(|| h.new_range.start + i),
+            });
+        }
+        o = h.old_range.end;
+        n = h.new_range.end;
+    }
+    while o < d.old.len() && n < d.new.len() {
+        rows.push(DiffRow {
+            old: Some(o),
+            new: Some(n),
+        });
+        o += 1;
+        n += 1;
+    }
+    rows
+}
+
+/// The aligned layout's shape without materialising its rows: `(total rows, (row, hunk) of
+/// each hunk's first row)`. O(hunks), where [`aligned_rows`] is O(lines) — the render
+/// paths only need where the gutter controls go, every frame.
+fn hunk_starts(d: &FileDiff) -> (usize, Vec<(usize, usize)>) {
+    let (mut o, mut n, mut row) = (0usize, 0usize, 0usize);
+    let mut starts = Vec::with_capacity(d.hunks.len());
+    for (hi, h) in d.hunks.iter().enumerate() {
+        // The equal stretch before the hunk advances both sides together.
+        row += h
+            .old_range
+            .start
+            .saturating_sub(o)
+            .min(h.new_range.start.saturating_sub(n));
+        starts.push((row, hi));
+        row += h.old_range.len().max(h.new_range.len());
+        o = h.old_range.end;
+        n = h.new_range.end;
+    }
+    row += d
+        .old
+        .len()
+        .saturating_sub(o)
+        .min(d.new.len().saturating_sub(n));
+    (row, starts)
+}
+
+/// Filler (blank alignment rows) for the two diff panes. `(left_map, left_end, right_map,
+/// right_end)` — `map[b] = N` blank rows before buffer line `b`; `end` = trailing blanks.
+/// Computed from the aligned rows so both panes end up the same number of display rows.
+fn diff_fillers(
+    d: &FileDiff,
+) -> (
+    std::collections::HashMap<usize, usize>,
+    usize,
+    std::collections::HashMap<usize, usize>,
+    usize,
+) {
+    let (mut left, mut right) = (
+        std::collections::HashMap::new(),
+        std::collections::HashMap::new(),
+    );
+    let (mut lblank, mut rblank) = (0usize, 0usize);
+    for r in aligned_rows(d) {
+        match r.old {
+            Some(o) => {
+                if lblank > 0 {
+                    left.insert(o, lblank);
+                    lblank = 0;
+                }
+            }
+            None => lblank += 1,
+        }
+        match r.new {
+            Some(n) => {
+                if rblank > 0 {
+                    right.insert(n, rblank);
+                    rblank = 0;
+                }
+            }
+            None => rblank += 1,
+        }
+    }
+    (left, lblank, right, rblank)
+}
+
+/// Per-line hunk backgrounds for the two diff panes: `(old_side, new_side)`,
+/// keyed by buffer line index.
+fn diff_line_bgs(
+    d: &FileDiff,
+) -> (
+    std::collections::HashMap<usize, ferritemcu_color::Color>,
+    std::collections::HashMap<usize, ferritemcu_color::Color>,
+) {
+    let t = theme::get();
+    let (mut old, mut new) = (
+        std::collections::HashMap::new(),
+        std::collections::HashMap::new(),
+    );
+    for h in &d.hunks {
+        match h.kind {
+            HunkKind::Deleted => {
+                for l in h.old_range.clone() {
+                    old.insert(l, t.diff_deleted_bg);
+                }
+            }
+            HunkKind::Added => {
+                for l in h.new_range.clone() {
+                    new.insert(l, t.diff_inserted_bg);
+                }
+            }
+            HunkKind::Modified => {
+                for l in h.old_range.clone() {
+                    old.insert(l, t.diff_modified_bg);
+                }
+                for l in h.new_range.clone() {
+                    new.insert(l, t.diff_modified_bg);
+                }
+            }
+        }
+    }
+    (old, new)
+}
+
+/// Buffer line index → byte ranges within that line that changed (one diff side).
+type LineWordBgs = std::collections::HashMap<usize, Vec<std::ops::Range<usize>>>;
+
+/// Per-line word-level highlight ranges for the two diff panes: `(old_side, new_side)`,
+/// keyed by buffer line index → byte ranges within that line that actually changed.
+fn diff_word_bgs(d: &FileDiff) -> (LineWordBgs, LineWordBgs) {
+    let (mut old, mut new) = (
+        std::collections::HashMap::new(),
+        std::collections::HashMap::new(),
+    );
+    for h in &d.hunks {
+        for (line, range) in &h.old_word_ranges {
+            old.entry(*line)
+                .or_insert_with(Vec::new)
+                .push(range.clone());
+        }
+        for (line, range) in &h.new_word_ranges {
+            new.entry(*line)
+                .or_insert_with(Vec::new)
+                .push(range.clone());
+        }
+    }
+    (old, new)
+}
+
+/// Turn "cmd-shift-o" into "⌘⇧O" for display ("Ctrl+Shift+O" off macOS).
+fn pretty_key(k: &str) -> String {
+    key_parts(k).join(if cfg!(target_os = "macos") { "" } else { "+" })
+}
+
+/// "cmd-shift-o" → `["⌘", "⇧", "O"]`: one glyph per key, for key-cap rendering. Off macOS the
+/// modifiers are words, and `cmd` is Ctrl as `keymap::platform_key` binds it:
+/// `["Ctrl", "Shift", "O"]`.
+fn key_parts(k: &str) -> Vec<String> {
+    if cfg!(target_os = "macos") {
+        key_glyphs(k)
+    } else {
+        key_words(k)
+    }
+}
+
+/// [`key_parts`] off macOS: `Ctrl` / `Alt` / `Shift` / `Super` and named keys as words
+/// (arrows stay arrows).
+fn key_words(k: &str) -> Vec<String> {
+    let (mods, key) = match k.strip_suffix("--") {
+        Some(mods) => (mods, "-"),
+        None => k.rsplit_once('-').unwrap_or(("", k)),
+    };
+    let word = |part: &str| match part {
+        "cmd" | "ctrl" | "secondary" => "Ctrl".to_string(),
+        "alt" | "opt" => "Alt".to_string(),
+        "shift" => "Shift".to_string(),
+        "super" | "win" => "Super".to_string(),
+        "left" => "←".to_string(),
+        "right" => "→".to_string(),
+        "up" => "↑".to_string(),
+        "down" => "↓".to_string(),
+        "escape" => "Esc".to_string(),
+        // "f3" → "F3", "enter" → "Enter", "pageup" → "Pageup", "o" → "O".
+        other => {
+            let mut chars = other.chars();
+            chars
+                .next()
+                .map(|c| c.to_uppercase().chain(chars).collect())
+                .unwrap_or_default()
+        }
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for m in mods.split('-').filter(|m| !m.is_empty()) {
+        let w = word(m);
+        // `cmd-ctrl-x` is one Ctrl off macOS.
+        if !parts.contains(&w) {
+            parts.push(w);
+        }
+    }
+    parts.push(word(key));
+    parts
+}
+
+/// [`key_parts`] on macOS: the menu-bar glyphs.
+fn key_glyphs(k: &str) -> Vec<String> {
+    // The key itself may be `-` (`cmd--`): split it off before the modifiers.
+    let (mods, key) = match k.strip_suffix("--") {
+        Some(mods) => (mods, "-"),
+        None => k.rsplit_once('-').unwrap_or(("", k)),
+    };
+    let glyph = |part: &str| match part {
+        "cmd" => "⌘".to_string(),
+        "shift" => "⇧".to_string(),
+        "ctrl" => "⌃".to_string(),
+        "alt" | "opt" => "⌥".to_string(),
+        "enter" => "⏎".to_string(),
+        "left" => "←".to_string(),
+        "right" => "→".to_string(),
+        "up" => "↑".to_string(),
+        "down" => "↓".to_string(),
+        "backspace" => "⌫".to_string(),
+        "tab" => "⇥".to_string(),
+        "space" => "Space".to_string(),
+        other => other.to_uppercase(),
+    };
+    mods.split('-')
+        .filter(|m| !m.is_empty())
+        .chain(std::iter::once(key))
+        .map(glyph)
+        .collect()
+}
+
+/// Embedded asset source for `svg()` icons (Lucide, MIT). Paths are relative, e.g.
+/// `"icons/folder.svg"`.
+struct Assets;
+
+impl gpui::AssetSource for Assets {
+    fn load(&self, path: &str) -> gpui::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        let bytes: &'static [u8] = match path {
+            "icons/folder.svg" => include_bytes!("../assets/icons/folder.svg"),
+            "icons/play-circle.svg" => include_bytes!("../assets/icons/play-circle.svg"),
+            "icons/esp-board.svg" => include_bytes!("../assets/icons/esp-board.svg"),
+            "icons/monitor.svg" => include_bytes!("../assets/icons/monitor.svg"),
+            "icons/git-branch.svg" => include_bytes!("../assets/icons/git-branch.svg"),
+            "icons/history.svg" => include_bytes!("../assets/icons/history.svg"),
+            "icons/layers.svg" => include_bytes!("../assets/icons/layers.svg"),
+            #[cfg(feature = "terminal")]
+            "icons/terminal.svg" => include_bytes!("../assets/icons/terminal.svg"),
+            // Window chrome off macOS (see `chrome`): the menu button, and minimize / maximize
+            // for a window that draws its own title bar.
+            #[cfg(not(target_os = "macos"))]
+            "icons/menu.svg" => include_bytes!("../assets/icons/menu.svg"),
+            #[cfg(not(target_os = "macos"))]
+            "icons/minus.svg" => include_bytes!("../assets/icons/minus.svg"),
+            #[cfg(not(target_os = "macos"))]
+            "icons/square.svg" => include_bytes!("../assets/icons/square.svg"),
+
+            "icons/chevrons-up-down.svg" => include_bytes!("../assets/icons/chevrons-up-down.svg"),
+            "icons/chevrons-down-up.svg" => include_bytes!("../assets/icons/chevrons-down-up.svg"),
+            "icons/file-lines.svg" => include_bytes!("../assets/icons/file-lines.svg"),
+            "icons/image.svg" => include_bytes!("../assets/icons/image.svg"),
+            "icons/ban.svg" => include_bytes!("../assets/icons/ban.svg"),
+            "icons/check.svg" => include_bytes!("../assets/icons/check.svg"),
+            "icons/search.svg" => include_bytes!("../assets/icons/search.svg"),
+            "icons/chevron-down.svg" => include_bytes!("../assets/icons/chevron-down.svg"),
+            "icons/chevrons-up.svg" => include_bytes!("../assets/icons/chevrons-up.svg"),
+            // Context-menu action icons.
+            "icons/git-commit.svg" => include_bytes!("../assets/icons/git-commit.svg"),
+            "icons/rotate-ccw.svg" => include_bytes!("../assets/icons/rotate-ccw.svg"),
+            "icons/arrow-down-to-line.svg" => {
+                include_bytes!("../assets/icons/arrow-down-to-line.svg")
+            }
+            "icons/arrow-down.svg" => include_bytes!("../assets/icons/arrow-down.svg"),
+            "icons/arrow-up.svg" => include_bytes!("../assets/icons/arrow-up.svg"),
+            "icons/file-plus.svg" => include_bytes!("../assets/icons/file-plus.svg"),
+            "icons/file-clock.svg" => include_bytes!("../assets/icons/file-clock.svg"),
+            "icons/pencil.svg" => include_bytes!("../assets/icons/pencil.svg"),
+            "icons/trash.svg" => include_bytes!("../assets/icons/trash.svg"),
+            "icons/scissors.svg" => include_bytes!("../assets/icons/scissors.svg"),
+            "icons/copy.svg" => include_bytes!("../assets/icons/copy.svg"),
+            "icons/clipboard.svg" => include_bytes!("../assets/icons/clipboard.svg"),
+            "icons/chevron-right.svg" => include_bytes!("../assets/icons/chevron-right.svg"),
+            "icons/x.svg" => include_bytes!("../assets/icons/x.svg"),
+            "icons/maximize-2.svg" => include_bytes!("../assets/icons/maximize-2.svg"),
+            "icons/minimize-2.svg" => include_bytes!("../assets/icons/minimize-2.svg"),
+            "branding/ferriteMCU-wordmark.svg" => {
+                include_bytes!("../assets/branding/ferriteMCU-wordmark.svg")
+            }
+            "branding/ferriteMCU-wordmark-dark.svg" => {
+                include_bytes!("../assets/branding/ferriteMCU-wordmark-dark.svg")
+            }
+            "logo.png" => include_bytes!("../assets/logo.png"),
+            _ => return Ok(None),
+        };
+        Ok(Some(std::borrow::Cow::Borrowed(bytes)))
+    }
+
+    fn list(&self, _path: &str) -> gpui::Result<Vec<SharedString>> {
+        Ok(vec![
+            "icons/folder.svg".into(),
+            "icons/git-branch.svg".into(),
+            "icons/file-lines.svg".into(),
+        ])
+    }
+}
+
+/// Register the bundled Inter (UI) + `JetBrains` Mono (code) faces so `font_family` resolves
+/// to them instead of silently falling back to a system font. Both are OFL-licensed.
+fn load_fonts(cx: &mut App) {
+    let fonts: Vec<std::borrow::Cow<'static, [u8]>> = vec![
+        std::borrow::Cow::Borrowed(include_bytes!("../assets/fonts/Inter-Regular.ttf")),
+        std::borrow::Cow::Borrowed(include_bytes!("../assets/fonts/Inter-Medium.ttf")),
+        std::borrow::Cow::Borrowed(include_bytes!("../assets/fonts/Inter-SemiBold.ttf")),
+        std::borrow::Cow::Borrowed(include_bytes!("../assets/fonts/Inter-Bold.ttf")),
+        std::borrow::Cow::Borrowed(include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf")),
+        std::borrow::Cow::Borrowed(include_bytes!("../assets/fonts/JetBrainsMono-SemiBold.ttf")),
+        std::borrow::Cow::Borrowed(include_bytes!("../assets/fonts/JetBrainsMono-Bold.ttf")),
+        std::borrow::Cow::Borrowed(include_bytes!("../assets/fonts/JetBrainsMono-Italic.ttf")),
+    ];
+    if let Err(e) = cx.text_system().add_fonts(fonts) {
+        eprintln!("ferritemcu: failed to load bundled fonts: {e}");
+    }
+}
+
+/// Path of the crash log (`~/.config/ferritemcu/crash.log`).
+fn crash_log_path() -> Option<PathBuf> {
+    keymap::Keymap::config_path()
+        .parent()
+        .map(|d| d.join("crash.log"))
+}
+
+/// Append panics to `~/.config/ferritemcu/crash.log` (with location + backtrace) and stderr,
+/// so a crash leaves a trace even when launched from Finder/`gs` without a terminal.
+fn install_crash_logger() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let bt = std::backtrace::Backtrace::force_capture();
+        let loc = info.location().map_or_else(
+            || "unknown".into(),
+            |l| format!("{}:{}:{}", l.file(), l.line(), l.column()),
+        );
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(std::string::ToString::to_string)
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic>".into());
+        let entry = format!("\n=== panic at {loc} ===\n{msg}\n{bt}\n");
+        let path = keymap::Keymap::config_path()
+            .parent()
+            .map(|d| d.join("crash.log"));
+        if let Some(path) = path {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = f.write_all(entry.as_bytes());
+            }
+        }
+        eprintln!("{entry}");
+        prev(info);
+    }));
+}
+
+/// macOS names an unbundled app's dock tile / menu after the **executable path's basename**.
+/// The binary is `ferritemcu` (lowercase, run via the `fmc` shell function), so the dock would read
+/// "ferritemcu". macOS filesystems are case-insensitive by default, so we re-exec ourselves once via
+/// the same file under the path `…/FerriteMCU` — same binary, but now the basename is "FerriteMCU", so the
+/// dock tile reads "FerriteMCU". No change needed to the user's shell function. The re-exec'd process
+/// is already `FerriteMCU`, so it doesn't loop; on a case-sensitive volume (no `FerriteMCU` file) the exec
+/// fails and we just continue as `ferritemcu`. No-op off macOS.
+#[cfg(target_os = "macos")]
+fn reexec_with_proper_name() {
+    use std::os::unix::process::CommandExt;
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    if exe.file_name().and_then(|s| s.to_str()) == Some("FerriteMCU") {
+        return; // already running under the capitalised name
+    }
+    let ferritemcu = exe.with_file_name("FerriteMCU");
+    if ferritemcu.exists() {
+        // exec() only returns on failure — fall through and run normally as `ferritemcu`.
+        let _ = std::process::Command::new(&ferritemcu)
+            .arg0("FerriteMCU")
+            .args(std::env::args_os().skip(1))
+            .exec();
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn reexec_with_proper_name() {}
+
+/// The most recent of `recents` that's still a folder on disk — its repo's top level when it's
+/// in git, else the folder itself (non-git folders open too).
+fn last_project(recents: &[PathBuf]) -> Option<PathBuf> {
+    recents
+        .iter()
+        .find(|p| p.is_dir())
+        .map(|p| Repo::discover(p).map_or_else(|_| p.clone(), |repo| repo.root().to_path_buf()))
+}
+
+/// The window's app id: Linux's X11 `WM_CLASS` / Wayland `app_id`, which the dock matches
+/// to the `.desktop` entry (`StartupWMClass`, see `scripts/bundle-linux.sh`) to group every
+/// FerriteMCU window under one icon. gpui ignores it on macOS.
+const APP_ID: &str = "ferritemcu";
+
+/// Name the running process "FerriteMCU" so the macOS dock tile / menu-bar app menu read "FerriteMCU"
+/// instead of the lowercase executable name. Must run before `NSApplication` checks in with
+/// `LaunchServices`, so it's called at the very top of `main`. No-op off macOS.
+#[cfg(target_os = "macos")]
+fn set_app_name() {
+    use objc2_foundation::{NSProcessInfo, NSString};
+    NSProcessInfo::processInfo().setProcessName(&NSString::from_str("FerriteMCU"));
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_app_name() {}
+
+/// The FerriteMCU runtime app icon (Dock + X11 windows), shared by every build configuration.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const LOGO_PNG: &[u8] = include_bytes!("../assets/logo.png");
+
+/// Set the macOS Dock icon from the bundled logo (no `.app` bundle needed). Runs on the
+/// main thread during app launch; silently no-ops if the image can't be built.
+#[cfg(target_os = "macos")]
+fn set_dock_icon() {
+    use objc2::{AllocAnyThread, MainThreadMarker};
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let data = NSData::with_bytes(LOGO_PNG);
+    let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    // SAFETY: `app` is the shared NSApplication obtained on the main thread (`mtm` proves it),
+    // and `image` is a fully-initialized, objc2-retained NSImage (the `else` above bailed if
+    // init failed). `setApplicationIconImage:` only reads the image and retains it itself, so
+    // passing a valid `&NSImage` upholds every precondition of the AppKit call.
+    unsafe { app.setApplicationIconImage(Some(&image)) };
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_dock_icon() {}
+
+/// Put FerriteMCU's icon on its X11 windows (see `platform::window_icon`) — call after opening a
+/// window. A no-op elsewhere: macOS has the Dock icon, Wayland the `.desktop` entry's.
+fn set_window_icons() {
+    #[cfg(target_os = "linux")]
+    if gpui::guess_compositor() == "X11" {
+        platform::window_icon::apply();
+    }
+}
+
+/// Drive `FerriteMCU` into one named screenshot state. Called only when `FERRITEMCU_SHOT` is set
+/// (see the call site in `main`). Each arm assumes the open project is this repo and sets
+/// the exact plugin install set it needs so highlighting / the install banner are
+/// deterministic regardless of any pre-existing config.
+fn apply_shot(
+    view: &mut FerriteMCU,
+    name: &str,
+    window: &mut Window,
+    cx: &mut Context<FerriteMCU>,
+) {
+    // Screenshots hide the visible FPS counter — only the dedicated `fps` shot turns it on, in
+    // its own arm.
+    // Force the install list to exactly `on` (everything else uninstalled), then persist.
+    let set_packs = |view: &mut FerriteMCU, on: &[&str]| {
+        for id in ["rust", "json", "markdown", "typescript", "javascript"] {
+            if on.contains(&id) {
+                view.plugins.install(id);
+            } else {
+                view.plugins.uninstall(id);
+            }
+        }
+        view.plugins.save();
+    };
+    // Pick the changed file to open in the diff pane: prefer the curated `color.rs` showcase
+    // (the screenshot fixture edits it), then any Rust file, else the first change.
+    fn diff_pick(view: &FerriteMCU) -> Option<usize> {
+        view.files
+            .iter()
+            .position(|f| f.path.ends_with("color.rs"))
+            .or_else(|| {
+                view.files
+                    .iter()
+                    .position(|f| f.path.extension().and_then(|e| e.to_str()) == Some("rs"))
+            })
+            .or(if view.files.is_empty() { None } else { Some(0) })
+    }
+    match name {
+        // Commit view, a changed Rust file selected → side-by-side coloured diff.
+        "git-diff" => {
+            set_packs(view, &["rust"]);
+            // The live repo may be clean (nothing to diff). screenshots.sh seeds a tiny
+            // fixture repo with a guaranteed working-tree change and passes its path here,
+            // so the diff pane always has content to show.
+            if let Ok(repo) = std::env::var("FERRITEMCU_SHOT_REPO") {
+                view.open_project(PathBuf::from(repo), cx);
+                // Only the fixture's tab: the repo FerriteMCU was launched on would read as a second
+                // "ferritemcu" project.
+                let root = view.repo_root.clone();
+                view.open_projects.retain(|p| Some(p) == root.as_ref());
+            }
+            view.enter_commit(cx);
+            // Click a changed file so the main content shows a side-by-side diff.
+            if let Some(i) = diff_pick(view) {
+                view.select_with(i, Some(cx));
+            }
+        }
+        // Same side-by-side diff as `git-diff`, but with the "FerriteMCU Light" palette applied first
+        // so the README can show the light theme. Switches the live theme before any render.
+        "light" => {
+            // Ephemeral (no save): the shots share one throwaway config dir, so persisting the
+            // light palette here would make every later (dark) shot launch in light mode.
+            theme::set_palette_ephemeral(theme::Theme::light());
+            set_packs(view, &["rust"]);
+            if let Ok(repo) = std::env::var("FERRITEMCU_SHOT_REPO") {
+                view.open_project(PathBuf::from(repo), cx);
+            }
+            view.enter_commit(cx);
+            let pick = view
+                .files
+                .iter()
+                .position(|f| f.path.as_path() == std::path::Path::new("README.md"))
+                .or(if view.files.is_empty() { None } else { Some(0) });
+            if let Some(i) = pick {
+                view.select_with(i, Some(cx));
+            }
+        }
+        // Browse a Rust file with the pack uninstalled → "Install Rust support?" banner.
+        "plugins" => {
+            set_packs(view, &[]);
+            view.open_file(PathBuf::from("src/main.rs"), cx);
+        }
+        // The Language Plugins native modal window (lists every language pack with toggles).
+        // A few installed so both on/off states show.
+        "plugins-window" => {
+            set_packs(view, &["rust", "json", "markdown", "typescript"]);
+            view.act_open_plugins(&OpenPlugins, window, cx);
+        }
+        // Browse a Markdown file with the pack installed → live rendered preview pane.
+        "markdown-support" => {
+            set_packs(view, &["markdown"]);
+            view.open_file(PathBuf::from("README.md"), cx);
+        }
+        // Go to File (Cmd+Shift+O): the fuzzy file finder open over a file, with a query
+        // typed so matched files are listed. Setting the query fires the editor's Changed
+        // event → recompute_finder runs the fuzzy match.
+        "go-to-file" => {
+            set_packs(view, &["rust"]);
+            view.open_file(PathBuf::from("src/main.rs"), cx);
+            view.act_go_to_file(&GoToFile, window, cx);
+            view.finder.query.update(cx, |e, cx| {
+                e.set_content("render".to_string(), Lang::PlainText, cx);
+            });
+            cx.notify();
+        }
+        // Find in Files (Cmd+Shift+F): the content-search finder open over a file, with the
+        // query "ferritemcu" typed in so `git grep` results are showing. Setting the query content
+        // fires the editor's Changed event → recompute_finder runs the grep.
+        "find-in-files" => {
+            set_packs(view, &["rust"]);
+            view.open_file(PathBuf::from("src/main.rs"), cx);
+            view.act_find_in_files(&FindInFiles, window, cx);
+            view.finder.query.update(cx, |e, cx| {
+                e.set_content("ferritemcu".to_string(), Lang::PlainText, cx);
+            });
+            cx.notify();
+        }
+        // Commit view (diff behind) + the Rollback native modal window open over it.
+        // Rollback window over the Commit view. screenshots.sh passes the git-diff fixture
+        // (FERRITEMCU_SHOT_REPO, guaranteed working-tree changes): on a clean repo there's nothing
+        // to roll back, the window never opens, and the capture waits on a bare Commit view.
+        "rollback" => {
+            set_packs(view, &["rust"]);
+            if let Ok(repo) = std::env::var("FERRITEMCU_SHOT_REPO") {
+                view.open_project(PathBuf::from(repo), cx);
+            }
+            view.enter_commit(cx);
+            view.open_rollback_path(PathBuf::new(), cx);
+        }
+        // Browse a large file with the FPS monitor on, scrolled partway down.
+        "fps" => {
+            set_packs(view, &["json"]);
+            view.fps.show = true;
+            if let Ok(f) = std::env::var("FERRITEMCU_SHOT_FILE") {
+                view.open_file(PathBuf::from(f), cx);
+            }
+            // Negative Y offset = scrolled down into the file.
+            view.browse
+                .editor_scroll
+                .set_offset(gpui::point(px(0.0), px(-600.0 * editor::line_height_px())));
+            cx.notify();
+        }
+        // Browse an invalid JSON file (FERRITEMCU_SHOT_FILE) with the JSON pack installed →
+        // wavy red squiggles under the parse errors (error highlighting is on by
+        // default for installed packs).
+        "error-highlight" => {
+            set_packs(view, &["json"]);
+            if let Ok(f) = std::env::var("FERRITEMCU_SHOT_FILE") {
+                view.open_file(PathBuf::from(f), cx);
+            }
+        }
+        // Browse a JSON file (FERRITEMCU_SHOT_FILE) with a multi-line selection and the editor
+        // context menu open → the Sort Lines / Sort Object Keys items above the git commands.
+        "sort-menu" => {
+            set_packs(view, &["json"]);
+            if let Ok(f) = std::env::var("FERRITEMCU_SHOT_FILE") {
+                view.open_file(PathBuf::from(f), cx);
+            }
+            view.browse
+                .editor
+                .update(cx, |e, cx| e.select_range(2..30, cx));
+            if let Some(p) = view.browse.open_path.clone() {
+                view.open_menu(
+                    gpui::point(px(560.0), px(200.0)),
+                    MenuTarget::EditorGit(p, true, true),
+                    cx,
+                );
+            }
+        }
+        // The Local History window for FERRITEMCU_SHOT_FILE: seeds two snapshots (so the
+        // timeline + snapshot ↔ current diff populate), then opens the window.
+        "local-history" => {
+            set_packs(view, &["json"]);
+            if let Ok(f) = std::env::var("FERRITEMCU_SHOT_FILE") {
+                let rel = PathBuf::from(f);
+                // Open the store synchronously — the async `lh_sync_store` open would
+                // race the shot's seeding below.
+                if let Some(root) = view.repo_root.clone() {
+                    if let Ok(s) = ferritemcu_local_history::Store::for_project(&root) {
+                        view.lh.store_root = Some(root);
+                        view.lh.store = Some(std::sync::Arc::new(std::sync::Mutex::new(s)));
+                    }
+                }
+                if let (Some(store), Some(root)) = (view.lh.store.clone(), view.repo_root.clone()) {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+                    let current = std::fs::read_to_string(root.join(&rel)).unwrap_or_default();
+                    if let Ok(mut s) = store.lock() {
+                        let _ = s.record(
+                            &rel,
+                            &format!("{current}\n\"an: \\\"older\\\" revision\"\n"),
+                            ferritemcu_local_history::EventKind::Change,
+                            None,
+                            now.saturating_sub(3_600_000),
+                        );
+                        let _ = s.record(
+                            &rel,
+                            &current,
+                            ferritemcu_local_history::EventKind::Label,
+                            Some("Before rollback".into()),
+                            now.saturating_sub(600_000),
+                        );
+                    }
+                }
+                view.open_local_history(rel, cx);
+                // Select the newest change (row 0): under Model B its "before" side is the
+                // older snapshot, so the panes show a real before→current diff with hunks.
+                view.lh_select(0, cx);
+            }
+        }
+        // The Compare window over two fixture files (FERRITEMCU_SHOT_FILE ↔ FERRITEMCU_SHOT_FILE_B):
+        // side-by-side aligned panes + the center apply gutter.
+        "compare" => {
+            set_packs(view, &["json"]);
+            if let (Ok(a), Ok(b)) = (
+                std::env::var("FERRITEMCU_SHOT_FILE"),
+                std::env::var("FERRITEMCU_SHOT_FILE_B"),
+            ) {
+                view.open_compare(PathBuf::from(a), PathBuf::from(b), cx);
+            }
+        }
+        // Find (⌘F) over a diff pane (issue #86): `find-diff` = the commit view's working
+        // pane, `find-compare` = the Compare window over FERRITEMCU_SHOT_FILE ↔ FERRITEMCU_SHOT_FILE_B.
+        // FERRITEMCU_SHOT_QUERY sets the search (default "fn").
+        "find-diff" | "find-compare" => {
+            set_packs(view, &["rust", "json"]);
+            let host = if name == "find-diff" {
+                if let Ok(repo) = std::env::var("FERRITEMCU_SHOT_REPO") {
+                    view.open_project(PathBuf::from(repo), cx);
+                }
+                view.enter_commit(cx);
+                if let Some(i) = diff_pick(view) {
+                    view.select_with(i, Some(cx));
+                }
+                FindHost::Main
+            } else {
+                if let (Ok(a), Ok(b)) = (
+                    std::env::var("FERRITEMCU_SHOT_FILE"),
+                    std::env::var("FERRITEMCU_SHOT_FILE_B"),
+                ) {
+                    view.open_compare(PathBuf::from(a), PathBuf::from(b), cx);
+                }
+                FindHost::Modal(ModalKind::Compare)
+            };
+            view.open_find(host, true, window, cx);
+            let q = std::env::var("FERRITEMCU_SHOT_QUERY").unwrap_or_else(|_| "fn".into());
+            view.find
+                .query
+                .update(cx, |e, cx| e.set_content(q, Lang::PlainText, cx));
+        }
+        // The "What's New" changelog window (issue #71). Seeded with fixed release notes so
+        // the shot is deterministic and needs no network; `FERRITEMCU_SHOT_RELEASES=<file>` renders
+        // a real GitHub feed dump instead.
+        "changelog" => {
+            let seeded = std::env::var("FERRITEMCU_SHOT_RELEASES")
+                .ok()
+                .and_then(|f| std::fs::read_to_string(f).ok())
+                .map(|body| update::parse_releases(&body))
+                .filter(|r| !r.is_empty())
+                .unwrap_or_else(|| {
+                    ["2.5.0", "2.4.0", "2.3.0"]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| update::ReleaseNote {
+                            version: (*v).to_string(),
+                            tag: format!("ferritemcu-v{v}"),
+                            title: format!("FerriteMCU {v}"),
+                            body: String::from(
+                                "## Features\n\n* **compare:** side-by-side compare of any \
+                                 two files \n\
+                                 * **local history:** per-file snapshots independent of git\n\n\
+                                 ## Bug Fixes\n\n* **editor:** keep the caret visible when \
+                                 folding a region\n* **tree:** drop deleted paths from the \
+                                 file tree\n",
+                            ),
+                            date: format!("2026-0{}-14", 7 - i),
+                            page_url: String::new(),
+                            prerelease: false,
+                        })
+                        .collect()
+                });
+            // Seed BEFORE opening: `open_changelog` only fetches when the list is empty, so
+            // this keeps the shot offline and deterministic (no live feed racing it in).
+            view.set_changelog(Ok(seeded), cx);
+            view.open_changelog(cx);
+        }
+        // Browse a Rust file with ⌘ "held" over an import — the link underlines
+        // (issue #26). Uses the debug hover forcer since shots can't hold keys.
+        "imports" => {
+            set_packs(view, &["rust"]);
+            view.open_file(PathBuf::from("src/main.rs"), cx);
+            view.browse.editor.update(cx, |e, cx| {
+                e.force_link_hover(0);
+                cx.notify();
+            });
+        }
+        // The tab strip with more tabs than fit — the active tab must be
+        // scrolled into view (strip overflows + scrolls; regression: the bar
+        // sized itself to content and no scroll ever applied).
+        "tab-scroll" => {
+            set_packs(view, &["rust"]);
+            for f in [
+                "src/main.rs",
+                "src/app.rs",
+                "src/render.rs",
+                "src/divider.rs",
+                "src/views/browse.rs",
+                "src/views/commit.rs",
+                "src/views/diff_view.rs",
+                "src/views/history.rs",
+                "src/views/merge.rs",
+                "src/views/compare.rs",
+                "src/views/finder.rs",
+                "src/views/tabs.rs",
+            ] {
+                view.open_file(PathBuf::from(f), cx);
+            }
+        }
+        // History view: the commit log for the current branch, first commit selected so the
+        // changed-files list + read-only diff are populated.
+        // The History log. screenshots.sh passes a clone with a short feature branch merged
+        // back `--no-ff` (FERRITEMCU_SHOT_REPO), so the graph has a real branch + merge to draw —
+        // main's own history is squash-merged and draws as one line. Selects the branch's
+        // first commit, diffed against its parent.
+        "history" => {
+            set_packs(view, &["rust"]);
+            if let Ok(repo) = std::env::var("FERRITEMCU_SHOT_REPO") {
+                view.open_project(PathBuf::from(repo), cx);
+            }
+            view.history.compare = CompareMode::Before;
+            view.enter_history(cx);
+            if let Some(i) = view
+                .history
+                .commits
+                .iter()
+                .position(|c| c.subject.starts_with("feat: ease the shimmer"))
+            {
+                view.select_history_commit(i, cx);
+            }
+        }
+        // Browse view with the bottom terminal panel open, seeded with a couple of commands
+        // so the shot shows a live shell (prompt + output), not a bare box.
+        #[cfg(feature = "terminal")]
+        "terminal" => {
+            set_packs(view, &["rust"]);
+            view.open_file(PathBuf::from("src/terminal.rs"), cx);
+            view.term.panel.open = true;
+            view.new_terminal_tab(cx);
+            if let Some(t) = view.term.tabs.last() {
+                t.read(cx).send_input("git status && ls src\n");
+            }
+            view.focus_active_terminal(window, cx);
+            cx.notify();
+        }
+        // The merge-conflict window. FERRITEMCU_SHOT_REPO is a clone with an in-progress
+        // conflicted merge (started by screenshots.sh). `merge-conflicts` shows the
+        // conflicts-list stage; `merge` drills into the first file's 3-pane resolve
+        // view with the non-conflicting changes applied (the toolbar's "All");
+        // `merge-compare` (manual, debugging) shows the Left-and-Right compare pair.
+        "merge" | "merge-conflicts" | "merge-compare" => {
+            set_packs(view, &["rust"]);
+            if let Ok(repo) = std::env::var("FERRITEMCU_SHOT_REPO") {
+                view.open_project(PathBuf::from(repo), cx);
+            }
+            // The async refresh snapshot hasn't landed yet — seed the branch labels the
+            // window's title/headers need (the same data the snapshot would deliver).
+            if let Some(r) = view.repo() {
+                view.current_branch = r.current_branch();
+                view.merge.source = r.merging();
+            }
+            view.open_merge_window(cx);
+            if name != "merge-conflicts" {
+                view.select_merge_file(0, cx);
+                view.merge_apply_clean(true, true, cx);
+            }
+            if name == "merge-compare" {
+                // FERRITEMCU_SHOT_COMPARE picks the pair (debugging): left-middle /
+                // right-middle (interactive) or the default read-only left-right.
+                let mode = match std::env::var("FERRITEMCU_SHOT_COMPARE").as_deref() {
+                    Ok("left-middle") => MergeCompare::LeftMiddle,
+                    Ok("right-middle") => MergeCompare::RightMiddle,
+                    _ => MergeCompare::LeftRight,
+                };
+                view.merge_set_compare(mode, cx);
+                // For the default pair, leave the dropdown open too — this shot doubles
+                // as the check that the deferred select panel paints ABOVE the panes.
+                if mode == MergeCompare::LeftRight {
+                    view.merge.compare_sel.show();
+                }
+            }
+        }
+        // Branch popup with a row's actions menu open (manual debug shot for the
+        // click-a-branch → Checkout/Merge menu flow).
+        "branch-menu" => {
+            // Seed the current branch (the async refresh snapshot hasn't landed yet), so
+            // the picked row — and the menu's "into X" label — match a real click.
+            if let Some(r) = view.repo() {
+                view.current_branch = r.current_branch();
+            }
+            view.toggle_branch_popup(window, cx);
+            let target = view
+                .branch
+                .list
+                .iter()
+                .find(|b| view.current_branch.as_deref() != Some(b.as_str()))
+                .cloned();
+            if let Some(b) = target {
+                view.open_menu(gpui::point(px(860.0), px(420.0)), MenuTarget::Branch(b), cx);
+            }
+        }
+        // Projects landing welcome hero — used by the README welcome image. Force no project
+        // open so `render` takes the landing path; the throwaway config has no recents.
+        "welcome" => {
+            view.repo_root = None;
+            cx.notify();
+        }
+        other => eprintln!("FERRITEMCU_SHOT: unknown state {other:?}"),
+    }
+}
+
+fn main() {
+    reexec_with_proper_name();
+    set_app_name();
+    install_crash_logger();
+    // X11: no XIM where ibus only carries plain layouts (`platform::input_method`); held back
+    // here, before any thread, and given back once gpui has connected below.
+    #[cfg(target_os = "linux")]
+    let xim = platform::input_method::hold_back_xim();
+    // A path arg opens that project directly; no arg → the project you had open last (the
+    // Projects landing view only when there's none to reopen). The path may be `.`, a
+    // relative dir, or any subdirectory of a repo — resolve it to the repo's top level
+    // (`git rev-parse --show-toplevel`, via Repo::discover). If it isn't inside a git repo,
+    // fall back to the Projects view rather than a broken state.
+    let initial = std::env::args()
+        .nth(1)
+        .map(PathBuf::from)
+        .and_then(|p| Repo::discover(&p).ok())
+        .map(|repo| repo.root().to_path_buf());
+
+    // Single instance (issue #72): every open project is already a tab, so a second
+    // `ferritemcu <path>` hands the path to the running FerriteMCU (which opens it as another tab and
+    // comes forward) and exits here, before any window is created. Nothing listening → we
+    // are the instance, and take the socket over below.
+    #[cfg(unix)]
+    let guarded = instance::enabled();
+    #[cfg(unix)]
+    if guarded {
+        let req = initial
+            .clone()
+            .map_or(instance::Request::Activate, instance::Request::Open);
+        if instance::try_send(&req) {
+            return;
+        }
+    }
+
+    // No path given (and not a screenshot run, which wants the landing view): reopen the
+    // last project. After the single-instance hand-off, so a bare `fmc` just brings a running
+    // FerriteMCU forward.
+    #[cfg(feature = "terminal")]
+    let initial = initial.or_else(|| {
+        std::env::var_os("FERRITEMCU_SHOT")
+            .is_none()
+            .then(|| last_project(&projects::Recents::load().paths))
+            .flatten()
+    });
+
+    let (km, first_run) = Keymap::load();
+
+    // Linux: Text → Your desktop's draws every glyph as the desktop draws text. gpui keeps the
+    // glyphs it draws for the whole run, so the rendering is chosen once, before the first one.
+    #[cfg(target_os = "linux")]
+    platform::desktop::text::choose_at_start(DesktopLook::load().desktop_text);
+
+    let app = Application::new().with_assets(Assets);
+    #[cfg(target_os = "linux")]
+    platform::input_method::restore(xim);
+    // Remote markdown-preview images need a real HttpClient (gpui's default bails);
+    // only wired when the `remote-images` feature is built in. See remote_img.rs.
+    #[cfg(feature = "remote-images")]
+    let app = app.with_http_client(std::sync::Arc::new(remote_img::UreqClient::new()));
+    app.run(move |cx: &mut App| {
+        load_fonts(cx);
+        set_dock_icon();
+        apply_keymap(cx, &km);
+        // Linux: a shortcut written with Shift binds as the active keyboard layout reports it;
+        // learnt now and again on every layout switch.
+        #[cfg(target_os = "linux")]
+        {
+            learn_keyboard_layout(cx);
+            cx.on_keyboard_layout_change(learn_keyboard_layout).detach();
+        }
+
+        // Native macOS menu bar: app menu + File (Open / Recent Projects).
+        cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+        cx.set_menus(app_menus(&Recents::load()));
+        // Dock right-click → "Recent Projects" submenu (refreshed on each open).
+        cx.set_dock_menu(dock_menu(&Recents::load()));
+
+        let bounds = Bounds::centered(None, gpui::size(px(1280.0), px(820.0)), cx);
+        // Blessed expect: opening the one main window can only fail on a fatal startup condition
+        // (no display / GPU surface), where panicking with a clear message is the right call.
+        #[allow(clippy::expect_used)]
+        let window = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    // Transparent titlebar so our chrome blends into the native window bar;
+                    // traffic lights nudged down to center in our 40px header strip.
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some("FerriteMCU".into()),
+                        appears_transparent: true,
+                        traffic_light_position: Some(gpui::point(px(16.0), px(16.0))),
+                    }),
+                    app_id: Some(APP_ID.into()),
+                    // Client-side on Wayland, so GNOME's windows get a title bar at all.
+                    window_decorations: chrome::requested_decorations(),
+                    ..Default::default()
+                },
+                {
+                    let km = km.clone();
+                    let initial = initial.clone();
+                    move |_, cx| {
+                        cx.new(|cx| FerriteMCU::new(initial.clone(), km.clone(), first_run, cx))
+                    }
+                },
+            )
+            .expect("failed to open main window");
+        set_window_icons();
+        // Focus the root so global keybindings (Go to File, etc.) dispatch immediately.
+        window
+            .update(cx, |view, window, cx| {
+                window.focus(&view.focus_handle(cx));
+                cx.activate(true);
+
+                // Launched straight to an empty Projects screen (no repo arg, no recents,
+                // and not mid first-run onboarding) → jump straight to the folder picker.
+                if view.repo_root.is_none()
+                    && view.recents.paths.is_empty()
+                    && !view.onboarding.open
+                {
+                    view.pick_folder(cx);
+                }
+
+                // FERRITEMCU_SHOT=<name> drives the app into one fixed UI state for the
+                // screenshot suite (scripts/screenshots.sh). Env-gated → zero cost on a
+                // normal launch. Assumes the open project is this repo. The suite points
+                // XDG_CONFIG_HOME at a throwaway dir, so the per-shot plugin install state
+                // set here never touches the user's real ~/.config/ferritemcu.
+                if let Ok(shot) = std::env::var("FERRITEMCU_SHOT") {
+                    apply_shot(view, &shot, window, cx);
+                }
+
+                // Re-sync git + open-file state whenever the window regains focus —
+                // external tools may have edited files while we were in the background.
+                // Fires on every activation change, so gate on becoming active.
+                cx.observe_window_activation(window, |this, window, cx| {
+                    if window.is_window_active() {
+                        this.reload_external(cx);
+                        this.recheck_update_if_stale(cx);
+                    }
+                })
+                .detach();
+            })
+            .ok();
+
+        // Become the instance later launches talk to (issue #72). The socket thread can't
+        // touch gpui entities, so it only forwards over a channel to this foreground pump —
+        // the terminal `EventProxy` / fs-watcher pattern. The guard lives in the task, so the
+        // socket is unlinked when the app goes away.
+        #[cfg(unix)]
+        if guarded {
+            let (tx, mut rx) = futures::channel::mpsc::unbounded::<instance::Request>();
+            if let Some((guard, _thread)) = instance::listen(move |req| {
+                let _ = tx.unbounded_send(req);
+            }) {
+                cx.spawn(async move |cx| {
+                    let _guard = guard;
+                    while let Some(req) = futures::StreamExt::next(&mut rx).await {
+                        let ok = window.update(cx, |view, window, cx| {
+                            if let instance::Request::Open(path) = req {
+                                view.open_folder(path, cx);
+                                window.focus(&view.focus_handle(cx));
+                            }
+                            // Either way the user asked for FerriteMCU — raise it.
+                            window.activate_window();
+                            cx.activate(true);
+                        });
+                        if ok.is_err() {
+                            break; // main window gone — stop pumping
+                        }
+                    }
+                })
+                .detach();
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod diff_layout_tests {
+    use super::*;
+
+    /// `hunk_starts` (the per-frame gutter layout, O(hunks)) must agree with the full
+    /// `aligned_rows` layout: same row count, each start on its hunk's first row.
+    #[test]
+    fn hunk_starts_match_the_aligned_rows() {
+        let before = "a\nb\nc\nd\ne\nf\ng\n";
+        let after = "a\nB\nc\nd\nX\nY\nZ\ne\ng\nh\n";
+        let d = FileDiff::compute(before, after);
+        let rows = aligned_rows(&d);
+        let (n, starts) = hunk_starts(&d);
+        assert_eq!(n, rows.len());
+        assert_eq!(starts.len(), d.hunks.len());
+        for &(row, hi) in &starts {
+            let h = &d.hunks[hi];
+            let r = &rows[row];
+            assert!(
+                r.old == (!h.old_range.is_empty()).then_some(h.old_range.start)
+                    && r.new == (!h.new_range.is_empty()).then_some(h.new_range.start),
+                "hunk {hi} starts on row {row}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod branch_tree_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn slash_becomes_folder_under_sections() {
+        let all = vec![
+            "feat/compare".to_string(),
+            "feat/stats".to_string(),
+            "main".to_string(),
+        ];
+        let mut exp = HashSet::new();
+        exp.insert("sec:local".to_string());
+        exp.insert("sec:local/feat".to_string());
+        let rows = branch_rows(&[], &all, &[], &exp, false);
+
+        // Section root present.
+        assert!(matches!(
+            rows[0].node,
+            BranchNode::Folder { section: true, .. }
+        ));
+        assert_eq!(rows[0].label, "Local");
+        // A "feat" folder exists with the two leaves nested deeper.
+        assert!(rows
+            .iter()
+            .any(|r| r.label == "feat"
+                && matches!(r.node, BranchNode::Folder { section: false, .. })));
+        let compare = rows.iter().find(|r| r.label == "compare").unwrap();
+        assert!(matches!(&compare.node, BranchNode::Leaf { full } if full == "feat/compare"));
+        // "main" is a top-level leaf in the section (depth 1).
+        let main = rows.iter().find(|r| r.label == "main").unwrap();
+        assert_eq!(main.depth, 1);
+    }
+
+    #[test]
+    fn collapsed_section_hides_children() {
+        let all = vec!["main".to_string()];
+        let rows = branch_rows(&[], &all, &[], &HashSet::new(), false);
+        // Only the collapsed "Local" root, no leaves.
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "Local");
+    }
+}
+
+/// Live-gpui smoke tests: run the real app headlessly (`TestAppContext`) so runtime panics
+/// — re-entrant entity updates, wrong-phase calls, etc. — fail the build. Pure-function and
+/// `perf_*` tests can't see these; this is the only category that exercises windows +
+/// entities + the render cycle. See README "Performance" / DEVELOPMENT.md.
+#[cfg(test)]
+mod gpui_smoke_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// Run a git command in `dir`, scrubbing the repo-pointing env (see `boot`).
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .unwrap();
+    }
+
+    /// Point local history at a throwaway data dir for the whole test binary, so smoke
+    /// tests never read or write the developer's real `~/.local/share/ferritemcu` store — the
+    /// `refresh` external-change scan (and the boot-time store open) would otherwise land
+    /// there. Idempotent + serialized (`Once`), so parallel tests agree on one value that's
+    /// in place before any `FerriteMCU::new` reads it.
+    fn isolate_history() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let dir =
+                std::env::temp_dir().join(format!("ferritemcu-test-xdg-{}", std::process::id()));
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            // Config too: the keymap / plugin / theme stores would otherwise read — and a test
+            // that saves would overwrite — the developer's real ~/.config/ferritemcu (CI has none).
+            std::env::set_var("XDG_CONFIG_HOME", dir.join("config"));
+        });
+    }
+
+    /// Build a `FerriteMCU` window against a throwaway git repo, return its handle + a visual cx.
+    fn boot(cx: &mut TestAppContext) -> (gpui::WindowHandle<FerriteMCU>, std::path::PathBuf) {
+        isolate_history();
+        // A real temp git repo with one change, so the commit/diff/rollback screens populate.
+        // Unique per boot() call: pid is shared across parallel test threads, so a bare-pid
+        // dir races (tests remove_dir_all/create_dir_all the same path at once → flaky panic).
+        static SMOKE_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = SMOKE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferritemcu-smoke-{}-{}", std::process::id(), seq));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                // Scrub the repo-pointing env git exports to hooks — inherited (e.g. under
+                // the pre-push hook) it would redirect these commands to the ferritemcu repo
+                // itself instead of the temp dir. Mirrors ferritemcu-git's `git_cmd`.
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .output()
+                .unwrap();
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.t"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("app.tsx"), "const a = 1;\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+        std::fs::write(dir.join("app.tsx"), "const a = 2;\n").unwrap();
+        std::fs::write(dir.join("new.txt"), "new\n").unwrap();
+
+        let km = Keymap::default();
+        let root = Some(dir.clone());
+        let handle =
+            cx.add_window(move |_w, cx| FerriteMCU::new(root.clone(), km.clone(), false, cx));
+        cx.run_until_parked();
+        (handle, dir)
+    }
+
+    /// A file path ⌘-clicked in a terminal opens in the editor — looked up off the UI thread,
+    /// then shown as a tab of the project it's in.
+    #[cfg(feature = "terminal")]
+    #[gpui::test]
+    fn terminal_file_link_opens_in_the_editor(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        handle
+            .update(cx, |k, _w, cx| {
+                k.open_terminal_file(dir.join("app.tsx"), Some(1), cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert!(k.mode == Mode::Browse);
+                assert_eq!(k.browse.open_path, Some(PathBuf::from("app.tsx")));
+            })
+            .unwrap();
+    }
+
+    /// A select's open list closes on a click outside it — and a click on the control while
+    /// open closes it, rather than the outside-click closing it and the control reopening it.
+    #[gpui::test]
+    fn select_closes_on_click_outside(cx: &mut TestAppContext) {
+        struct Host(ui::SelectState);
+        impl Render for Host {
+            fn render(&mut self, _w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let select = ui::select(
+                    cx,
+                    "sel",
+                    120.0,
+                    &["A", "B"],
+                    Some(0),
+                    &self.0,
+                    |h: &mut Host| &mut h.0,
+                    |_h, _cx| {},
+                    |_h, _i, _cx| {},
+                );
+                div().size_full().child(
+                    div()
+                        .w(px(120.0))
+                        .debug_selector(|| "sel".into())
+                        .child(select),
+                )
+            }
+        }
+        let (host, vcx) = cx.add_window_view(|_w, cx| Host(ui::SelectState::new(cx)));
+        let open = |vcx: &mut gpui::VisualTestContext| host.read_with(vcx, |h, _| h.0.is_open());
+        let none = gpui::Modifiers::none();
+        let control = vcx.debug_bounds("sel").expect("the select is on screen");
+        vcx.simulate_click(control.center(), none);
+        assert!(open(vcx));
+        vcx.simulate_click(control.center(), none);
+        assert!(!open(vcx), "the control toggles it shut");
+        vcx.simulate_click(control.center(), none);
+        let outside = gpui::point(control.center().x, control.bottom() + gpui::px(200.0));
+        vcx.simulate_click(outside, none);
+        assert!(!open(vcx), "a click outside closes it");
+    }
+
+    /// Renaming a FOLDER (issue #68) moves its whole subtree on disk and repoints every
+    /// piece of Browse UI state that pointed under it — open tabs, the active/selected
+    /// path, and the expanded set — to the new location.
+    #[gpui::test]
+    fn rename_folder_moves_subtree_and_repoints_state(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        std::fs::create_dir_all(dir.join("src/inner")).unwrap();
+        std::fs::write(dir.join("src/inner/mod.rs"), "// mod\n").unwrap();
+        handle
+            .update(cx, |k, _w, cx| {
+                k.refresh(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, w, cx| {
+                let inner = PathBuf::from("src/inner/mod.rs");
+                k.open_file(inner.clone(), cx);
+                k.browse.expanded.insert(PathBuf::from("src"));
+                k.browse.expanded.insert(PathBuf::from("src/inner"));
+                k.browse.selected_path = Some(inner.clone());
+                // Rename the top folder `src` → `lib`.
+                k.name_prompt = Some(NamePrompt::Rename(PathBuf::from("src")));
+                k.name_input
+                    .update(cx, |e, cx| e.set_content("lib".into(), Lang::PlainText, cx));
+                k.confirm_name_prompt(w, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, _cx| {
+                // Moved on disk.
+                assert!(dir.join("lib/inner/mod.rs").is_file());
+                assert!(!dir.join("src").exists());
+                // Tabs, selection, expansion all repointed under the new name.
+                let moved = PathBuf::from("lib/inner/mod.rs");
+                assert!(k.browse.open_tabs.contains(&moved));
+                assert_eq!(k.browse.open_path.as_ref(), Some(&moved));
+                assert_eq!(k.browse.selected_path.as_ref(), Some(&moved));
+                assert!(k.browse.expanded.contains(&PathBuf::from("lib")));
+                assert!(k.browse.expanded.contains(&PathBuf::from("lib/inner")));
+                assert!(!k.browse.expanded.contains(&PathBuf::from("src")));
+            })
+            .unwrap();
+    }
+
+    /// Tree drag & drop (issue #65): dropping a file onto a folder moves it there; a
+    /// drop that's a no-op (already in that folder) or into a folder's own subtree is
+    /// refused so it can't destroy the source.
+    #[gpui::test]
+    fn drag_drop_moves_into_folder_and_guards_bad_drops(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        std::fs::create_dir_all(dir.join("src/sub")).unwrap();
+        std::fs::write(dir.join("src/sub/keep.rs"), "// keep\n").unwrap();
+        std::fs::write(dir.join("top.txt"), "top\n").unwrap();
+        handle.update(cx, |k, _w, cx| k.refresh(cx)).unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, cx| {
+                // Move top.txt into src/.
+                k.drop_onto_dir(PathBuf::from("top.txt"), PathBuf::from("src"), cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(dir.join("src/top.txt").is_file(), "file moved into folder");
+        assert!(!dir.join("top.txt").exists(), "source is gone");
+
+        handle
+            .update(cx, |k, _w, cx| {
+                // No-op: already inside src/.
+                k.drop_onto_dir(PathBuf::from("src/top.txt"), PathBuf::from("src"), cx);
+                // Refused: moving src into its own descendant would destroy it.
+                k.drop_onto_dir(PathBuf::from("src"), PathBuf::from("src/sub"), cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            dir.join("src/top.txt").is_file(),
+            "no-op drop kept the file"
+        );
+        assert!(
+            dir.join("src/sub/keep.rs").is_file(),
+            "self-descendant drop refused"
+        );
+        assert!(
+            !dir.join("src/sub/src").exists(),
+            "src was not moved into its child"
+        );
+    }
+
+    /// File-tree clipboard (issue #67): Copy duplicates (auto-renaming on a clash), Cut
+    /// moves and clears the clipboard, and a folder copies recursively.
+    #[gpui::test]
+    fn clipboard_copy_cut_paste_move_and_duplicate(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        std::fs::write(dir.join("a/x.txt"), "x\n").unwrap();
+        handle.update(cx, |k, _w, cx| k.refresh(cx)).unwrap();
+        cx.run_until_parked();
+
+        // Copy a/x.txt, paste into b/ → b/x.txt appears, source stays.
+        handle
+            .update(cx, |k, _w, cx| {
+                k.clip_paths(vec![PathBuf::from("a/x.txt")], false, cx);
+                k.paste_into(PathBuf::from("b"), cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(dir.join("b/x.txt").is_file(), "copy pasted into b/");
+        assert!(dir.join("a/x.txt").is_file(), "copy left the source");
+
+        // Paste the same copy back into a/ (where it already lives) → auto-renamed.
+        handle
+            .update(cx, |k, _w, cx| {
+                k.clip_paths(vec![PathBuf::from("a/x.txt")], false, cx);
+                k.paste_into(PathBuf::from("a"), cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            dir.join("a/x copy.txt").is_file(),
+            "clash auto-renamed to ' copy'"
+        );
+
+        // Cut folder a/ into b/ → b/a/x.txt appears, a/ is gone, clipboard cleared.
+        handle
+            .update(cx, |k, _w, cx| {
+                k.clip_paths(vec![PathBuf::from("a")], true, cx);
+                k.paste_into(PathBuf::from("b"), cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            dir.join("b/a/x.txt").is_file(),
+            "cut moved the folder recursively"
+        );
+        assert!(!dir.join("a").exists(), "cut removed the source folder");
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert!(k.browse.clipboard.is_none(), "cut cleared the clipboard");
+            })
+            .unwrap();
+    }
+
+    /// Renaming a tracked file records it clearly in local history (issue #67 QA): the new
+    /// path gets a "Renamed" marker and the old path a deletion tombstone.
+    #[gpui::test]
+    fn rename_shows_clearly_in_local_history(cx: &mut TestAppContext) {
+        use ferritemcu_local_history::EventKind;
+        let (handle, dir) = boot(cx);
+        // app.tsx is a tracked file in the boot repo; rename it.
+        handle
+            .update(cx, |k, _w, cx| {
+                k.move_path(
+                    std::path::Path::new("app.tsx"),
+                    std::path::Path::new("renamed.tsx"),
+                    "Renaming",
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(dir.join("renamed.tsx").is_file());
+        assert!(!dir.join("app.tsx").exists());
+        handle
+            .update(cx, |k, _w, _cx| {
+                let store = k.lh.store.clone().unwrap();
+                let s = store.lock().unwrap();
+                let new_ev = s.events_for(std::path::Path::new("renamed.tsx"));
+                assert!(
+                    new_ev.iter().any(|e| e.label.as_deref() == Some("Renamed")),
+                    "new path has a Renamed marker: {new_ev:?}"
+                );
+                let old_ev = s.events_for(std::path::Path::new("app.tsx"));
+                assert!(
+                    old_ev.iter().any(|e| e.kind == EventKind::Deleted),
+                    "old path is tombstoned: {old_ev:?}"
+                );
+            })
+            .unwrap();
+    }
+
+    /// A folder picker that couldn't open (Linux without an XDG desktop portal) says so on
+    /// the error banner instead of silently doing nothing; a cancelled pick stays quiet.
+    #[gpui::test]
+    fn a_folder_picker_that_cannot_open_says_so(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        handle
+            .update(cx, |k, _w, cx| {
+                k.op_error = None;
+                assert_eq!(k.picked_folder(Ok(None), cx), None);
+                assert!(k.op_error.is_none(), "a cancelled pick is not an error");
+                assert_eq!(
+                    k.picked_folder(Ok(Some(vec![dir.clone()])), cx),
+                    Some(dir.clone())
+                );
+                let missing = anyhow::anyhow!(
+                    "Couldn't open file picker due to missing xdg-desktop-portal implementation."
+                );
+                assert_eq!(k.picked_folder(Err(missing), cx), None);
+                let banner = k.op_error.clone().unwrap_or_default();
+                assert!(
+                    banner.starts_with("Opening the folder picker failed")
+                        && banner.contains("xdg-desktop-portal"),
+                    "{banner}"
+                );
+            })
+            .unwrap();
+    }
+
+    /// Linux: when the OS won't watch the project (here a folder FerriteMCU can't read; in the
+    /// wild, usually the inotify watch limit), the status bar says live refresh is off
+    /// instead of silently waiting for a window refocus.
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn a_project_the_os_wont_watch_says_live_refresh_is_off(cx: &mut TestAppContext) {
+        use std::os::unix::fs::PermissionsExt;
+        let (handle, dir) = boot(cx);
+        let locked = dir.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads anything, so there the watch still works and there is nothing to say.
+        let unreadable = std::fs::read_dir(&locked).is_err();
+        handle
+            .update(cx, |k, _w, cx| {
+                assert!(k.watch_off.is_none(), "the boot repo is watched");
+                k.watch_root = None; // re-arm on the same project
+                k.sync_fs_watcher(cx);
+                if unreadable {
+                    let why = k.watch_off.clone().unwrap_or_default();
+                    assert!(why.starts_with("Can't watch locked:"), "{why}");
+                    assert!(k.fs_watcher.is_none());
+                }
+            })
+            .unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A window refocus rechecks for a release only once the last check is 15+ minutes old,
+    /// and a recheck never re-raises the version the user dismissed — only a newer one.
+    #[gpui::test]
+    fn refocus_rechecks_for_an_update_once_stale(cx: &mut TestAppContext) {
+        let (handle, _dir) = boot(cx);
+        let rel = |v: &str| update::Release {
+            version: v.into(),
+            tag: format!("ferritemcu-v{v}"),
+            zip_url: String::new(),
+            sha256_url: String::new(),
+            page_url: String::new(),
+        };
+        handle
+            .update(cx, |k, _w, cx| {
+                let fresh = k.self_update.checked_at.expect("launch checks");
+                k.recheck_update_if_stale(cx);
+                assert_eq!(k.self_update.checked_at, Some(fresh), "fresh: no recheck");
+                let stale = std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_mins(16))
+                    .unwrap();
+                k.self_update.checked_at = Some(stale);
+                k.recheck_update_if_stale(cx);
+                assert!(k.self_update.checked_at > Some(stale), "stale: rechecks");
+
+                k.self_update.available = Some(rel("9.9.9"));
+                k.dismiss_update(cx);
+                k.offer_update(rel("9.9.9"), cx);
+                assert!(k.self_update.available.is_none(), "dismissed stays hidden");
+                k.offer_update(rel("9.9.10"), cx);
+                let offered = k.self_update.available.as_ref().map(|r| r.version.as_str());
+                assert_eq!(offered, Some("9.9.10"), "a newer release still shows");
+            })
+            .unwrap();
+    }
+
+    /// The update banner's Download with no zip to fetch (every non-macOS build) opens the
+    /// release page through the system's URL handler, not a shelled-out macOS `open`.
+    #[gpui::test]
+    fn update_download_without_a_zip_opens_the_release_page(cx: &mut TestAppContext) {
+        let (handle, _dir) = boot(cx);
+        let page = "https://example.com/releases/tag/ferritemcu-v9.9.9";
+        handle
+            .update(cx, |k, _w, cx| {
+                k.self_update.available = Some(update::Release {
+                    version: "9.9.9".into(),
+                    tag: "ferritemcu-v9.9.9".into(),
+                    zip_url: String::new(),
+                    sha256_url: String::new(),
+                    page_url: page.into(),
+                });
+                k.do_update(cx);
+                assert!(!k.self_update.updating, "nothing to download");
+            })
+            .unwrap();
+        assert_eq!(cx.opened_url().as_deref(), Some(page));
+    }
+
+    /// Pasting raw image data (e.g. a screenshot on the clipboard) writes it as an image
+    /// file in the target folder — into the folder itself, and (regression) into a folder
+    /// even when the paste target resolves to a FILE, without the "not a directory" error.
+    #[gpui::test]
+    fn paste_clipboard_image_writes_a_file(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        // A tiny valid-enough PNG byte blob — the paste writes bytes verbatim, it doesn't decode.
+        let png = b"\x89PNG\r\n\x1a\n-fake-image-bytes".to_vec();
+        handle
+            .update(cx, |k, _w, cx| {
+                let img = gpui::Image::from_bytes(gpui::ImageFormat::Png, png.clone());
+                cx.write_to_clipboard(gpui::ClipboardItem::new_image(&img));
+                // Nothing on the internal clipboard, so paste falls through to image data.
+                assert!(k.browse.clipboard.is_none());
+                k.paste_into(PathBuf::from("assets"), cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let into_folder = dir.join("assets/image.png");
+        assert!(into_folder.is_file(), "image pasted into the folder");
+        assert_eq!(std::fs::read(&into_folder).unwrap(), png);
+
+        // Regression: a paste target that is a FILE must resolve to its parent folder, not
+        // error with "not a directory".
+        std::fs::write(dir.join("note.txt"), "hi\n").unwrap();
+        handle
+            .update(cx, |k, _w, cx| {
+                let img = gpui::Image::from_bytes(gpui::ImageFormat::Png, png.clone());
+                cx.write_to_clipboard(gpui::ClipboardItem::new_image(&img));
+                k.paste_into(PathBuf::from("note.txt"), cx);
+                assert!(k.op_error.is_none(), "no paste error: {:?}", k.op_error);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            dir.join("image.png").is_file(),
+            "file-target paste landed in the parent"
+        );
+    }
+
+    /// New File / New Folder must work in a plain folder with NO git repo (they're pure
+    /// filesystem ops), and a created-but-still-empty folder must show in the Browse
+    /// tree (file-derived trees can't see empty dirs — `extra_dirs` carries them).
+    #[gpui::test]
+    fn new_file_and_folder_work_in_a_plain_non_git_folder(cx: &mut TestAppContext) {
+        isolate_history();
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferritemcu-plain-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("readme.md"), "hi\n").unwrap();
+
+        let km = Keymap::default();
+        let root = Some(dir.clone());
+        let handle =
+            cx.add_window(move |_w, cx| FerriteMCU::new(root.clone(), km.clone(), false, cx));
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, w, cx| {
+                // The non-git filesystem walk populated the tree.
+                assert!(k.browse.all_files.contains(&PathBuf::from("readme.md")));
+
+                // New File at the project root.
+                k.name_prompt = Some(NamePrompt::NewFile(PathBuf::new()));
+                k.name_input.update(cx, |e, cx| {
+                    e.set_content("hello.ts".into(), Lang::PlainText, cx);
+                });
+                k.confirm_name_prompt(w, cx);
+                assert_eq!(std::fs::read_to_string(dir.join("hello.ts")).unwrap(), "");
+
+                // New Folder at the project root.
+                k.name_prompt = Some(NamePrompt::NewFolder(PathBuf::new()));
+                k.name_input.update(cx, |e, cx| {
+                    e.set_content("docs".into(), Lang::PlainText, cx);
+                });
+                k.confirm_name_prompt(w, cx);
+                assert!(dir.join("docs").is_dir());
+                assert!(k.browse.extra_dirs.contains(&PathBuf::from("docs")));
+            })
+            .unwrap();
+        cx.run_until_parked(); // the refreshes' snapshots land
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert!(k.browse.all_files.contains(&PathBuf::from("hello.ts")));
+                // The EMPTY folder is a visible tree row.
+                let rows = k.browse.tree.visible(&k.browse.expanded);
+                assert!(
+                    rows.iter()
+                        .any(|r| r.path.as_os_str() == "docs" && r.is_dir),
+                    "empty new folder shows in the tree"
+                );
+            })
+            .unwrap();
+    }
+
+    /// A plain (non-git) folder reports `is_git == false`, and `do_git_init` turns it into a
+    /// real repo so the full git UI comes to life (issue #66).
+    #[gpui::test]
+    fn non_git_folder_flags_and_git_init_makes_a_repo(cx: &mut TestAppContext) {
+        isolate_history();
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferritemcu-nogit-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("readme.md"), "hi\n").unwrap();
+
+        let km = Keymap::default();
+        let root = Some(dir.clone());
+        let handle =
+            cx.add_window(move |_w, cx| FerriteMCU::new(root.clone(), km.clone(), false, cx));
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert!(!k.is_git, "a plain folder is not a git repo");
+                // The Browse tree still works (filesystem walk).
+                assert!(k.browse.all_files.contains(&PathBuf::from("readme.md")));
+            })
+            .unwrap();
+        // git init here, then refresh flips the flag.
+        handle.update(cx, |k, _w, cx| k.do_git_init(cx)).unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert!(dir.join(".git").is_dir(), "git init created .git");
+                assert!(k.is_git, "is_git flips true after init");
+            })
+            .unwrap();
+    }
+
+    /// "Initialize Git Repository" on a folder with more files than the Browse walk lists
+    /// asks first — git would list each one as an untracked change (#137).
+    #[gpui::test]
+    fn git_init_on_a_huge_folder_asks_first(cx: &mut TestAppContext) {
+        isolate_history();
+        let dir = std::env::temp_dir().join(format!("ferritemcu-bigdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let km = Keymap::default();
+        let root = Some(dir.clone());
+        let handle =
+            cx.add_window(move |_w, cx| FerriteMCU::new(root.clone(), km.clone(), false, cx));
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, cx| {
+                // What the walk reports when it hits its cap (cheaper than 20k real files).
+                k.browse.all_files = vec![PathBuf::from("f"); DIR_WALK_CAP];
+                k.request_git_init(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, cx| {
+                assert!(k.git_init_win.is_some(), "confirmation window opens");
+                assert!(!dir.join(".git").exists(), "nothing initialized yet");
+                k.confirm_git_init(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(dir.join(".git").is_dir(), "Initialize Anyway runs git init");
+    }
+
+    /// The Create-New-Branch dialog (type a name → Create) must create + switch to the branch,
+    /// and a typed space becomes a hyphen (git rejects spaces). Guards "New Branch does
+    /// nothing" + the space-in-name error.
+    #[gpui::test]
+    fn new_branch_dialog_creates_and_slugifies(cx: &mut TestAppContext) {
+        assert_eq!(slugify_branch("  new branch "), "new-branch");
+        assert_eq!(
+            slugify_branch("feat/compare-overrides"),
+            "feat/compare-overrides"
+        );
+        // Pasting a commit subject: `:` and spaces are git-forbidden → hyphens, runs collapsed.
+        assert_eq!(
+            slugify_branch("fix: new branch shows whole repo"),
+            "fix-new-branch-shows-whole-repo"
+        );
+        // Other forbidden chars + sequences are sanitised; namespacing slash preserved.
+        assert_eq!(slugify_branch("wip/foo?*bar~baz"), "wip/foo-bar-baz");
+        assert_eq!(slugify_branch("a..b@{c"), "a.b-c");
+        assert_eq!(slugify_branch("///lead..trail///"), "lead.trail");
+        assert_eq!(slugify_branch("hotfix.lock"), "hotfix");
+
+        let (handle, _dir) = boot(cx);
+        handle
+            .update(cx, |k, _w, cx| {
+                k.open_new_branch(cx);
+                // Type a name with a space — it should be slugified on Create.
+                k.branch.query.update(cx, |e, cx| {
+                    e.set_content("new branch".into(), Lang::PlainText, cx);
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, cx| k.do_create_branch(cx))
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert_eq!(k.current_branch.as_deref(), Some("new-branch"));
+                assert!(
+                    k.new_branch_win.is_none(),
+                    "dialog should close after Create"
+                );
+            })
+            .unwrap();
+    }
+
+    /// Controller state machine: the (now asynchronous) `refresh` must, after the background
+    /// snapshot lands, populate the changed-files list, the file tree, the branch, and
+    /// auto-select the first change into a diff. Guards the whole `refresh` → `RepoSnapshot`
+    /// → `apply_snapshot` → `select` pipeline (`boot` waits for it via `run_until_parked`).
+    #[gpui::test]
+    fn refresh_populates_changed_files_tree_and_selection(cx: &mut TestAppContext) {
+        let (handle, _dir) = boot(cx);
+        handle
+            .update(cx, |k, _w, cx| {
+                assert!(
+                    k.files.iter().any(|f| f.path.ends_with("app.tsx")),
+                    "the modified file should appear in the changed-files list"
+                );
+                assert!(
+                    k.files.iter().any(|f| f.path.ends_with("new.txt")),
+                    "the untracked file should appear in the changed-files list"
+                );
+                assert!(
+                    k.browse.all_files.iter().any(|p| p.ends_with("app.tsx")),
+                    "the file tree should be populated from ls-files"
+                );
+                assert!(k.current_branch.is_some(), "branch should be read");
+                assert!(k.selected.is_some(), "a change should be auto-selected");
+                assert!(k.op_error.is_none(), "a clean status read shows no banner");
+                // The diff is only computed where it's shown — the Commit view.
+                k.enter_commit(cx);
+                assert!(
+                    k.diff.current.is_some(),
+                    "the selected change should load a diff model"
+                );
+            })
+            .unwrap();
+    }
+
+    /// The `pending_error` mechanism: because `refresh` is asynchronous, an operation error
+    /// set alongside it (rollback/pull/push/branch) can't be written straight to `op_error`
+    /// — the background status read would clear it. Stashing it in `pending_error` must
+    /// survive exactly that refresh (re-applied by `apply_snapshot`), then a later clean
+    /// refresh clears the banner.
+    #[gpui::test]
+    fn pending_error_survives_the_refresh_then_clears(cx: &mut TestAppContext) {
+        let (handle, _dir) = boot(cx);
+        handle
+            .update(cx, |k, _w, cx| {
+                k.pending_error = Some("Rollback failed for 1 file(s): x".into());
+                k.refresh(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert_eq!(
+                    k.op_error.as_deref(),
+                    Some("Rollback failed for 1 file(s): x"),
+                    "the stashed error must be shown after the refresh clears the banner"
+                );
+                assert!(
+                    k.pending_error.is_none(),
+                    "pending_error is consumed exactly once"
+                );
+            })
+            .unwrap();
+        // A subsequent clean refresh clears the transient banner.
+        handle.update(cx, |k, _w, cx| k.refresh(cx)).unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert!(
+                    k.op_error.is_none(),
+                    "the next successful refresh clears the banner"
+                );
+            })
+            .unwrap();
+    }
+
+    /// Tab state machine: opening files appends unique permanent tabs and activates the last;
+    /// closing a non-active tab leaves the active one; closing the active tab falls back to a
+    /// neighbour; closing the last empties the editor.
+    #[gpui::test]
+    fn open_and_close_tabs_tracks_active_tab(cx: &mut TestAppContext) {
+        let (handle, _dir) = boot(cx);
+        handle
+            .update(cx, |k, _w, cx| {
+                k.open_file(PathBuf::from("app.tsx"), cx);
+                k.open_file(PathBuf::from("new.txt"), cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, cx| {
+                assert_eq!(k.browse.open_tabs.len(), 2, "two distinct files → two tabs");
+                assert!(
+                    k.browse
+                        .open_path
+                        .as_ref()
+                        .is_some_and(|p| p.ends_with("new.txt")),
+                    "the last-opened file is active"
+                );
+                // Close the non-active tab (app.tsx, index 0): active stays new.txt.
+                k.close_tab(0, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, cx| {
+                assert_eq!(k.browse.open_tabs.len(), 1);
+                assert!(k
+                    .browse
+                    .open_path
+                    .as_ref()
+                    .is_some_and(|p| p.ends_with("new.txt")));
+                // Close the last (active) tab → editor cleared.
+                k.close_tab(0, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert!(
+                    k.browse.open_tabs.is_empty(),
+                    "closing the last tab empties the list"
+                );
+                assert!(k.browse.open_path.is_none(), "nothing is active");
+            })
+            .unwrap();
+    }
+
+    /// A snapshot landing while the finder is open must recompute its results: `refresh` is
+    /// asynchronous, so a finder opened before the background read finishes would otherwise
+    /// show empty/stale results (matched against the old `all_files`) until the next
+    /// keystroke. Caught live — the go-to-file screenshot state rendered zero rows.
+    #[gpui::test]
+    fn snapshot_landing_recomputes_open_finder(cx: &mut TestAppContext) {
+        let (handle, _dir) = boot(cx);
+        handle
+            .update(cx, |k, _w, cx| {
+                // Simulate "opened before the first snapshot landed": stale-empty file list.
+                k.browse.all_files.clear();
+                k.finder.open = true;
+                k.finder.mode = FinderMode::Files;
+                k.finder
+                    .query
+                    .update(cx, |e, cx| e.set_content("app".into(), Lang::PlainText, cx));
+                k.recompute_finder(cx);
+                assert!(
+                    k.finder.results.is_empty(),
+                    "sanity: nothing to match before the snapshot"
+                );
+                k.refresh(cx);
+            })
+            .unwrap();
+        cx.run_until_parked(); // let the background snapshot land
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert!(
+                    k.finder.results.iter().any(|p| p.ends_with("app.tsx")),
+                    "the landing snapshot must refresh the open finder's results"
+                );
+            })
+            .unwrap();
+    }
+
+    /// IME composition: each marked-text update replaces the PREVIOUS marked region, and the
+    /// IME's selection is relative to that region — the selection must be anchored at the
+    /// region's START on both ends. (It was anchored at `range.end` on the end, overshooting
+    /// by the old marked text's length on every update — walking the selection past the
+    /// composed text and, eventually, the buffer.)
+    #[gpui::test]
+    fn ime_composition_keeps_selection_inside_marked_text(cx: &mut TestAppContext) {
+        use gpui::EntityInputHandler;
+        let (handle, _dir) = boot(cx);
+        handle
+            .update(cx, |k, window, cx| {
+                k.open_file(PathBuf::from("app.tsx"), cx); // content: "const a = 2;\n"
+                k.browse.editor.update(cx, |e, cx| {
+                    e.select_range(3..3, cx); // caret inside the buffer
+                                              // First composition update: no marked text yet → replaces the caret.
+                    e.replace_and_mark_text_in_range(None, "ni", Some(0..2), window, cx);
+                    assert_eq!(e.selection(), 3..5, "selection covers the marked text");
+                    // Second update replaces the marked region ("ni" → "niho"). Selection
+                    // must cover the new marked text — 3..7, not 3..9 (the old overshoot).
+                    e.replace_and_mark_text_in_range(None, "niho", Some(0..4), window, cx);
+                    assert_eq!(
+                        e.selection(),
+                        3..7,
+                        "selection must be anchored at the marked region's start"
+                    );
+                    assert!(e.selection().end <= e.text().len());
+                });
+            })
+            .unwrap();
+    }
+
+    /// The sort ops (issues #43/#41): Sort Lines rewrites the selected block
+    /// alphabetically and keeps it selected; Sort Object Keys rewrites the object
+    /// at the caret. Both go through `replace_range_text` (one undo step) and are
+    /// gated to Browse with a file open.
+    #[gpui::test]
+    fn sort_ops_rewrite_selection_and_object(cx: &mut TestAppContext) {
+        let (handle, _dir) = boot(cx);
+        handle
+            .update(cx, |k, _w, cx| {
+                k.open_file(PathBuf::from("app.tsx"), cx); // sets open_path (the op gate)
+                                                           // Sort Lines on a plain buffer.
+                k.browse.editor.update(cx, |e, cx| {
+                    e.set_content("b\nB\na\n".into(), Lang::PlainText, cx);
+                    e.select_range(0..6, cx);
+                });
+                k.sort_selected_lines(cx);
+                let ed = k.browse.editor.read(cx);
+                assert_eq!(ed.text(), "a\nB\nb\n");
+                assert_eq!(ed.selection(), 0..5, "sorted block stays selected");
+                // Sort Object Keys at the caret (lang set explicitly — the op must
+                // not depend on the machine's installed-plugins config).
+                k.browse.editor.update(cx, |e, cx| {
+                    e.set_content("{\n  \"b\": 1,\n  \"a\": 2\n}".into(), Lang::Json, cx);
+                    e.select_range(1..1, cx);
+                });
+                k.sort_object_keys_at_caret(cx);
+                assert_eq!(
+                    k.browse.editor.read(cx).text(),
+                    "{\n  \"a\": 2,\n  \"b\": 1\n}"
+                );
+                // "Sort Lines" with the selection inside a JSON object delegates to
+                // the key sort (#43) — a textual line sort would strand the commas.
+                k.browse.editor.update(cx, |e, cx| {
+                    e.set_content("{\n  \"b\": 1,\n  \"a\": 2\n}".into(), Lang::Json, cx);
+                    e.select_range(2..20, cx);
+                });
+                k.sort_selected_lines(cx);
+                assert_eq!(
+                    k.browse.editor.read(cx).text(),
+                    "{\n  \"a\": 2,\n  \"b\": 1\n}",
+                    "line sort inside an object must key-sort, not text-sort"
+                );
+                // Guard: outside Browse the ops are inert.
+                k.mode = Mode::Commit;
+                k.browse
+                    .editor
+                    .update(cx, |e, cx| e.select_range(0..10, cx));
+                k.sort_selected_lines(cx);
+                assert_eq!(
+                    k.browse.editor.read(cx).text(),
+                    "{\n  \"a\": 2,\n  \"b\": 1\n}",
+                    "no sorting outside Browse"
+                );
+            })
+            .unwrap();
+    }
+
+    /// Compare two files (issue #42): `open_compare` diffs them, the gutter's
+    /// apply copies a hunk either direction (writing the TARGET file to disk and
+    /// re-diffing in place), and the pair converges to zero differences.
+    #[gpui::test]
+    fn compare_applies_hunks_both_directions(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "one\nTWO\nthree\nfour\n").unwrap();
+        handle
+            .update(cx, |k, _w, cx| {
+                k.open_compare(PathBuf::from("a.txt"), PathBuf::from("b.txt"), cx);
+                let d = k.compare.diff.as_ref().unwrap();
+                assert_eq!(d.hunks.len(), 2, "two→TWO + the trailing four");
+                // « — the LEFT file takes the right side's hunk 0 (two → TWO).
+                k.compare_apply_hunk(0, false, cx);
+                assert_eq!(
+                    std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+                    "one\nTWO\nthree\n"
+                );
+                assert_eq!(
+                    k.compare.diff.as_ref().unwrap().hunks.len(),
+                    1,
+                    "re-diffed after the apply"
+                );
+                // » — the RIGHT file takes the left side for the remaining hunk
+                // (drops its extra "four" line).
+                k.compare_apply_hunk(0, true, cx);
+                assert_eq!(
+                    std::fs::read_to_string(dir.join("b.txt")).unwrap(),
+                    "one\nTWO\nthree\n"
+                );
+                assert!(k.compare.diff.as_ref().unwrap().hunks.is_empty());
+            })
+            .unwrap();
+    }
+
+    /// Find in every diff view (issue #86): ⌘R over the editable working pane opens
+    /// replace, over the read-only base pane it downgrades to find; matches paint on the
+    /// find layer without clobbering the diff's word tint; and a bar hosted by a modal
+    /// (Compare) goes away with its window.
+    #[gpui::test]
+    fn find_targets_any_diff_pane_and_modal(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        let set_query = |k: &mut FerriteMCU, q: &str, cx: &mut Context<FerriteMCU>| {
+            k.find
+                .query
+                .update(cx, |e, cx| e.set_content(q.into(), Lang::PlainText, cx));
+        };
+        handle
+            .update(cx, |k, w, cx| {
+                k.enter_commit(cx);
+                let i = k.files.iter().position(|f| f.path.ends_with("app.tsx"));
+                k.select_with(i.unwrap(), Some(cx));
+                k.open_find(FindHost::Main, true, w, cx);
+                assert_eq!(k.find.target.as_ref(), Some(&k.diff.right));
+                assert!(k.find.replace, "working pane is editable → replace row");
+                set_query(k, "const", cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, w, cx| {
+                assert_eq!(k.find.matches.len(), 1);
+                let right = k.diff.right.read(cx);
+                assert!(right.find_bg.contains_key(&0), "match painted on line 0");
+                assert_eq!(
+                    right.find_current,
+                    Some((0, 0..5)),
+                    "current match outlined"
+                );
+                assert!(!right.word_bg.is_empty(), "diff word tint kept");
+                // Focus the base pane → ⌘R there is find-only, and the old pane's
+                // highlights are cleared.
+                let left_focus = k.diff.left.read(cx).focus_handle.clone();
+                w.focus(&left_focus);
+                k.open_find(FindHost::Main, true, w, cx);
+                assert_eq!(k.find.target.as_ref(), Some(&k.diff.left));
+                assert!(!k.find.replace, "read-only pane → find only");
+                assert!(k.diff.right.read(cx).find_bg.is_empty());
+            })
+            .unwrap();
+
+        std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "one\nTWO\ntwo\n").unwrap();
+        handle
+            .update(cx, |k, _w, cx| {
+                k.open_compare(PathBuf::from("a.txt"), PathBuf::from("b.txt"), cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, w, cx| {
+                k.open_find(FindHost::Modal(ModalKind::Compare), false, w, cx);
+                assert_eq!(k.find.target.as_ref(), Some(&k.compare.right));
+                set_query(k, "two", cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, cx| {
+                assert_eq!(k.find.matches.len(), 2, "case-insensitive: TWO + two");
+                assert!(
+                    !k.find_shown(FindHost::Main),
+                    "the bar lives in the Compare window"
+                );
+                k.close_modal_window(ModalKind::Compare, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, cx| {
+                assert!(!k.find.open, "closing the host window closes its find bar");
+                assert!(k.compare.right.read(cx).find_bg.is_empty());
+            })
+            .unwrap();
+    }
+
+    /// ⌘-click import navigation (issue #26): a link resolved against the
+    /// project file list opens the target; unresolvable specifiers (packages)
+    /// are a silent no-op.
+    #[gpui::test]
+    fn cmd_click_import_opens_the_target_file(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        std::fs::write(dir.join("lib.ts"), "export const a = 1;\n").unwrap();
+        std::fs::write(dir.join("main.ts"), "import { a } from './lib';\n").unwrap();
+        handle.update(cx, |k, _w, cx| k.refresh(cx)).unwrap();
+        cx.run_until_parked(); // let the file-list snapshot land
+        handle
+            .update(cx, |k, _w, cx| {
+                k.open_file(PathBuf::from("main.ts"), cx);
+                // Lang set explicitly — must not depend on the machine's installed packs.
+                k.browse.editor.update(cx, |e, cx| {
+                    e.set_link_navigation(true, cx);
+                    e.set_content("import { a } from './lib';\n".into(), Lang::Ts, cx);
+                });
+                let links = highlight::import_links("import { a } from './lib';\n", Lang::Ts);
+                assert_eq!(links.len(), 1);
+                k.open_import_link(links[0].clone(), cx);
+                assert_eq!(
+                    k.browse.open_path,
+                    Some(PathBuf::from("lib.ts")),
+                    "relative TS import resolves + opens"
+                );
+                // A bare specifier is an npm package — no-op.
+                let npm = highlight::import_links("import r from 'react';\n", Lang::Ts);
+                k.open_import_link(npm[0].clone(), cx);
+                assert_eq!(k.browse.open_path, Some(PathBuf::from("lib.ts")));
+            })
+            .unwrap();
+    }
+
+    /// ⌘-click on a USE of an imported symbol jumps THROUGH the import: opens
+    /// the target file and lands the selection on the definition. The pack for
+    /// the target must be installed (effective lang drives the definition scan).
+    #[gpui::test]
+    fn cmd_click_symbol_jumps_to_its_definition(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        let lib = "const pad = 1;\nexport const answer = 42;\n";
+        std::fs::write(dir.join("lib.ts"), lib).unwrap();
+        std::fs::write(
+            dir.join("main.ts"),
+            "import { answer } from './lib';\nconsole.log(answer);\n",
+        )
+        .unwrap();
+        handle.update(cx, |k, _w, cx| k.refresh(cx)).unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, cx| {
+                k.plugins.install("typescript"); // effective_lang must see Ts for lib.ts
+                k.open_file(PathBuf::from("main.ts"), cx);
+                let src = "import { answer } from './lib';\nconsole.log(answer);\n";
+                k.browse.editor.update(cx, |e, cx| {
+                    e.set_link_navigation(true, cx);
+                    e.set_content(src.into(), Lang::Ts, cx);
+                });
+                let binds = highlight::import_bindings(src, Lang::Ts);
+                let (name, link) = binds[0].clone();
+                assert_eq!(name, "answer");
+                k.open_import_symbol(link, name, cx);
+                assert_eq!(k.browse.open_path, Some(PathBuf::from("lib.ts")));
+                let sel = k.browse.editor.read(cx).selection();
+                assert_eq!(&lib[sel], "answer", "selection lands on the definition");
+            })
+            .unwrap();
+    }
+
+    /// ⌘-click on a METHOD of an imported class resolves through the
+    /// external-defs index: the imported file's definitions are indexed in the
+    /// background, and clicking the method name opens that file at the method.
+    #[gpui::test]
+    fn cmd_click_method_resolves_via_imported_file(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        let lib = "export class Cat {\n  meow() { return 1; }\n}\n";
+        std::fs::write(dir.join("lib.ts"), lib).unwrap();
+        let main = "import { Cat } from './lib';\nnew Cat().meow();\n";
+        std::fs::write(dir.join("main.ts"), main).unwrap();
+        handle.update(cx, |k, _w, cx| k.refresh(cx)).unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, cx| {
+                k.plugins.install("typescript");
+                k.open_file(PathBuf::from("main.ts"), cx);
+                k.browse.editor.update(cx, |e, cx| {
+                    e.set_link_navigation(true, cx);
+                });
+                // open_file may have skipped the index (pack installed just
+                // now) — force a fresh compute with links enabled.
+                k.browse.ext_defs_targets.clear();
+                k.refresh_external_defs(cx);
+            })
+            .unwrap();
+        cx.run_until_parked(); // background index lands
+        handle
+            .update(cx, |k, _w, cx| {
+                // The editor's external index must now know `meow` → lib.ts.
+                let (path, range) = k
+                    .browse
+                    .editor
+                    .read(cx)
+                    .external_def_for("meow")
+                    .expect("method of the imported class is indexed");
+                assert_eq!(path, PathBuf::from("lib.ts"));
+                k.open_definition_at(path, range, cx);
+                assert_eq!(k.browse.open_path, Some(PathBuf::from("lib.ts")));
+                let sel = k.browse.editor.read(cx).selection();
+                assert_eq!(&lib[sel], "meow", "selection lands on the method");
+            })
+            .unwrap();
+    }
+
+    /// ⌘⌥←/⌘⌥→ file navigation: visits record, back/forward walk them without
+    /// recording, and opening a new file after going back discards the forward
+    /// branch.
+    #[gpui::test]
+    fn nav_back_and_forward_walk_the_visit_history(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        for n in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(dir.join(n), n).unwrap();
+        }
+        handle.update(cx, |k, _w, cx| k.refresh(cx)).unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, cx| {
+                for n in ["a.txt", "b.txt", "c.txt"] {
+                    k.open_file(PathBuf::from(n), cx);
+                }
+                k.nav_back(cx);
+                assert_eq!(k.browse.open_path, Some(PathBuf::from("b.txt")));
+                k.nav_back(cx);
+                assert_eq!(k.browse.open_path, Some(PathBuf::from("a.txt")));
+                k.nav_back(cx); // start of history — no-op
+                assert_eq!(k.browse.open_path, Some(PathBuf::from("a.txt")));
+                k.nav_forward(cx);
+                assert_eq!(k.browse.open_path, Some(PathBuf::from("b.txt")));
+                // New open from the middle discards the forward branch (c.txt).
+                k.open_file(PathBuf::from("app.tsx"), cx);
+                k.nav_forward(cx); // nothing forward anymore
+                assert_eq!(k.browse.open_path, Some(PathBuf::from("app.tsx")));
+                k.nav_back(cx);
+                assert_eq!(k.browse.open_path, Some(PathBuf::from("b.txt")));
+                assert_eq!(k.browse.nav_history.len(), 3, "a, b, app.tsx (c discarded)");
+            })
+            .unwrap();
+    }
+
+    /// Window-refocus reload: a file changed on disk by an external tool must land in the
+    /// open editor when `reload_external` runs (the activation observer's callback), as
+    /// long as the buffer has no unsaved edits.
+    #[gpui::test]
+    fn reload_external_picks_up_disk_changes(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        handle
+            .update(cx, |k, _w, cx| {
+                k.open_file(PathBuf::from("app.tsx"), cx);
+                assert_eq!(k.browse.editor.read(cx).text(), "const a = 2;\n");
+            })
+            .unwrap();
+        cx.run_until_parked();
+        // Simulate an external editor rewriting the file while FerriteMCU is in the background.
+        std::fs::write(dir.join("app.tsx"), "const a = 99; // external\n").unwrap();
+        handle
+            .update(cx, |k, _w, cx| k.reload_external(cx))
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, cx| {
+                assert_eq!(
+                    k.browse.editor.read(cx).text(),
+                    "const a = 99; // external\n",
+                    "refocus must reload the externally-changed file"
+                );
+            })
+            .unwrap();
+    }
+
+    /// A huge changed file (a stray multi-GB log) is never read into the Commit view's
+    /// diff: selecting it shows a note, and its pane can't autosave over the file.
+    #[gpui::test]
+    fn commit_view_does_not_diff_a_huge_file(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        // Sparse: past the limit without writing the bytes.
+        let log = std::fs::File::create(dir.join("huge.log")).unwrap();
+        log.set_len(21 << 20).unwrap();
+        handle.update(cx, |k, _w, cx| k.refresh(cx)).unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, cx| {
+                k.enter_commit(cx);
+                let i = k.files.iter().position(|f| f.path.ends_with("huge.log"));
+                k.select_with(i.expect("huge.log is a change"), Some(cx));
+                assert!(k.diff.right.read(cx).text().starts_with("File too large"));
+                assert!(k.diff.path.is_none(), "autosave stays off");
+            })
+            .unwrap();
+    }
+
+    /// Window-refocus reload, Commit view: the side-by-side panes show a file's working
+    /// copy, and `refresh` deliberately never touches the pane editors (cx=None re-select)
+    /// — so an explicit refocus must reload them, or external edits stay invisible (and an
+    /// editable stale right pane could then clobber them on the next keystroke).
+    #[gpui::test]
+    fn reload_external_refreshes_commit_diff_panes(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        handle
+            .update(cx, |k, _w, cx| {
+                k.enter_commit(cx);
+                // Select the modified file WITH a context so the panes actually load.
+                let i = k
+                    .files
+                    .iter()
+                    .position(|f| f.path.ends_with("app.tsx"))
+                    .expect("app.tsx is a change");
+                k.select_with(i, Some(cx));
+                assert_eq!(k.diff.right.read(cx).text(), "const a = 2;\n");
+            })
+            .unwrap();
+        cx.run_until_parked();
+        // External tool rewrites the file while FerriteMCU is in the background.
+        std::fs::write(dir.join("app.tsx"), "const a = 7; // external\n").unwrap();
+        handle
+            .update(cx, |k, _w, cx| k.reload_external(cx))
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, cx| {
+                assert_eq!(
+                    k.diff.right.read(cx).text(),
+                    "const a = 7; // external\n",
+                    "refocus must reload the commit view's working pane"
+                );
+            })
+            .unwrap();
+    }
+
+    /// Refocus with a clean tree while a history diff is open (#39): the empty-status
+    /// refresh must not clear the shared diff panes back to "Select a file".
+    #[gpui::test]
+    fn reload_external_keeps_history_diff_open(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        // Clean tree + 2 commits.
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "second"]);
+        handle
+            .update(cx, |k, _w, cx| {
+                k.history.compare = CompareMode::Before;
+                k.enter_history(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert!(k.diff.current.is_some(), "sanity: history diff loaded");
+                assert_eq!(k.history.file_selected, Some(0));
+            })
+            .unwrap();
+        // Refocus = the activation observer's callback.
+        handle
+            .update(cx, |k, _w, cx| k.reload_external(cx))
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert!(
+                    k.diff.current.is_some(),
+                    "refocus must not blank the open history diff"
+                );
+                assert!(k.diff.path.is_some());
+                assert_eq!(k.history.file_selected, Some(0));
+            })
+            .unwrap();
+    }
+
+    /// Refocus with a dirty tree while a history diff is open: the refresh must not
+    /// overwrite the committed diff model with the working-tree diff.
+    #[gpui::test]
+    fn reload_external_keeps_history_diff_model(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "second"]);
+        std::fs::write(dir.join("app.tsx"), "const a = 3;\n").unwrap(); // dirty again
+        handle
+            .update(cx, |k, _w, cx| {
+                k.history.compare = CompareMode::Before;
+                k.enter_history(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let new_side = |k: &FerriteMCU| {
+            k.diff
+                .current
+                .as_ref()
+                .expect("history diff loaded")
+                .new
+                .join("\n")
+        };
+        handle
+            .update(cx, |k, _w, _cx| {
+                // Newest commit vs parent: the new side is the committed "a = 2".
+                assert!(new_side(k).contains("const a = 2;"));
+            })
+            .unwrap();
+        handle
+            .update(cx, |k, _w, cx| k.reload_external(cx))
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert!(
+                    new_side(k).contains("const a = 2;"),
+                    "refocus overwrote the history diff with the working-tree diff: {:?}",
+                    new_side(k)
+                );
+            })
+            .unwrap();
+    }
+
+    /// Refocus in History "Local" compare: the right pane shows the working copy, so
+    /// external edits must reload it (same never-clobber rules as the Commit pane).
+    #[gpui::test]
+    fn reload_external_refreshes_history_local_pane(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "second"]);
+        std::fs::write(dir.join("app.tsx"), "const a = 3;\n").unwrap(); // dirty again
+        handle
+            .update(cx, |k, _w, cx| {
+                k.history.compare = CompareMode::Local;
+                k.enter_history(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, cx| {
+                assert_eq!(k.history.file_selected, Some(0), "sanity: file selected");
+                assert_eq!(k.diff.right.read(cx).text(), "const a = 3;\n");
+            })
+            .unwrap();
+        // External tool rewrites the file while FerriteMCU is in the background.
+        std::fs::write(dir.join("app.tsx"), "const a = 4;\n").unwrap();
+        handle
+            .update(cx, |k, _w, cx| k.reload_external(cx))
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, cx| {
+                assert_eq!(
+                    k.diff.right.read(cx).text(),
+                    "const a = 4;\n",
+                    "refocus must reload the history Local-compare working pane"
+                );
+                assert!(k.diff.current.is_some(), "the diff must stay open");
+                assert_eq!(k.history.file_selected, Some(0));
+            })
+            .unwrap();
+    }
+
+    /// A diff whose language pack isn't installed offers the install banner — a Java change in
+    /// History used to show as plain text with no hint why (#92). Installing re-highlights both
+    /// diff panes in place, and the banner goes.
+    #[gpui::test]
+    fn diff_offers_a_missing_pack_and_installing_rehighlights_it(cx: &mut TestAppContext) {
+        let (handle, _dir) = boot(cx);
+        handle.update(cx, |k, _w, cx| k.refresh(cx)).unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, cx| {
+                k.plugins.uninstall("typescript");
+                k.enter_commit(cx);
+                let i = k
+                    .files
+                    .iter()
+                    .position(|f| f.path == std::path::Path::new("app.tsx"))
+                    .unwrap();
+                k.select_with(i, Some(cx));
+                assert_eq!(k.diff_pending_pack().map(|p| p.id), Some("typescript"));
+                assert_eq!(k.diff.right.read(cx).lang, Lang::PlainText);
+
+                // The banner's Install, minus the save into the developer's real config.
+                k.plugins.install("typescript");
+                k.rehighlight_for(Lang::Tsx, cx);
+                assert!(
+                    k.diff_pending_pack().is_none(),
+                    "banner gone once installed"
+                );
+                assert_eq!(k.diff.left.read(cx).lang, Lang::Tsx);
+                assert_eq!(k.diff.right.read(cx).lang, Lang::Tsx);
+            })
+            .unwrap();
+    }
+
+    /// Settings → Keymap: recording a shortcut rebinds the action (taking the key from the
+    /// action that had it, with a note saying so), a bare key is refused with recording left
+    /// on, and a confirmed "Reset to `WebStorm` / `IntelliJ`" puts every default back.
+    #[gpui::test]
+    fn keymap_editor_records_rebinds_and_resets(cx: &mut TestAppContext) {
+        let (handle, _dir) = boot(cx);
+        handle
+            .update(cx, |k, w, cx| {
+                k.choose_preset(Preset::WebStorm, cx);
+                k.start_key_recording("push", w, cx);
+                // ⌘⇧O on macOS, Ctrl+Shift+O elsewhere: either way the keymap writes `cmd`.
+                k.record_keystroke(&gpui::Keystroke::parse("secondary-shift-o").unwrap(), cx);
+                assert_eq!(k.keymap.key_for("push").as_deref(), Some("cmd-shift-o"));
+                assert_eq!(k.keymap.key_for("go_to_file"), None);
+                let moved = if cfg!(target_os = "macos") {
+                    "⌘⇧O moved from Go to File"
+                } else {
+                    "Ctrl+Shift+O moved from Go to File"
+                };
+                assert_eq!(k.keymap_editor.note.as_deref(), Some(moved));
+                assert_eq!(k.keymap_editor.recording, None);
+
+                k.start_key_recording("pull", w, cx);
+                k.record_keystroke(&gpui::Keystroke::parse("p").unwrap(), cx);
+                assert_eq!(k.keymap_editor.recording, Some("pull"), "bare key refused");
+                assert_eq!(k.keymap.key_for("pull").as_deref(), Some("cmd-t"));
+                if !cfg!(target_os = "macos") {
+                    // Super belongs to the desktop off macOS: Super+Shift+O is a bare key.
+                    k.record_keystroke(&gpui::Keystroke::parse("super-shift-o").unwrap(), cx);
+                    assert_eq!(k.keymap_editor.recording, Some("pull"), "Super refused");
+                    assert_eq!(k.keymap.key_for("pull").as_deref(), Some("cmd-t"));
+                }
+
+                k.stop_key_recording();
+                k.request_preset_reset(Preset::WebStorm, cx);
+                assert_eq!(
+                    k.keymap.key_for("push").as_deref(),
+                    Some("cmd-shift-o"),
+                    "nothing changes until the reset is confirmed"
+                );
+                k.confirm_preset_reset(cx);
+                assert_eq!(
+                    k.keymap.key_for("go_to_file").as_deref(),
+                    Some("cmd-shift-o")
+                );
+                assert_eq!(k.keymap.key_for("push").as_deref(), Some("cmd-shift-k"));
+            })
+            .unwrap();
+    }
+
+    /// History branches sidebar (#92): branches load off the UI thread when the view opens,
+    /// `/` folders start expanded, and a folder the user collapsed stays collapsed on reload.
+    #[gpui::test]
+    fn history_branches_sidebar_loads_and_remembers_collapse(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        git(&dir, &["branch", "feature/greeting"]);
+        handle.update(cx, |k, _w, cx| k.enter_history(cx)).unwrap();
+        cx.run_until_parked();
+        let folder = "sec:local/feature".to_string();
+        handle
+            .update(cx, |k, _w, cx| {
+                assert!(k.history.locals.iter().any(|b| b == "feature/greeting"));
+                assert!(k.history.branches_expanded.contains(&folder));
+                k.toggle_history_branch_folder(folder.clone(), cx);
+                k.enter_history(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert!(
+                    !k.history.branches_expanded.contains(&folder),
+                    "a collapsed folder must stay collapsed when the branches reload"
+                );
+                assert!(k.history.branches_expanded.contains("sec:local"));
+            })
+            .unwrap();
+    }
+
+    /// Push tree (#92): a refresh with the same files keeps the user's folder collapses; a
+    /// changed file set rebuilds the tree fully expanded.
+    #[test]
+    fn push_tree_keeps_collapses_until_files_change() {
+        let f = |p: &str| ChangedFile {
+            path: PathBuf::from(p),
+            status: FileStatus::Modified,
+        };
+        let src = std::path::Path::new("src");
+        let mut s = SyncState::new();
+        s.set_push_files(vec![f("src/a.rs"), f("src/b/c.rs")]);
+        assert!(s.push_expanded.contains(src));
+        s.push_expanded.remove(src);
+        s.set_push_files(vec![f("src/a.rs"), f("src/b/c.rs")]);
+        assert!(
+            !s.push_expanded.contains(src),
+            "a refresh must not re-expand"
+        );
+        s.set_push_files(vec![f("src/a.rs")]);
+        assert!(s.push_expanded.contains(src));
+    }
+
+    /// Autosave state machine: a dirty editor buffer flushes to disk, the buffer is marked
+    /// clean, and the changed-files list optimistically shows the file as Modified before
+    /// the debounced `git status` lands (so tree/tab colors react instantly).
+    #[gpui::test]
+    fn autosave_flushes_to_disk_and_marks_modified(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        handle
+            .update(cx, |k, _w, cx| {
+                k.open_file(PathBuf::from("app.tsx"), cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, cx| {
+                // Simulate a real edit: new buffer content + the dirty flag a keystroke sets.
+                k.browse.editor.update(cx, |e, cx| {
+                    e.set_content("const a = 3;\n".into(), Lang::PlainText, cx);
+                    e.dirty = true;
+                });
+                k.autosave(cx);
+                assert!(
+                    !k.browse.editor.read(cx).dirty,
+                    "a successful autosave marks the buffer clean"
+                );
+                assert!(
+                    k.files.iter().any(|f| f.path.ends_with("app.tsx")
+                        && f.status == ferritemcu_git::FileStatus::Modified),
+                    "autosave optimistically lists the file as Modified"
+                );
+            })
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("app.tsx")).unwrap(),
+            "const a = 3;\n",
+            "the edit must reach disk"
+        );
+    }
+
+    /// Clicking "Rollback" in the rollback window must discard the changes AND close the
+    /// window (the close is deferred because it fires from inside that window's own button).
+    #[gpui::test]
+    fn rollback_action_closes_window(cx: &mut TestAppContext) {
+        let (handle, _dir) = boot(cx);
+        handle
+            .update(cx, |k, _w, cx| k.open_rollback_path(PathBuf::new(), cx))
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, _cx| assert!(k.rollback_win.is_some()))
+            .unwrap();
+        // Simulate the Rollback button, with "delete local copies" UNticked — the untracked
+        // file must survive on disk (the pre-checked default is covered by
+        // `rollback_deletes_newly_added_files`).
+        handle
+            .update(cx, |k, _w, cx| {
+                k.rollback_delete_added = false;
+                k.do_rollback(cx);
+            })
+            .unwrap();
+        cx.run_until_parked(); // let the deferred remove_window run
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert!(k.rollback_win.is_none(), "Rollback should close its window");
+                // The modified file was discarded (untracked new.txt survives without "delete").
+                assert!(
+                    !k.files.iter().any(|f| f.path.ends_with("app.tsx")),
+                    "the modified file should have been rolled back"
+                );
+            })
+            .unwrap();
+    }
+
+    /// Rolling back a newly `git add`ed file must actually remove it (issue #59): the
+    /// delete-local-copies toggle is pre-checked, so the default rollback unstages the
+    /// Added file AND deletes it — instead of leaving it untracked (same green, still in
+    /// the changes list) which read as "rollback did nothing".
+    #[gpui::test]
+    fn rollback_deletes_newly_added_files(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        // Stage the new file so it shows as Added, and pick up the new status.
+        git(&dir, &["add", "new.txt"]);
+        handle.update(cx, |k, _w, cx| k.refresh(cx)).unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, cx| {
+                assert!(
+                    k.files
+                        .iter()
+                        .any(|f| f.path.ends_with("new.txt") && f.status == FileStatus::Added),
+                    "staged new file should be Added"
+                );
+                k.open_rollback_path(PathBuf::from("new.txt"), cx);
+                assert!(
+                    k.rollback_delete_added,
+                    "delete-local-copies defaults to checked"
+                );
+                k.do_rollback(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert!(
+                    !dir.join("new.txt").exists(),
+                    "the added file is deleted from disk"
+                );
+                assert!(
+                    !k.files.iter().any(|f| f.path.ends_with("new.txt")),
+                    "the added file left the changes list"
+                );
+            })
+            .unwrap();
+    }
+
+    /// A folder (or project-root) scope shows every file's events under it, and the
+    /// selected row's own file drives the diff/restore target.
+    #[gpui::test]
+    fn local_history_folder_scope_lists_files_under_it(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        handle
+            .update(cx, |k, _w, cx| {
+                lh_test_store(k, &dir);
+                let store = k.lh.store.clone().unwrap();
+                {
+                    use ferritemcu_local_history::EventKind;
+                    let mut s = store.lock().unwrap();
+                    s.record(
+                        std::path::Path::new("app.tsx"),
+                        "root",
+                        EventKind::Change,
+                        None,
+                        1_000,
+                    )
+                    .unwrap();
+                    s.record(
+                        std::path::Path::new("sub/lib.rs"),
+                        "nested",
+                        EventKind::Change,
+                        None,
+                        2_000,
+                    )
+                    .unwrap();
+                }
+                // Folder scope: only the file under `sub` shows.
+                k.lh.path = Some(PathBuf::from("sub"));
+                k.lh.selected = 0;
+                k.lh_reload(cx);
+                assert_eq!(k.lh.events.len(), 1);
+                assert_eq!(k.lh.events[0].path, PathBuf::from("sub/lib.rs"));
+                // Project-root scope: everything shows, newest first.
+                k.lh.path = Some(PathBuf::new());
+                k.lh_reload(cx);
+                assert_eq!(k.lh.events.len(), 2);
+                assert_eq!(k.lh.events[0].path, PathBuf::from("sub/lib.rs"));
+                assert_eq!(k.lh.events[1].path, PathBuf::from("app.tsx"));
+            })
+            .unwrap();
+    }
+
+    /// The Local History changed-files panel + reverts under Model B ("this change &
+    /// later"): selecting a change lists every file it (or a later change) touched vs the
+    /// state before it; a file whose selected change is an EDIT reverts to the pre-edit
+    /// content, one whose selected change is its CREATION reverts by DELETION; folder and
+    /// timeline reverts do the same over their scope; a file changed BACK drops out of the
+    /// panel; a recorded-but-never-on-disk file (both sides empty) is never listed; and
+    /// every revert records a recoverable "Before revert" label.
+    #[gpui::test]
+    fn local_history_changed_panel_and_reverts(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("app.tsx"), "now-a\n").unwrap();
+        std::fs::write(dir.join("sub/lib.rs"), "now-l\n").unwrap();
+        std::fs::write(dir.join("new.txt"), "n1\n").unwrap();
+        std::fs::write(dir.join("empty.txt"), "").unwrap();
+        // ghost.txt is recorded below but never written to disk.
+        handle
+            .update(cx, |k, _w, cx| {
+                lh_test_store(k, &dir);
+                {
+                    use ferritemcu_local_history::EventKind;
+                    let store = k.lh.store.clone().unwrap();
+                    let mut s = store.lock().unwrap();
+                    let rec =
+                        |s: &mut ferritemcu_local_history::Store, p: &str, c: &str, ts: u64| {
+                            s.record(std::path::Path::new(p), c, EventKind::Change, None, ts)
+                                .unwrap();
+                        };
+                    rec(&mut s, "app.tsx", "a1\n", 1_000); // app created
+                    rec(&mut s, "ghost.txt", "", 1_500); // empty, never on disk
+                    rec(&mut s, "sub/lib.rs", "l1\n", 2_000); // lib created
+                    rec(&mut s, "app.tsx", "a2\n", 3_000); // app edited
+                    rec(&mut s, "sub/lib.rs", "l2\n", 4_000); // lib edited
+                    rec(&mut s, "new.txt", "n1\n", 5_000); // new created, unchanged since
+                    rec(&mut s, "empty.txt", "", 6_000); // empty created
+                }
+                k.lh.path = Some(PathBuf::new()); // whole-project scope
+                k.lh.selected = 0;
+                k.lh_reload(cx);
+                assert_eq!(k.lh.events.len(), 7);
+                let row = |k: &FerriteMCU, p: &str, ts: u64| {
+                    k.lh.events
+                        .iter()
+                        .position(|e| e.path == std::path::Path::new(p) && e.ts_ms == ts)
+                        .unwrap()
+                };
+
+                // (1) Select app's CREATION (the oldest change) → undo everything from
+                // here on: every file that exists now is listed, ghost.txt (recorded
+                // empty, never on disk — both sides empty) is NOT.
+                k.lh_select(row(k, "app.tsx", 1_000), cx);
+                assert_eq!(
+                    k.lh.files,
+                    vec![
+                        PathBuf::from("app.tsx"),
+                        PathBuf::from("empty.txt"),
+                        PathBuf::from("new.txt"),
+                        PathBuf::from("sub/lib.rs"),
+                    ]
+                );
+
+                // (2) Folder revert restores CONTENT when the selected change is an EDIT
+                // (the file had a prior state). Select lib's edit (l1→l2); reverting "sub"
+                // undoes it → l1.
+                std::fs::write(dir.join("sub/lib.rs"), "zz\n").unwrap();
+                k.lh_select(row(k, "sub/lib.rs", 4_000), cx);
+                k.lh_revert_path(PathBuf::from("sub"), cx);
+                assert_eq!(
+                    std::fs::read_to_string(dir.join("sub/lib.rs")).unwrap(),
+                    "l1\n",
+                    "undoing an edit restores the pre-edit content"
+                );
+
+                // (3) File revert DELETES when the selected change is the file's CREATION.
+                // Select new.txt's creation; reverting removes it (recoverable via label).
+                k.lh_select(row(k, "new.txt", 5_000), cx);
+                assert!(k.lh_has_base_under(std::path::Path::new("new.txt")));
+                k.lh_revert_path(PathBuf::from("new.txt"), cx);
+                assert!(
+                    !dir.join("new.txt").exists(),
+                    "undoing a creation deletes the file"
+                );
+                {
+                    let store = k.lh.store.clone().unwrap();
+                    let s = store.lock().unwrap();
+                    let ev = s.events_for(std::path::Path::new("new.txt"));
+                    assert_eq!(ev[0].label.as_deref(), Some("Before revert"));
+                    assert_eq!(
+                        s.content(&ev[0].hash).unwrap(),
+                        "n1\n",
+                        "pre-delete content is recoverable"
+                    );
+                }
+
+                // (4) File revert restores CONTENT on an edit; the timeline immediately
+                // shows the "Before revert" marker.
+                std::fs::write(dir.join("app.tsx"), "zz\n").unwrap();
+                k.lh_select(row(k, "app.tsx", 3_000), cx);
+                k.lh_revert_path(PathBuf::from("app.tsx"), cx);
+                assert_eq!(
+                    std::fs::read_to_string(dir.join("app.tsx")).unwrap(),
+                    "a1\n"
+                );
+                use ferritemcu_local_history::EventKind;
+                assert_eq!(k.lh.events[0].kind, EventKind::Label);
+                assert_eq!(k.lh.events[0].label.as_deref(), Some("Before revert"));
+                assert_eq!(k.lh.events[0].path, PathBuf::from("app.tsx"));
+
+                // (5) app.tsx is now a1 = its state before the a2 edit (changed BACK), so
+                // at that edit's row it drops out of the panel — "No differences" is noise.
+                k.lh_select(row(k, "app.tsx", 3_000), cx);
+                assert!(
+                    !k.lh.files.contains(&PathBuf::from("app.tsx")),
+                    "a file reverted to its pre-change state leaves the panel"
+                );
+
+                // (6) Timeline "Revert This Change and After" at lib's CREATION: deletes
+                // lib (created here) and empty.txt (created later); labels every target.
+                std::fs::write(dir.join("sub/lib.rs"), "l1\n").unwrap(); // restore fixture
+                k.lh_select(row(k, "sub/lib.rs", 2_000), cx);
+                k.lh_revert_since(cx);
+                assert!(
+                    !dir.join("sub/lib.rs").exists(),
+                    "revert-since deletes files created at this change or later"
+                );
+                assert!(
+                    !dir.join("empty.txt").exists(),
+                    "an empty created file is deleted too — existence is the change"
+                );
+                let labels =
+                    k.lh.events
+                        .iter()
+                        .filter(|e| e.label.as_deref() == Some("Before revert"))
+                        .count();
+                assert!(labels >= 4, "every revert target got a label, got {labels}");
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    /// Model B ("this change & later"): selecting a file's OWN creation event lists it as a
+    /// change and reverts by DELETING it — even for an EMPTY new file (the user's `abc.txt`
+    /// case that used to show a confusing "0 files / No differences"). The pre-revert state
+    /// is labeled first, so it stays recoverable. The virtual "Start of history" row does
+    /// the same (base `None` for everything).
+    #[gpui::test]
+    fn local_history_creation_event_lists_and_reverts_by_deletion(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        handle
+            .update(cx, |k, _w, cx| {
+                lh_test_store(k, &dir);
+                {
+                    use ferritemcu_local_history::EventKind;
+                    let store = k.lh.store.clone().unwrap();
+                    let mut s = store.lock().unwrap();
+                    s.record(
+                        std::path::Path::new("solo.txt"),
+                        "",
+                        EventKind::Label,
+                        Some("Created".into()),
+                        1_000,
+                    )
+                    .unwrap();
+                }
+                std::fs::write(dir.join("solo.txt"), "").unwrap();
+                k.lh.path = Some(PathBuf::from("solo.txt"));
+                k.lh.selected = 0;
+                k.lh.file_selected = None;
+                k.lh_reload(cx);
+                assert_eq!(k.lh.events.len(), 1);
+                // The creation event itself now lists the file — it went from not-existing
+                // to existing, which IS the change (even though empty). The old model
+                // showed "0 files / No differences" here; this is the fix.
+                assert_eq!(k.lh.files, vec![PathBuf::from("solo.txt")]);
+                assert!(k.lh_has_base_under(std::path::Path::new("solo.txt")));
+                // Reverting the creation deletes the file (undo "this change and after").
+                k.lh_revert_since(cx);
+                assert!(
+                    !dir.join("solo.txt").exists(),
+                    "undoing the creation deletes the file"
+                );
+                // Recoverable: the pre-revert (empty) content was labeled first.
+                let store = k.lh.store.clone().unwrap();
+                let s = store.lock().unwrap();
+                let ev = s.events_for(std::path::Path::new("solo.txt"));
+                assert_eq!(ev[0].label.as_deref(), Some("Before revert"));
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    /// Delete → re-create reads as a deletion then an ADDITION, not one long edit: the
+    /// tombstone (`EventKind::Deleted`) makes the re-creation diff against "did not exist"
+    /// (so it's listed/added), and reverting the DELETION row undoes the deletion (restores
+    /// the pre-delete content).
+    #[gpui::test]
+    fn local_history_delete_then_recreate_reads_as_deletion_then_addition(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        handle
+            .update(cx, |k, _w, cx| {
+                lh_test_store(k, &dir);
+                {
+                    use ferritemcu_local_history::EventKind;
+                    let store = k.lh.store.clone().unwrap();
+                    let mut s = store.lock().unwrap();
+                    let p = std::path::Path::new("note.txt");
+                    s.record(p, "v1\n", EventKind::Change, None, 1_000).unwrap();
+                    s.record_deletion(p, 2_000).unwrap();
+                    s.record(p, "v2\n", EventKind::External, None, 3_000)
+                        .unwrap();
+                }
+                std::fs::write(dir.join("note.txt"), "v2\n").unwrap(); // currently re-created
+                k.lh.path = Some(PathBuf::from("note.txt"));
+                k.lh.selected = 0;
+                k.lh.file_selected = None;
+                k.lh_reload(cx);
+                use ferritemcu_local_history::EventKind;
+                assert_eq!(k.lh.events.len(), 3);
+                assert_eq!(
+                    k.lh.events[0].kind,
+                    EventKind::External,
+                    "row 0 = re-creation"
+                );
+                assert_eq!(k.lh.events[1].kind, EventKind::Deleted, "row 1 = deletion");
+                // The re-creation is listed as a change (added back) — its "before" is the
+                // deletion tombstone, i.e. "did not exist".
+                assert_eq!(k.lh.files, vec![PathBuf::from("note.txt")]);
+                // Select the deletion row: the file is listed, and undoing the deletion
+                // restores the pre-delete content.
+                let del =
+                    k.lh.events
+                        .iter()
+                        .position(|e| e.kind == EventKind::Deleted)
+                        .unwrap();
+                k.lh_select(del, cx);
+                assert_eq!(k.lh.files, vec![PathBuf::from("note.txt")]);
+                k.lh_revert_to_selected(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert_eq!(
+                    std::fs::read_to_string(dir.join("note.txt")).unwrap(),
+                    "v1\n",
+                    "undoing the deletion restores the pre-delete content"
+                );
+                let _ = k;
+            })
+            .unwrap();
+    }
+
+    /// Clear Local History: the action opens a native confirmation window; confirming
+    /// wipes the project's store (journal + blobs) and empties any open timeline.
+    #[gpui::test]
+    fn local_history_clear_confirms_and_wipes(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        handle
+            .update(cx, |k, _w, cx| {
+                lh_test_store(k, &dir);
+                let store = k.lh.store.clone().unwrap();
+                {
+                    use ferritemcu_local_history::EventKind;
+                    let mut s = store.lock().unwrap();
+                    s.record(
+                        std::path::Path::new("app.tsx"),
+                        "v1",
+                        EventKind::Change,
+                        None,
+                        1_000,
+                    )
+                    .unwrap();
+                }
+                k.lh.path = Some(PathBuf::from("app.tsx"));
+                k.lh_reload(cx);
+                assert_eq!(k.lh.events.len(), 1);
+                k.open_clear_local_history(cx);
+            })
+            .unwrap();
+        cx.run_until_parked(); // the native window opens on a spawned task
+        handle
+            .update(cx, |k, _w, cx| {
+                assert!(k.clear_lh_win.is_some(), "confirmation window opens");
+                k.do_clear_local_history(cx);
+                assert!(k.lh.events.is_empty(), "any open timeline empties");
+                let store = k.lh.store.clone().unwrap();
+                assert_eq!(store.lock().unwrap().event_count(), 0, "store wiped");
+            })
+            .unwrap();
+    }
+
+    /// Changelog window (issue #71): opening it spawns the native window; a fetch result
+    /// populates the version list, selects the newest, and pushes its notes into the
+    /// markdown pane; selecting an older release swaps the notes. A failed fetch keeps the
+    /// window usable (error text + Retry), never a blank pane.
+    #[gpui::test]
+    fn changelog_lists_releases_and_shows_their_notes(cx: &mut TestAppContext) {
+        let (handle, _dir) = boot(cx);
+        handle.update(cx, |k, _w, cx| k.open_changelog(cx)).unwrap();
+        cx.run_until_parked(); // the native window opens on a spawned task
+        handle
+            .update(cx, |k, _w, cx| {
+                assert!(k.changelog_win.is_some(), "changelog window opens");
+                let note = |v: &str, body: &str| update::ReleaseNote {
+                    version: v.into(),
+                    tag: format!("ferritemcu-v{v}"),
+                    title: format!("FerriteMCU {v}"),
+                    body: body.into(),
+                    date: "2026-07-01".into(),
+                    page_url: format!("https://example.com/{v}"),
+                    prerelease: false,
+                };
+                k.set_changelog(
+                    Ok(vec![note("2.5.0", "# new stuff"), note("2.4.0", "# old")]),
+                    cx,
+                );
+                assert_eq!(k.changelog.notes.len(), 2);
+                assert_eq!(k.changelog.selected, 0, "newest release shown first");
+                assert!(k.changelog.error.is_none());
+                assert_eq!(k.changelog.body.read(cx).source(), "# new stuff");
+
+                k.select_changelog(1, cx);
+                assert_eq!(k.changelog.body.read(cx).source(), "# old");
+
+                // Fetch failure → an error to show, and the retry path is armed.
+                k.set_changelog(Err("network is down".into()), cx);
+                assert_eq!(k.changelog.error.as_deref(), Some("network is down"));
+                assert!(!k.changelog.loading);
+            })
+            .unwrap();
+    }
+
+    /// A tracked file deleted from the working tree must leave the Browse tree (and so
+    /// ⌘P): `git ls-files` still lists it, but showing a nonexistent file reads as a
+    /// bug. The deletion itself still shows in the changed-files list.
+    #[gpui::test]
+    fn deleted_files_leave_the_browse_tree(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert!(k.browse.all_files.contains(&PathBuf::from("app.tsx")));
+            })
+            .unwrap();
+        std::fs::remove_file(dir.join("app.tsx")).unwrap();
+        handle.update(cx, |k, _w, cx| k.refresh(cx)).unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert!(
+                    !k.browse.all_files.contains(&PathBuf::from("app.tsx")),
+                    "the deleted file left the Browse tree"
+                );
+                assert!(
+                    k.files
+                        .iter()
+                        .any(|f| f.path.as_os_str() == "app.tsx"
+                            && f.status == FileStatus::Deleted),
+                    "the deletion still shows as a change"
+                );
+            })
+            .unwrap();
+    }
+
+    /// The Delete confirmation dialog answers the keyboard: Enter = the primary
+    /// (destructive) action, Escape = cancel — IDE default-button behavior.
+    #[gpui::test]
+    fn delete_dialog_enter_confirms_and_escape_cancels(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        handle
+            .update(cx, |k, w, cx| {
+                // Escape cancels — the file survives.
+                k.open_delete(dir.join("new.txt"), cx);
+                assert!(k.delete_target.is_some());
+                k.act_escape(&EscapeKey, w, cx);
+                assert!(k.delete_target.is_none(), "Escape cancels the dialog");
+                assert!(dir.join("new.txt").exists(), "cancel leaves the file");
+                // Enter confirms — the file is deleted.
+                k.open_delete(dir.join("new.txt"), cx);
+                k.act_confirm(&ConfirmKey, w, cx);
+                assert!(k.delete_target.is_none(), "confirm consumes the dialog");
+                assert!(!dir.join("new.txt").exists(), "Enter deletes the file");
+                // No dialog open → Enter is a no-op (doesn't panic, deletes nothing).
+                k.act_confirm(&ConfirmKey, w, cx);
+                assert!(dir.join("app.tsx").exists());
+            })
+            .unwrap();
+    }
+
+    /// Opening + rendering the Rollback native window must not panic. (It previously crashed
+    /// via a re-entrant `Entity<FerriteMCU>` update when opened during a FerriteMCU update; it's now opened
+    /// from a spawned task. This guards the window opens, renders its body, and is tracked.)
+    #[gpui::test]
+    fn opening_rollback_window_does_not_panic(cx: &mut TestAppContext) {
+        let (handle, _dir) = boot(cx);
+        // Root path = roll back all changes (boot leaves app.tsx + new.txt changed).
+        handle
+            .update(cx, |k, _w, cx| k.open_rollback_path(PathBuf::new(), cx))
+            .unwrap();
+        cx.run_until_parked(); // the window opens + renders on the spawned task
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert!(k.rollback_win.is_some(), "rollback window should be open");
+            })
+            .unwrap();
+    }
+
+    /// Point `k` at a private local-history store inside the smoke repo (never the real
+    /// XDG data dir) with a fixed enabled config — tests must not depend on, or pollute,
+    /// the developer's own history/config.
+    fn lh_test_store(k: &mut FerriteMCU, dir: &std::path::Path) {
+        k.lh.cfg = ferritemcu_config::history::HistoryCfg {
+            enabled: true,
+            retention_days: 7,
+            throttle_secs: 1,
+        };
+        // Keep the store OUTSIDE the repo (like production, which roots it under XDG) —
+        // a store inside the working tree would show up in `git status` as untracked and
+        // the external-change scan would try to record the store into itself.
+        let store_dir = std::env::temp_dir().join(format!(
+            "ferritemcu-lh-store-{}",
+            dir.file_name().unwrap().to_string_lossy()
+        ));
+        let _ = std::fs::remove_dir_all(&store_dir);
+        let store = ferritemcu_local_history::Store::open(store_dir).unwrap();
+        k.lh.store = Some(std::sync::Arc::new(std::sync::Mutex::new(store)));
+        k.lh.store_root = k.repo_root.clone();
+    }
+
+    /// Local history (issue #7), the record pipeline: opening a file records its baseline;
+    /// a save marks the path pending and the flush snapshots the on-disk state (deduped —
+    /// an unchanged flush adds nothing); the Local History window opens for the file.
+    #[gpui::test]
+    fn local_history_records_opens_and_saves(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        handle
+            .update(cx, |k, _w, cx| {
+                lh_test_store(k, &dir);
+                k.open_file(PathBuf::from("app.tsx"), cx);
+            })
+            .unwrap();
+        cx.run_until_parked(); // the background baseline record lands
+        handle
+            .update(cx, |k, _w, cx| {
+                let store = k.lh.store.clone().unwrap();
+                {
+                    let s = store.lock().unwrap();
+                    let ev = s.events_for(std::path::Path::new("app.tsx"));
+                    assert_eq!(ev.len(), 1, "opening records the baseline once");
+                    assert_eq!(s.content(&ev[0].hash).unwrap(), "const a = 2;\n");
+                }
+                // A save: the file changes on disk, the save path marks it pending…
+                std::fs::write(dir.join("app.tsx"), "const a = 3;\n").unwrap();
+                k.lh_note_save(std::path::Path::new("app.tsx"), cx);
+                assert!(k.lh.pending.contains(std::path::Path::new("app.tsx")));
+                // …and the flush snapshots the final on-disk state.
+                k.lh_flush(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, cx| {
+                let store = k.lh.store.clone().unwrap();
+                {
+                    let s = store.lock().unwrap();
+                    let ev = s.events_for(std::path::Path::new("app.tsx"));
+                    assert_eq!(ev.len(), 2, "the save burst flushed one snapshot");
+                    assert_eq!(s.content(&ev[0].hash).unwrap(), "const a = 3;\n");
+                }
+                // Re-opening the unchanged file records nothing (content dedup).
+                k.open_file(PathBuf::from("app.tsx"), cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, cx| {
+                let store = k.lh.store.clone().unwrap();
+                assert_eq!(
+                    store.lock().unwrap().event_count(),
+                    2,
+                    "unchanged reopen adds no event"
+                );
+                // The window opens for the file.
+                k.open_local_history(PathBuf::from("app.tsx"), cx);
+            })
+            .unwrap();
+        cx.run_until_parked(); // the native window opens on a spawned task
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert!(k.local_history_win.is_some(), "Local History window opens");
+                assert_eq!(k.lh.events.len(), 2, "the timeline shows both snapshots");
+            })
+            .unwrap();
+    }
+
+    /// External-change recording (the whole point of this fix): a file changed OUTSIDE
+    /// FerriteMCU — written straight to disk, never saved through the editor, never re-opened in
+    /// Browse — still lands in local history. `apply_snapshot` runs `lh_scan_external` over
+    /// the git-changed files on every refresh; here we drive that scan directly (a real
+    /// refresh's debounce/watcher timing is exercised elsewhere) to check it records a
+    /// baseline on first sight and an `External` snapshot when the disk later moves.
+    #[gpui::test]
+    fn local_history_records_external_changes_on_refresh(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        handle
+            .update(cx, |k, _w, cx| {
+                lh_test_store(k, &dir);
+                // boot's refresh already populated the changed-files list (app.tsx
+                // modified, new.txt untracked) — scan it into the fresh store.
+                assert!(
+                    !k.files.is_empty(),
+                    "boot left the changed-files list ready"
+                );
+                k.lh_scan_external(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, cx| {
+                {
+                    let store = k.lh.store.clone().unwrap();
+                    let s = store.lock().unwrap();
+                    let app_ev = s.events_for(std::path::Path::new("app.tsx"));
+                    assert_eq!(
+                        app_ev.len(),
+                        1,
+                        "a changed file's baseline is recorded from the scan, unopened"
+                    );
+                    assert_eq!(
+                        app_ev[0].kind,
+                        ferritemcu_local_history::EventKind::External,
+                        "anything the scan catches is an External change, never a plain Change"
+                    );
+                    assert_eq!(
+                        s.events_for(std::path::Path::new("new.txt")).len(),
+                        1,
+                        "an externally-created (untracked) file records its baseline too"
+                    );
+                }
+                // Now edit app.tsx entirely outside FerriteMCU: straight to disk, no save path,
+                // no reopen — then scan again, as a watcher-driven refresh would.
+                std::fs::write(dir.join("app.tsx"), "const a = 99;\n").unwrap();
+                k.lh_scan_external(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, _cx| {
+                let store = k.lh.store.clone().unwrap();
+                let s = store.lock().unwrap();
+                let ev = s.events_for(std::path::Path::new("app.tsx"));
+                assert_eq!(
+                    ev.len(),
+                    2,
+                    "the external edit is captured as a new snapshot"
+                );
+                assert_eq!(
+                    ev[0].kind,
+                    ferritemcu_local_history::EventKind::External,
+                    "and it's labeled as an external change, not an in-app save"
+                );
+                assert_eq!(s.content(&ev[0].hash).unwrap(), "const a = 99;\n");
+            })
+            .unwrap();
+    }
+
+    /// Local history revert: selecting a change and undoing it rewrites the file to its
+    /// pre-change content, stamps a "Before revert" label (the pre-revert state stays
+    /// recoverable), and reloads the timeline. Model B: to get back to `v1` you undo the
+    /// change that produced the current `v2` (its row), which reverts to the state before.
+    #[gpui::test]
+    fn local_history_revert_restores_the_snapshot(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        handle
+            .update(cx, |k, _w, cx| {
+                lh_test_store(k, &dir);
+                // Seed an older snapshot, then the current state.
+                let store = k.lh.store.clone().unwrap();
+                {
+                    let mut s = store.lock().unwrap();
+                    use ferritemcu_local_history::EventKind;
+                    s.record(
+                        std::path::Path::new("app.tsx"),
+                        "const a = 1;\n",
+                        EventKind::Change,
+                        None,
+                        1_000,
+                    )
+                    .unwrap();
+                    s.record(
+                        std::path::Path::new("app.tsx"),
+                        "const a = 2;\n",
+                        EventKind::Change,
+                        None,
+                        2_000,
+                    )
+                    .unwrap();
+                }
+                k.lh.path = Some(PathBuf::from("app.tsx"));
+                k.lh_reload(cx);
+                assert_eq!(k.lh.events.len(), 2);
+                // Undo the newest change (the one that produced current `v2`, row 0):
+                // reverting it restores the state before = `v1`.
+                k.lh_select(0, cx);
+                k.lh_revert_to_selected(cx);
+            })
+            .unwrap();
+        cx.run_until_parked(); // background "Before revert" record + refresh land
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert_eq!(
+                    std::fs::read_to_string(dir.join("app.tsx")).unwrap(),
+                    "const a = 1;\n",
+                    "undoing the change restores the state before it"
+                );
+                let store = k.lh.store.clone().unwrap();
+                let s = store.lock().unwrap();
+                let ev = s.events_for(std::path::Path::new("app.tsx"));
+                assert!(
+                    ev.iter()
+                        .any(|e| e.label.as_deref() == Some("Before revert")),
+                    "the pre-revert state is stamped into the timeline"
+                );
+            })
+            .unwrap();
+    }
+
+    /// The master switch: with local history disabled nothing is recorded — no store is
+    /// opened, and every note/flush call is a no-op.
+    #[gpui::test]
+    fn local_history_disabled_records_nothing(cx: &mut TestAppContext) {
+        let (handle, _dir) = boot(cx);
+        handle
+            .update(cx, |k, _w, cx| {
+                k.lh.cfg = ferritemcu_config::history::HistoryCfg {
+                    enabled: false,
+                    retention_days: 7,
+                    throttle_secs: 1,
+                };
+                k.lh_sync_store(cx);
+                assert!(k.lh.store.is_none(), "disabled → no store");
+                k.open_file(PathBuf::from("app.tsx"), cx);
+                k.lh_note_save(std::path::Path::new("app.tsx"), cx);
+                assert!(k.lh.pending.is_empty(), "disabled → nothing pending");
+                assert!(!k.lh.flush_scheduled);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert!(k.lh.store.is_none(), "still no store after settling");
+            })
+            .unwrap();
+    }
+
+    /// Virtualization guard for big files — the regression that *did* slip through: a
+    /// 37k-line `package-lock.json` scrolled at ~30fps because the editor shaped a line (and
+    /// a fold chevron) for **every row in the file** each frame, not just the on-screen band.
+    /// Pure `perf_*` tests couldn't catch it (the cost is in the windowed render path), and
+    /// the panic-only screen test didn't open a big file. This opens a 15k-line file in the
+    /// real FerriteMCU layout (its scroll container clips the editor) and asserts the last frame
+    /// shaped only ≈ the visible window, not the whole file. Revert the windowing and
+    /// `shaped` jumps to the file's row count → this fails.
+    #[gpui::test]
+    fn big_file_editor_only_shapes_visible_rows(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        // 15k lines of foldable JSON (objects → a fold start on most lines, the exact shape
+        // that made the chevron-shaping cost O(file)).
+        let mut big = String::from("{\n");
+        for i in 0..15000 {
+            big.push_str(&format!("  \"key_{i}\": {{ \"n\": {i} }},\n"));
+        }
+        big.push_str("  \"end\": true\n}\n");
+        std::fs::write(dir.join("big.json"), &big).unwrap();
+
+        handle
+            .update(cx, |k, _w, cx| {
+                k.mode = Mode::Browse;
+                k.open_file(PathBuf::from("big.json"), cx);
+            })
+            .unwrap();
+        // Let async highlight/fold land, then force a painted frame.
+        for _ in 0..3 {
+            cx.refresh().unwrap();
+            cx.run_until_parked();
+        }
+
+        handle
+            .update(cx, |k, _w, cx| {
+                let ed = k.browse.editor.read(cx);
+                let (shaped, rows) = (ed.shaped_row_count(), ed.display_row_count());
+                assert!(rows > 5000, "expected a big file ({rows} display rows)");
+                // Visible band + 12-row overscan each side is well under a few hundred; the
+                // whole-file count would be ~15000. A loose ceiling catches the regression
+                // without depending on the exact test window height.
+                assert!(
+                    shaped < 600,
+                    "editor shaped {shaped} rows of a {rows}-row file — virtualization broke \
+                     (should shape only the on-screen window)"
+                );
+            })
+            .unwrap();
+    }
+
+    /// Render every screen — with the FPS monitor ON — and assert none panics. This is the
+    /// project's broad runtime guard: it actually drives the render cycle (layout + prepaint
+    /// + paint) for each view, the category that pure-function/`perf_*` tests can't reach.
+    /// (Headless can't measure real GPU fps — virtual time, no Metal — so per-frame *cost* is
+    /// guarded by the deterministic `perf_*` tests instead; this guards correctness/panics.)
+    #[gpui::test]
+    fn every_screen_renders_without_panic(cx: &mut TestAppContext) {
+        let (handle, dir) = boot(cx);
+        let settle = |cx: &mut TestAppContext| {
+            cx.refresh().unwrap(); // mark all windows dirty → repaint on park
+            cx.run_until_parked();
+        };
+
+        // FPS monitor on for the whole sweep (exercises the request_animation_frame +
+        // render-timing path on every screen too).
+        handle.update(cx, |k, _w, _cx| k.fps.show = true).unwrap();
+        settle(cx);
+
+        // Browse with a file open in the editor.
+        handle
+            .update(cx, |k, _w, cx| {
+                k.open_file(std::path::PathBuf::from("app.tsx"), cx);
+            })
+            .unwrap();
+        settle(cx);
+
+        // Find bar (cmd-F) over the open file.
+        handle
+            .update(cx, |k, w, cx| k.open_find(FindHost::Main, false, w, cx))
+            .unwrap();
+        settle(cx);
+
+        // Go-to-File finder overlay.
+        handle
+            .update(cx, |k, w, cx| k.act_go_to_file(&GoToFile, w, cx))
+            .unwrap();
+        settle(cx);
+        handle
+            .update(cx, |k, _w, _cx| k.finder.open = false)
+            .unwrap();
+
+        // Commit view with a changed file selected → the side-by-side diff renders.
+        handle
+            .update(cx, |k, _w, cx| {
+                k.enter_commit(cx);
+                k.select_with(0, Some(cx));
+            })
+            .unwrap();
+        settle(cx);
+
+        // Full-screen Show-Diff view (Rollback → View Diff), then back out of it.
+        handle
+            .update(cx, |k, _w, cx| k.menu_show_diff(0, cx))
+            .unwrap();
+        settle(cx);
+        handle
+            .update(cx, |k, _w, cx| k.close_diff_view(cx))
+            .unwrap();
+        settle(cx);
+
+        // History view: the commit log with its graph column + the selected commit's diff.
+        handle.update(cx, |k, _w, cx| k.enter_history(cx)).unwrap();
+        settle(cx);
+
+        // Branch popup.
+        handle
+            .update(cx, super::FerriteMCU::toggle_branch_popup)
+            .unwrap();
+        settle(cx);
+        handle
+            .update(cx, |k, _w, _cx| k.branch.popup_open = false)
+            .unwrap();
+
+        // Worktree popup (seed a fake linked worktree so the rows render; the badge
+        // gather runs its background statuses harmlessly against these paths).
+        handle
+            .update(cx, |k, w, cx| {
+                k.worktree.list = vec![
+                    git::Worktree {
+                        path: dir.clone(),
+                        branch: Some("main".into()),
+                        head: "0000000000000000000000000000000000000000".into(),
+                        is_main: true,
+                    },
+                    git::Worktree {
+                        path: dir.join("linked-wt"),
+                        branch: Some("feature/task".into()),
+                        head: "1111111111111111111111111111111111111111".into(),
+                        is_main: false,
+                    },
+                ];
+                k.toggle_worktree_popup(w, cx);
+            })
+            .unwrap();
+        settle(cx);
+        handle
+            .update(cx, |k, _w, _cx| k.worktree.popup_open = false)
+            .unwrap();
+
+        // Delete-confirmation modal.
+        handle
+            .update(cx, |k, _w, cx| k.open_delete(dir.join("new.txt"), cx))
+            .unwrap();
+        settle(cx);
+        handle
+            .update(cx, |k, _w, _cx| k.delete_target = None)
+            .unwrap();
+
+        // Onboarding / keymap picker overlay.
+        handle
+            .update(cx, |k, _w, _cx| k.onboarding.open = true)
+            .unwrap();
+        settle(cx);
+        handle
+            .update(cx, |k, _w, _cx| k.onboarding.open = false)
+            .unwrap();
+
+        // Plugin manager (native modal window).
+        handle
+            .update(cx, |k, w, cx| k.act_open_plugins(&OpenPlugins, w, cx))
+            .unwrap();
+        settle(cx);
+        handle
+            .update(cx, |k, _w, cx| k.close_modal_window(ModalKind::Plugins, cx))
+            .unwrap();
+        settle(cx);
+
+        // Font preview (native modal window).
+        handle
+            .update(cx, |k, w, cx| k.run_palette(PaletteAction::Fonts, w, cx))
+            .unwrap();
+        settle(cx);
+        handle
+            .update(cx, |k, _w, cx| k.close_modal_window(ModalKind::Fonts, cx))
+            .unwrap();
+        settle(cx);
+
+        // Clear-data confirmation (native modal window; render only — never click confirm).
+        handle
+            .update(cx, |k, w, cx| k.act_clear_data(&ClearData, w, cx))
+            .unwrap();
+        settle(cx);
+        handle
+            .update(cx, |k, _w, cx| {
+                k.close_modal_window(ModalKind::ClearData, cx);
+            })
+            .unwrap();
+        settle(cx);
+
+        // Rollback native window.
+        handle
+            .update(cx, |k, _w, cx| k.open_rollback_path(PathBuf::new(), cx))
+            .unwrap();
+        settle(cx);
+        handle
+            .update(cx, |k, _w, cx| {
+                k.close_modal_window(ModalKind::Rollback, cx);
+            })
+            .unwrap();
+        settle(cx);
+
+        // Push confirmation native window.
+        handle
+            .update(cx, |k, _w, cx| k.open_push_modal(cx))
+            .unwrap();
+        settle(cx);
+        handle
+            .update(cx, |k, _w, cx| k.close_modal_window(ModalKind::Push, cx))
+            .unwrap();
+        settle(cx);
+
+        // Projects landing view (no repo open).
+        handle.update(cx, |k, _w, _cx| k.repo_root = None).unwrap();
+        settle(cx);
+
+        // No panic across any screen = pass.
+    }
+
+    /// Shortcut labels: the macOS glyphs there ("⌘⇧O"); off macOS words joined with "+"
+    /// ("Ctrl+Shift+O"), `cmd` shown as the Ctrl it binds.
+    #[test]
+    fn shortcut_labels_follow_the_platform() {
+        assert_eq!(key_glyphs("cmd-shift-o"), ["⌘", "⇧", "O"]);
+        assert_eq!(key_glyphs("cmd-alt-left").concat(), "⌘⌥←");
+        assert_eq!(key_glyphs("ctrl-`").concat(), "⌃`");
+        for (key, words) in [
+            ("cmd-shift-o", "Ctrl+Shift+O"),
+            ("cmd-alt-left", "Ctrl+Alt+←"),
+            ("ctrl-`", "Ctrl+`"),
+            ("cmd-,", "Ctrl+,"),
+            ("cmd--", "Ctrl+-"),
+            ("cmd-enter", "Ctrl+Enter"),
+            ("cmd-shift-]", "Ctrl+Shift+]"),
+            ("cmd-ctrl-x", "Ctrl+X"),
+            ("shift-f3", "Shift+F3"),
+            ("f2", "F2"),
+        ] {
+            assert_eq!(key_words(key).join("+"), words, "{key}");
+        }
+        let save = if cfg!(target_os = "macos") {
+            "⌘S"
+        } else {
+            "Ctrl+S"
+        };
+        assert_eq!(pretty_key("cmd-s"), save);
+    }
+
+    /// ⌃` opens the panel + spawns the first tab, and ⌘W (``act_close_terminal_tab``) closes the
+    /// active tab — the last one hides the panel. Exercises the real gpui wiring (window +
+    /// PTY-backed ``TerminalView``s + the ``TermPanel`` state), not just the pure state machine.
+    #[cfg(feature = "terminal")]
+    #[gpui::test]
+    fn terminal_toggle_opens_and_cmd_w_closes(cx: &mut TestAppContext) {
+        let (handle, _dir) = boot(cx);
+        handle
+            .update(cx, |k, window, cx| {
+                k.act_toggle_terminal(&ToggleTerminal, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert!(k.term.panel.open, "⌃` opens the panel");
+                assert_eq!(k.term.tabs.len(), 1, "first tab spawned on open");
+            })
+            .unwrap();
+        // A second tab, then ⌘W closes the active one → one remains, panel stays open.
+        handle
+            .update(cx, |k, _w, cx| k.new_terminal_tab(cx))
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, window, cx| {
+                assert_eq!(k.term.tabs.len(), 2);
+                k.act_close_terminal_tab(&CloseTerminalTab, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert_eq!(k.term.tabs.len(), 1, "⌘W closes the active tab");
+                assert!(k.term.panel.open, "panel stays open while a tab remains");
+            })
+            .unwrap();
+        // ⌘W the last tab → the panel hides.
+        handle
+            .update(cx, |k, window, cx| {
+                k.act_close_terminal_tab(&CloseTerminalTab, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert!(k.term.tabs.is_empty());
+                assert!(!k.term.panel.open, "closing the last tab hides the panel");
+            })
+            .unwrap();
+    }
+
+    /// Enter is also bound at the app root (`ConfirmKey`). The deeper Terminal binding must win
+    /// and relay CR to the PTY instead of letting the root action consume the key.
+    #[cfg(feature = "terminal")]
+    #[gpui::test]
+    fn terminal_enter_binding_sends_carriage_return(cx: &mut TestAppContext) {
+        cx.update(|cx| apply_keymap(cx, &Keymap::default()));
+        let routed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _observer = cx.update(|cx| {
+            let routed = routed.clone();
+            cx.observe_keystrokes(move |event, _window, _cx| {
+                if event
+                    .action
+                    .as_ref()
+                    .is_some_and(|action| action.partial_eq(&TerminalEnter))
+                {
+                    routed.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+        });
+        let (handle, _dir) = boot(cx);
+        handle
+            .update(cx, |k, window, cx| {
+                k.act_toggle_terminal(&ToggleTerminal, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, window, cx| k.focus_active_terminal(window, cx))
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, window, cx| {
+                let enter = gpui::Keystroke::parse("enter").expect("valid Enter keystroke");
+                window.dispatch_keystroke(enter, cx);
+                assert!(k.term.panel.open);
+            })
+            .unwrap();
+        assert!(
+            routed.load(std::sync::atomic::Ordering::Relaxed),
+            "TerminalEnter must shadow the root ConfirmKey binding"
+        );
+    }
+
+    /// ⌘C / ⌘V are the file tree's copy / paste at the app root; in a terminal they must be
+    /// the terminal's. Off macOS the terminal's
+    /// are Ctrl+Shift+C / V (Ctrl+C is the shell's interrupt).
+    #[cfg(feature = "terminal")]
+    #[gpui::test]
+    fn terminal_copy_paste_beat_the_file_tree_bindings(cx: &mut TestAppContext) {
+        cx.update(|cx| apply_keymap(cx, &Keymap::default()));
+        let routed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _observer = cx.update(|cx| {
+            let routed = routed.clone();
+            cx.observe_keystrokes(move |event, _window, _cx| {
+                if let Some(a) = event.action.as_ref() {
+                    routed.lock().unwrap().push(a.name().to_string());
+                }
+            })
+        });
+        let (handle, _dir) = boot(cx);
+        handle
+            .update(cx, |k, window, cx| {
+                k.act_toggle_terminal(&ToggleTerminal, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, window, cx| k.focus_active_terminal(window, cx))
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |_k, window, cx| {
+                let keys = if cfg!(target_os = "macos") {
+                    ["cmd-c", "cmd-v"]
+                } else {
+                    ["ctrl-shift-c", "ctrl-shift-v"]
+                };
+                for key in keys {
+                    let stroke = gpui::Keystroke::parse(key).expect("valid keystroke");
+                    window.dispatch_keystroke(stroke, cx);
+                }
+            })
+            .unwrap();
+        let routed = routed.lock().unwrap().clone();
+        assert!(
+            routed.iter().any(|a| a.ends_with("TerminalCopy"))
+                && routed.iter().any(|a| a.ends_with("TerminalPaste")),
+            "⌘C / ⌘V in the terminal went to {routed:?}"
+        );
+    }
+
+    /// Ctrl+letter in a terminal is the shell's on every OS: Ctrl+C interrupts, Ctrl+W rubs out
+    /// a word, Ctrl+R searches history. Off macOS the app's own shortcuts are on Ctrl too
+    /// (Ctrl+S save, Ctrl+K commit, Ctrl+W close tab, Ctrl+Q quit…), and none may take the key
+    /// while a terminal has focus; outside one they still fire.
+    /// Resolved against the real keymap for the focused context stack (a live shell would keep
+    /// the test's keys as input).
+    #[cfg(feature = "terminal")]
+    #[gpui::test]
+    fn terminal_keeps_ctrl_letters_for_the_shell(cx: &mut TestAppContext) {
+        for preset in [Preset::WebStorm, Preset::VSCode] {
+            let mut km = Keymap::default();
+            km.set_preset(preset);
+            cx.update(|cx| {
+                apply_keymap(cx, &km);
+                let stack = |names: &[&str]| -> Vec<gpui::KeyContext> {
+                    names
+                        .iter()
+                        .map(|n| gpui::KeyContext::parse(n).unwrap())
+                        .collect()
+                };
+                let resolve = |key: &str, ctx: &[gpui::KeyContext]| -> Vec<String> {
+                    let ks = gpui::Keystroke::parse(key).unwrap();
+                    let keymap = cx.key_bindings();
+                    let keymap = keymap.borrow();
+                    let (bindings, _) = keymap.bindings_for_input(&[ks], ctx);
+                    bindings
+                        .iter()
+                        .map(|b| b.action().name().to_string())
+                        .collect()
+                };
+                for ctx in [stack(&["FerriteMCU", "Terminal"])] {
+                    for c in 'a'..='z' {
+                        let ran = resolve(&format!("ctrl-{c}"), &ctx);
+                        assert!(ran.is_empty(), "Ctrl+{c} in a terminal ran {ran:?}");
+                    }
+                    let copy = if cfg!(target_os = "macos") {
+                        "cmd-c"
+                    } else {
+                        "ctrl-shift-c"
+                    };
+                    let ran = resolve(copy, &ctx);
+                    assert!(
+                        ran.first().is_some_and(|a| a.ends_with("TerminalCopy")),
+                        "{ran:?}"
+                    );
+                    // ⌘F is the terminal's own find, not the editor's / Find in Files…
+                    let find = format!("{TERMINAL_MOD}-f");
+                    let ran = resolve(&find, &ctx);
+                    assert!(
+                        ran.first().is_some_and(|a| a.ends_with("TerminalFind")),
+                        "{ran:?}"
+                    );
+                    // …and in its query box Enter / Escape drive the find, not the shell.
+                    let mut in_box = ctx.clone();
+                    in_box.push(gpui::KeyContext::parse("CodeInput FindBar").unwrap());
+                    for (key, action) in [("enter", "FindNext"), ("escape", "CloseFind")] {
+                        let ran = resolve(key, &in_box);
+                        assert!(ran.first().is_some_and(|a| a.ends_with(action)), "{ran:?}");
+                    }
+                    // ⌘W / ⌘F there stay the terminal's, not CloseTab / the editor's find, and
+                    // its paste goes into the query, not the shell.
+                    let term = |k: &str| format!("{TERMINAL_MOD}-{k}");
+                    for (key, action) in [
+                        (term("w"), "CloseTerminalTab"),
+                        (term("f"), "TerminalFind"),
+                        ("secondary-f".into(), "TerminalFind"),
+                        (term("v"), "::Paste"),
+                    ] {
+                        let ran = resolve(&key, &in_box);
+                        assert!(
+                            ran.first().is_some_and(|a| a.ends_with(action)),
+                            "{key}: {ran:?}"
+                        );
+                    }
+                }
+                if !cfg!(target_os = "macos") {
+                    let ran = resolve("ctrl-s", &stack(&["FerriteMCU"]));
+                    assert!(
+                        ran.first().is_some_and(|a| a.ends_with("SaveFile")),
+                        "{ran:?}"
+                    );
+                }
+            });
+        }
+    }
+
+    /// Off macOS every shortcut is on Ctrl (or Alt), never Super, which the desktop owns (GNOME
+    /// and Cinnamon take Super+S, Super+P, Super+V, Super+←/→…), under both presets.
+    #[cfg(not(target_os = "macos"))]
+    #[gpui::test]
+    fn shortcuts_bind_ctrl_not_super_off_macos(cx: &mut TestAppContext) {
+        for preset in [Preset::WebStorm, Preset::VSCode] {
+            let mut km = Keymap::default();
+            km.set_preset(preset);
+            cx.update(|cx| {
+                apply_keymap(cx, &km);
+                let bindings = cx.key_bindings();
+                let bindings = bindings.borrow();
+                for b in bindings.bindings() {
+                    assert!(
+                        b.keystrokes().iter().all(|k| !k.modifiers().platform),
+                        "{} is on Super",
+                        b.action().name()
+                    );
+                }
+                let bound = |key: &str, action: &dyn gpui::Action| {
+                    let ks = gpui::Keystroke::parse(key).unwrap();
+                    cx.all_bindings_for_input(&[ks])
+                        .iter()
+                        .any(|b| b.action().partial_eq(action))
+                };
+                assert!(bound("ctrl-s", &SaveFile));
+                assert!(bound("ctrl-q", &Quit));
+                assert!(bound("ctrl-w", &CloseTab));
+                assert!(bound("ctrl-,", &OpenKeymap));
+                assert!(bound("ctrl-c", &CopyFiles));
+                assert!(bound("ctrl-shift-f", &FindInFiles));
+                assert!(bound("f3", &FindNext) && bound("shift-f3", &FindPrev));
+                // Linux: the keys the desktop keeps (Ctrl+Alt+arrows, Ctrl+Alt+L) and the
+                // layout-dependent Shift+bracket move to keys every desktop and layout leaves free.
+                if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+                    assert!(bound("alt-left", &NavBack) && bound("alt-right", &NavForward));
+                    assert!(bound("f9", &SortLines));
+                    assert!(!bound("ctrl-alt-left", &NavBack) && !bound("ctrl-alt-l", &SortLines));
+                }
+                if preset == Preset::WebStorm {
+                    assert!(bound("ctrl-shift-o", &GoToFile) && bound("ctrl-k", &DoCommit));
+                } else {
+                    assert!(bound("ctrl-p", &GoToFile) && bound("ctrl-shift-g", &ModeCommit));
+                    assert!(
+                        !bound("ctrl-shift-g", &FindPrev),
+                        "Commit view keeps its key"
+                    );
+                }
+            });
+        }
+    }
+
+    /// Off macOS the menu bar's items live behind the title strip's menu button (`chrome`):
+    /// File's first and Quit last, Recent Projects as a flyout of the recents, and picking an
+    /// item runs the menu bar's own action — in a project window and on the Projects screen.
+    #[cfg(not(target_os = "macos"))]
+    #[gpui::test]
+    fn app_menu_holds_the_menu_bar_and_runs_its_actions(cx: &mut TestAppContext) {
+        cx.update(|cx| apply_keymap(cx, &Keymap::default()));
+        let labels = |entries: &[MenuEntry]| -> Vec<String> {
+            entries
+                .iter()
+                .map(|e| match e {
+                    MenuEntry::Item { label, .. } | MenuEntry::Note(label) => label.to_string(),
+                    MenuEntry::Submenu { label, .. } => format!("{label} ▸"),
+                    MenuEntry::Divider => "—".into(),
+                })
+                .collect()
+        };
+        // Open the menu, light `item`, press ⏎ in the given window.
+        let pick = |cx: &mut TestAppContext, handle: gpui::WindowHandle<FerriteMCU>, item: &str| {
+            let item = item.to_string();
+            handle
+                .update(cx, |k, _w, cx| {
+                    k.open_menu(gpui::point(px(6.0), px(36.0)), MenuTarget::AppMenu, cx);
+                    let m = k.context_menu.as_mut().expect("menu open");
+                    let at = labels(&m.entries).iter().position(|l| *l == item);
+                    m.hl = Some(at.expect("item in the menu"));
+                })
+                .unwrap();
+            cx.refresh().unwrap(); // the menu takes focus on its first render
+            cx.run_until_parked();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.dispatch_keystroke(gpui::Keystroke::parse("enter").unwrap(), cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+        };
+
+        let (handle, dir) = boot(cx);
+        let fps_was = handle
+            .update(cx, |k, _w, cx| {
+                k.recents.paths = vec![dir.clone()];
+                k.open_menu(gpui::point(px(6.0), px(36.0)), MenuTarget::AppMenu, cx);
+                let m = k.context_menu.as_ref().expect("menu open");
+                assert_eq!(
+                    labels(&m.entries),
+                    [
+                        "Open…",
+                        "—",
+                        "Recent Projects ▸",
+                        "—",
+                        "Settings…",
+                        "Plugins…",
+                        "What's New…",
+                        "Toggle FPS Monitor",
+                        "—",
+                        "Clear Data & Restart…",
+                        "—",
+                        "Quit FerriteMCU"
+                    ]
+                );
+                let MenuEntry::Submenu { items, .. } = &m.entries[2] else {
+                    panic!("Recent Projects is a flyout");
+                };
+                assert_eq!(labels(items), [projects::name_of(&dir)]);
+                k.close_menu(cx);
+                k.fps.show
+            })
+            .unwrap();
+        pick(cx, handle, "Toggle FPS Monitor");
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert_ne!(k.fps.show, fps_was, "the menu item ran ToggleFps");
+                assert!(k.context_menu.is_none(), "picking an item closes the menu");
+            })
+            .unwrap();
+        pick(cx, handle, "Toggle FPS Monitor"); // put it back (it's remembered)
+
+        // The Projects screen has no project, and its own handlers for the menu's actions.
+        let km = Keymap::default();
+        let landing = cx.add_window(move |_w, cx| FerriteMCU::new(None, km.clone(), false, cx));
+        cx.run_until_parked();
+        pick(cx, landing, "Settings…");
+        landing
+            .update(cx, |k, _w, _cx| {
+                assert!(k.settings_win.is_some(), "Settings… opened Settings");
+            })
+            .unwrap();
+    }
+
+    /// Linux's menu bar holds every item of the macOS menu bar (the ☰ menu's), each running
+    /// the same action, under File / View / Help.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn menu_bar_holds_every_menu_bar_item() {
+        fn items(menus: Vec<Menu>) -> Vec<(String, String)> {
+            fn walk(items: Vec<MenuItem>, out: &mut Vec<(String, String)>) {
+                for item in items {
+                    match item {
+                        MenuItem::Action { name, action, .. } => {
+                            out.push((name.to_string(), action.name().to_string()));
+                        }
+                        MenuItem::Submenu(menu) => walk(menu.items, out),
+                        MenuItem::Separator | MenuItem::SystemMenu(_) => {}
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            for menu in menus {
+                walk(menu.items, &mut out);
+            }
+            out.sort();
+            out
+        }
+        let recents = Recents {
+            paths: vec![PathBuf::from("/work/alpha"), PathBuf::from("/work/beta")],
+        };
+        let bar = menu_bar_menus(&recents);
+        let titles: Vec<String> = bar.iter().map(|m| m.name.to_string()).collect();
+        assert_eq!(titles, MENU_BAR);
+        assert_eq!(items(bar), items(app_menus(&recents)));
+    }
+
+    /// Linux's menu bar, through the real keys: F10 opens File under its title with the first
+    /// item lit, ← / → walk the menus round (→ steps into Recent Projects first), Alt + a
+    /// title's letter opens that menu and again closes it, ⏎ runs the lit item, ⎋ closes. The
+    /// pointer opens a menu from its title and, with one open, switches as it crosses another.
+    /// Under the ☰ button F10 opens its menu and the Alt letters open nothing; in a terminal
+    /// the shell keeps all of them.
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn menu_bar_works_from_keys_and_pointer(cx: &mut TestAppContext) {
+        use ferritemcu_config::window::MenuBar;
+        cx.update(|cx| apply_keymap(cx, &Keymap::default()));
+        let (handle, dir) = boot(cx);
+        let press = |cx: &mut TestAppContext, keys: &str| {
+            for k in keys.split(' ') {
+                cx.update_window(handle.into(), |_, window, cx| {
+                    let ks = gpui::Keystroke::parse(k).expect("valid keystroke");
+                    window.dispatch_keystroke(ks, cx);
+                })
+                .unwrap();
+                cx.refresh().unwrap(); // a just-opened menu takes focus on its first render
+                cx.run_until_parked();
+            }
+        };
+        // (open menu of the bar, its lit row, its lit flyout row); `None` = no menu open.
+        let state = |cx: &mut TestAppContext| {
+            handle
+                .update(cx, |k, _w, _cx| {
+                    k.context_menu
+                        .as_ref()
+                        .map(|m| (k.open_bar_menu(), m.hl, m.sub_hl))
+                })
+                .unwrap()
+        };
+        handle
+            .update(cx, |k, w, cx| {
+                k.recents.paths = vec![dir.clone()];
+                k.chrome.cfg.menu_bar = MenuBar::Bar;
+                w.focus(&k.focus_handle);
+                cx.notify();
+            })
+            .unwrap();
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        let titles = handle
+            .update(cx, |k, _w, _cx| k.chrome.menu_titles.borrow().clone())
+            .unwrap();
+        assert_eq!(titles.len(), MENU_BAR.len(), "every title laid out");
+
+        press(cx, "f10");
+        assert_eq!(state(cx), Some((Some(0), Some(0), None)));
+        handle
+            .update(cx, |k, _w, _cx| {
+                let m = k.context_menu.as_ref().expect("menu open");
+                assert!(m.at.x == titles[0].left() && m.at.y > titles[0].bottom());
+                let labels: Vec<String> = m
+                    .entries
+                    .iter()
+                    .map(|e| match e {
+                        MenuEntry::Item { label, .. } | MenuEntry::Note(label) => label.to_string(),
+                        MenuEntry::Submenu { label, .. } => format!("{label} ▸"),
+                        MenuEntry::Divider => "—".into(),
+                    })
+                    .collect();
+                assert_eq!(
+                    labels,
+                    [
+                        "Open…",
+                        "—",
+                        "Recent Projects ▸",
+                        "—",
+                        "Settings…",
+                        "Plugins…",
+                        "—",
+                        "Clear Data & Restart…",
+                        "—",
+                        "Quit FerriteMCU"
+                    ]
+                );
+            })
+            .unwrap();
+        press(cx, "down right");
+        assert_eq!(
+            state(cx),
+            Some((Some(0), Some(2), Some(0))),
+            "→ enters the flyout"
+        );
+        press(cx, "left");
+        assert_eq!(state(cx), Some((Some(0), Some(2), None)), "← leaves it");
+        press(cx, "left");
+        assert_eq!(
+            state(cx),
+            Some((Some(2), Some(0), None)),
+            "← wraps round to Help"
+        );
+        press(cx, "right right");
+        assert_eq!(state(cx), Some((Some(1), Some(0), None)), "→ → is View");
+        press(cx, "escape");
+        assert_eq!(state(cx), None);
+
+        press(cx, "alt-h");
+        assert_eq!(state(cx), Some((Some(2), Some(0), None)));
+        press(cx, "alt-h");
+        assert_eq!(state(cx), None, "its letter again closes it");
+        let fps_was = handle.update(cx, |k, _w, _cx| k.fps.show).unwrap();
+        press(cx, "alt-v enter");
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert_ne!(k.fps.show, fps_was, "View → Toggle FPS Monitor ran");
+                assert!(k.context_menu.is_none());
+            })
+            .unwrap();
+        press(cx, "alt-v enter"); // put it back (it's remembered)
+
+        // The pointer: a title opens its menu; with one open, crossing another title switches
+        // to it, and a press on the open menu's own title closes it.
+        let mut vcx = gpui::VisualTestContext::from_window(handle.into(), cx);
+        let none = gpui::Modifiers::none();
+        vcx.simulate_click(titles[0].center(), none);
+        assert_eq!(state(cx), Some((Some(0), None, None)));
+        vcx.simulate_mouse_move(titles[1].center(), None, none);
+        assert_eq!(state(cx), Some((Some(1), None, None)));
+        vcx.simulate_click(titles[1].center(), none);
+        assert_eq!(state(cx), None);
+
+        // Under the ☰ button: F10 opens (and closes) its menu, the letters open nothing.
+        handle
+            .update(cx, |k, _w, cx| {
+                k.chrome.cfg.menu_bar = MenuBar::Button;
+                cx.notify();
+            })
+            .unwrap();
+        press(cx, "alt-f");
+        assert_eq!(state(cx), None);
+        press(cx, "f10");
+        handle
+            .update(cx, |k, _w, _cx| {
+                let m = k.context_menu.as_ref().expect("the ☰ menu");
+                assert!(matches!(m.target, MenuTarget::AppMenu) && m.hl == Some(0));
+            })
+            .unwrap();
+        press(cx, "f10");
+        assert_eq!(state(cx), None);
+
+        // In a terminal F10 and the Alt letters reach the shell.
+        #[cfg(feature = "terminal")]
+        cx.update(|cx| {
+            let keymap = cx.key_bindings();
+            let keymap = keymap.borrow();
+            let ctx: Vec<gpui::KeyContext> = ["FerriteMCU", "Terminal"]
+                .iter()
+                .map(|n| gpui::KeyContext::parse(n).unwrap())
+                .collect();
+            let ran = |key: &str, ctx: &[gpui::KeyContext]| -> Vec<String> {
+                let ks = gpui::Keystroke::parse(key).unwrap();
+                let (bindings, _) = keymap.bindings_for_input(&[ks], ctx);
+                bindings
+                    .iter()
+                    .map(|b| b.action().name().to_string())
+                    .collect()
+            };
+            for key in ["f10", "alt-f", "alt-v", "alt-h"] {
+                assert!(ran(key, &ctx).is_empty(), "{key} in a terminal ran");
+                assert!(!ran(key, &ctx[..1]).is_empty(), "{key} is bound outside it");
+            }
+        });
+    }
+
+    /// Keyboard navigation end to end (issue #81), through the real bindings + key contexts:
+    /// the Browse tree walks and opens with arrows/⏎, ⇧F10 opens the row's menu where →/←
+    /// enter and leave the "New ▸" submenu and ⎋ closes it, space ticks a Commit-tree row,
+    /// and the branch popup's ⏎ folds a section from its search box.
+    #[gpui::test]
+    fn keyboard_drives_trees_menus_and_popups(cx: &mut TestAppContext) {
+        cx.update(|cx| apply_keymap(cx, &Keymap::default()));
+        let (handle, _dir) = boot(cx);
+        let press = |cx: &mut TestAppContext, keys: &str| {
+            for k in keys.split(' ') {
+                cx.update_window(handle.into(), |_, window, cx| {
+                    let ks = gpui::Keystroke::parse(k).expect("valid keystroke");
+                    window.dispatch_keystroke(ks, cx);
+                })
+                .unwrap();
+                cx.refresh().unwrap(); // a just-opened menu takes focus on its first render
+                cx.run_until_parked();
+            }
+        };
+
+        // Browse tree: root, app.tsx, new.txt.
+        handle
+            .update(cx, |k, w, cx| k.act_mode_browse(&ModeBrowse, w, cx))
+            .unwrap();
+        press(cx, "down down enter");
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert_eq!(k.browse.open_path, Some(PathBuf::from("app.tsx")));
+            })
+            .unwrap();
+
+        // ⇧F10 on the row → its menu, first entry ("New ▸") lit; → steps into the flyout.
+        handle
+            .update(cx, |k, w, cx| k.act_mode_browse(&ModeBrowse, w, cx))
+            .unwrap();
+        press(cx, "shift-f10 right");
+        handle
+            .update(cx, |k, _w, _cx| {
+                let m = k.context_menu.as_ref().expect("menu open");
+                assert!(matches!(&m.target, MenuTarget::BrowseFile(p, false) if p == &PathBuf::from("app.tsx")));
+                assert!(m.submenu == Some(Submenu::New) && m.sub_hl == Some(0));
+            })
+            .unwrap();
+        press(cx, "left escape");
+        handle
+            .update(cx, |k, w, _cx| {
+                assert!(k.context_menu.is_none(), "⎋ after ← closes the menu");
+                assert!(
+                    k.browse.tree_focus.is_focused(w),
+                    "focus returns to the tree"
+                );
+            })
+            .unwrap();
+
+        // Commit tree: cursor onto new.txt, space ticks it out of the commit.
+        handle.update(cx, |k, _w, cx| k.enter_commit(cx)).unwrap();
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        // Entering lands the caret in the message box; ⌘9 again hops to the tree.
+        press(cx, "secondary-9");
+        let new_txt = PathBuf::from("new.txt");
+        let was = handle
+            .update(cx, |k, _w, _cx| k.commit.checked.contains(&new_txt))
+            .unwrap();
+        press(cx, "down space"); // enter_commit selected the first change, app.tsx
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert_eq!(k.files[k.selected.unwrap()].path, new_txt);
+                assert_ne!(k.commit.checked.contains(&new_txt), was, "space toggled it");
+            })
+            .unwrap();
+
+        // Branch popup (focus stays in its search box): ↓↓↓ past New Branch + Pull onto the
+        // Local section; ⏎ unfolds it.
+        handle
+            .update(cx, super::FerriteMCU::toggle_branch_popup)
+            .unwrap();
+        cx.run_until_parked();
+        press(cx, "down down down enter");
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert_eq!(k.branch.hl, Some(2));
+                assert!(k.branch.expanded.contains("sec:local"));
+            })
+            .unwrap();
+    }
+
+    /// The shell exiting (`^D` / `exit`) makes the IO thread emit `CloseRequested`; the FerriteMCU
+    /// subscription must close that tab (the "stuck on exited" item). Simulate the event.
+    #[cfg(feature = "terminal")]
+    #[gpui::test]
+    fn terminal_child_exit_closes_its_tab(cx: &mut TestAppContext) {
+        let (handle, _dir) = boot(cx);
+        handle
+            .update(cx, |k, _w, cx| {
+                k.new_terminal_tab(cx);
+                k.new_terminal_tab(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let view = handle
+            .update(cx, |k, _w, _cx| k.term.tabs[k.term.panel.active].clone())
+            .unwrap();
+        view.update(cx, |_v, cx| {
+            cx.emit(terminal::TerminalEvent::CloseRequested);
+        });
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert_eq!(
+                    k.term.tabs.len(),
+                    1,
+                    "child exit (CloseRequested) closes the tab"
+                );
+            })
+            .unwrap();
+    }
+
+    /// Switching view (rail folder/git/history icon, or ⌘ shortcut) while the terminal is
+    /// maximized must un-maximize it — otherwise the full-column terminal hides the chosen
+    /// view and the click looks like a no-op (the original feedback item).
+    #[cfg(feature = "terminal")]
+    #[gpui::test]
+    fn switching_view_unmaximizes_terminal(cx: &mut TestAppContext) {
+        let (handle, _dir) = boot(cx);
+        handle
+            .update(cx, |k, window, cx| {
+                k.act_toggle_terminal(&ToggleTerminal, window, cx);
+                k.term.panel.maximized = true;
+            })
+            .unwrap();
+        cx.run_until_parked();
+        handle
+            .update(cx, |k, _w, cx| k.switch_mode(Mode::Browse, cx))
+            .unwrap();
+        handle
+            .update(cx, |k, _w, _cx| {
+                assert!(
+                    !k.term.panel.maximized,
+                    "switching view un-maximizes the terminal"
+                );
+                assert!(k.mode == Mode::Browse);
+            })
+            .unwrap();
+    }
+}
+
+/// A full-window dimmed overlay that centers its child. When `dismissable`, clicking the
+/// backdrop closes the open overlays; otherwise the backdrop swallows the click (modal).
+pub(crate) fn overlay(cx: &mut Context<FerriteMCU>, dismissable: bool) -> gpui::Div {
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        // A dim scrim, not a blackout — the app stays visible behind the modal.
+        .bg(gpui::rgba(0x00000099))
+        .occlude()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _e, window, cx| {
+                if dismissable {
+                    this.finder.open = false;
+                    this.onboarding.open = false;
+                    this.delete_target = None;
+                    window.focus(&this.focus_handle);
+                    cx.notify();
+                }
+            }),
+        )
+}

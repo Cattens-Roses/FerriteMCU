@@ -1,0 +1,2787 @@
+//! Embedded terminal — a real PTY-backed VTE terminal, gated behind the `terminal`
+//! Cargo feature (so the whole module + alacritty's ~2MB of parse tables leave the
+//! binary when the feature is off, exactly like a language pack).
+//!
+//! Architecture (mirrors the `editor` module's entity + custom-Element split):
+//!   - `TerminalView` is an Entity owning the alacritty `Term` grid, the PTY notifier,
+//!     and the background IO thread's `EventLoop`. It is the focusable widget: typed
+//!     text + control keys are translated to bytes and written to the PTY here.
+//!   - `EventProxy` is alacritty's `EventListener` — the IO thread calls it on new
+//!     output (`Wakeup`), title changes, child exit, etc. It forwards each event over a
+//!     `futures` channel to a gpui foreground task, which repaints / writes-back / etc.
+//!     (gpui entities aren't `Send`, so the IO thread can't touch them directly.)
+//!   - `TerminalElement` is the custom `Element` that locks the grid each frame, shapes
+//!     one line per visible row with per-cell fg/bg, and paints the block cursor.
+//!
+//! The shell itself (zsh/bash) owns command history (Up arrow), tab-completion, line
+//! editing — all we do is faithfully relay keystrokes and render the bytes back. So
+//! Up-arrow history "just works" once we send the correct `ESC [ A` for the Up key.
+use crate::editor::{CodeEditor, EditorEvent};
+use crate::theme;
+use alacritty_terminal::event::{Event as AlacEvent, EventListener, Notify, OnResize, WindowSize};
+use alacritty_terminal::event_loop::{EventLoop, Msg, Notifier};
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Direction, Line, Point as GridPoint, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::sync::FairMutex;
+use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
+use alacritty_terminal::term::{test::TermSize, Config, Term, TermMode};
+use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
+use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
+use futures::channel::mpsc::{unbounded, UnboundedSender};
+use futures::StreamExt;
+use gpui::{
+    div, fill, point, prelude::*, px, relative, App, Bounds, ContentMask, Context, DispatchPhase,
+    ElementId, Entity, EventEmitter, FocusHandle, Focusable, GlobalElementId, Hsla, KeyDownEvent,
+    LayoutId, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, ScrollWheelEvent, ShapedLine, Style, TextRun, UnderlineStyle, Window,
+};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Default grid until the first paint measures the real cell size and resizes.
+const INIT_COLS: u16 = 80;
+const INIT_ROWS: u16 = 24;
+/// How long a pane size must hold, mid-burst, before the grid + PTY follow it. A live window
+/// drag changes the size every frame; resizing on each one can leave programs drawing for a
+/// width the grid has already left. One resize when the drag settles, like kitty's
+/// `resize_debounce_time`.
+const RESIZE_SETTLE: Duration = Duration::from_millis(100);
+
+/// Scrollbar gutter width, thumb thickness and end inset — the editor panes' (`with_scrollbars`).
+const SB_BAR: f32 = 12.0;
+const SB_THUMB: f32 = 6.0;
+const SB_END: f32 = 8.0;
+
+/// How often an open find re-counts while output streams in.
+const FIND_RESCAN: Duration = Duration::from_millis(500);
+
+/// Opacity of SGR-dim (faint) text.
+const DIM_ALPHA: f32 = 0.5;
+
+#[cfg(target_os = "windows")]
+fn default_shell() -> String {
+    windows_shell_from_comspec(std::env::var("COMSPEC").ok())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_shell_from_comspec(comspec: Option<String>) -> String {
+    comspec
+        .filter(|shell| !shell.trim().is_empty())
+        .unwrap_or_else(|| "cmd.exe".to_string())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn default_shell() -> String {
+    std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn default_shell() -> String {
+    shell_from(std::env::var("SHELL").ok(), passwd_shell)
+}
+
+/// Off macOS: `$SHELL`, else the login shell in the user database, else `/bin/sh`. A launch
+/// from a desktop entry can arrive without `SHELL`, and zsh isn't installed on most Linux
+/// systems (Ubuntu ships bash), so `/bin/zsh` would leave a dead tab. Pure; `passwd` is the
+/// user-database lookup.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn shell_from(env: Option<String>, passwd: impl FnOnce() -> Option<String>) -> String {
+    env.filter(|s| !s.trim().is_empty())
+        .or_else(passwd)
+        .unwrap_or_else(|| "/bin/sh".to_string())
+}
+
+/// The current user's login shell from the user database (`/etc/passwd`, LDAP, …).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn passwd_shell() -> Option<String> {
+    let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
+    let mut buf: Vec<libc::c_char> = vec![0; 4096];
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: `entry`, `buf` and `found` are live, writable and passed with `buf`'s real
+    // length; getpwuid_r fills `entry` (its strings point into `buf`) and sets `found` to
+    // `entry` on success, or leaves it null when there is no entry or on error.
+    let rc = unsafe {
+        libc::getpwuid_r(
+            libc::getuid(),
+            entry.as_mut_ptr(),
+            buf.as_mut_ptr(),
+            buf.len(),
+            &raw mut found,
+        )
+    };
+    if rc != 0 || found.is_null() {
+        return None;
+    }
+    // SAFETY: `found` is non-null, so `entry` was filled; `pw_shell` is null or a
+    // NUL-terminated string inside `buf`, which outlives this read.
+    let shell = unsafe {
+        let p = (*found).pw_shell;
+        if p.is_null() {
+            return None;
+        }
+        std::ffi::CStr::from_ptr(p)
+            .to_str()
+            .ok()?
+            .trim()
+            .to_string()
+    };
+    (!shell.is_empty()).then_some(shell)
+}
+
+/// Forwards alacritty IO-thread events to the gpui foreground over an unbounded channel.
+/// `Clone` because both the `Term` and the `EventLoop` need a handle to the same sink.
+#[derive(Clone)]
+struct EventProxy(UnboundedSender<AlacEvent>);
+
+impl EventListener for EventProxy {
+    fn send_event(&self, event: AlacEvent) {
+        // Best-effort: if the receiver (the view) is gone, the terminal is closing.
+        let _ = self.0.unbounded_send(event);
+    }
+}
+
+/// Where a terminal's bytes go and come from.
+enum Backend {
+    /// Its own PTY, driven by alacritty's IO thread.
+    Local {
+        notifier: Notifier,
+        /// IO-thread handle, kept for lifetime ownership. On `Drop` we send `Msg::Shutdown`
+        /// so the thread drains + exits and the PTY/child are torn down.
+        _io: std::thread::JoinHandle<(
+            EventLoop<tty::Pty, EventProxy>,
+            alacritty_terminal::event_loop::State,
+        )>,
+    },
+    /// An in-app tool console backed only by the terminal grid; it never starts a shell/PTY.
+    OutputOnly,
+}
+
+impl Backend {
+    fn write(&self, bytes: std::borrow::Cow<'static, [u8]>) {
+        match self {
+            Self::Local { notifier, .. } => notifier.notify(bytes),
+            Self::OutputOnly => {}
+        }
+    }
+
+    fn resize(&mut self, ws: WindowSize) {
+        match self {
+            Self::Local { notifier, .. } => notifier.on_resize(ws),
+            Self::OutputOnly => {}
+        }
+    }
+}
+
+/// One terminal tab: the grid + the PTY plumbing + render state.
+pub struct TerminalView {
+    focus: FocusHandle,
+    term: Arc<FairMutex<Term<EventProxy>>>,
+    /// Persistent ANSI parser used for output produced by in-app tools (ESP build/flash/debug
+    /// and serial monitor), so it is rendered by the same terminal grid as shell output.
+    output_parser: alacritty_terminal::vte::ansi::Processor,
+    backend: Backend,
+    /// Whether this tab is a read-only in-app output console with no child shell.
+    pub output_only: bool,
+    /// Window/tab title as set by the shell (OSC 0/2). Falls back to "Local".
+    pub title: String,
+    /// Child process has exited — the tab shows a closed marker.
+    pub exited: bool,
+    /// Last grid size pushed to the PTY (cols, rows), so we only resize on a real change.
+    last_size: (u16, u16),
+    /// A pane size waiting out [`RESIZE_SETTLE`], and since when (see `resize`).
+    pending_size: Option<((u16, u16), Instant)>,
+    /// When the grid + PTY last changed size (`None` = never; the first size doesn't wait).
+    resized_at: Option<Instant>,
+    /// Measured cell size in px, cached from the most recent paint (for wheel/mouse math).
+    cell: (f32, f32),
+    bounds: Option<Bounds<Pixels>>,
+    /// True while a left-drag text selection is in progress.
+    selecting: bool,
+    /// Right-click context menu anchor (window-space), `None` = closed.
+    menu_at: Option<gpui::Point<Pixels>>,
+    /// Rows the content is pushed down by bottom-anchoring (see `prepaint`), so mouse
+    /// positions map back onto the grid.
+    shift: u16,
+    /// Wheel pixels short of a whole line, carried to the next event (a trackpad sends a few
+    /// px at a time; rounding each event alone dropped every one under half a line).
+    scroll_px: f32,
+    /// A scrollbar thumb drag in progress.
+    sb_drag: Option<SbDrag>,
+    /// Find (⌘F), built the first time it opens.
+    find: Option<TermFind>,
+    /// The link under the mouse while ⌘ (Ctrl off macOS) is held: drawn underlined, with
+    /// a pointing hand, so you can see a click will open it.
+    link: Option<Link>,
+}
+
+/// A link in the grid: its row, the columns it spans, and where it goes.
+#[derive(Clone, Debug, PartialEq)]
+struct Link {
+    line: Line,
+    cols: std::ops::Range<usize>,
+    target: Target,
+}
+
+/// Where a link goes: a web page, or a file to open (at a line, if it named one).
+#[derive(Clone, Debug, PartialEq)]
+enum Target {
+    Url(String),
+    File { path: PathBuf, line: Option<u32> },
+}
+
+impl Target {
+    /// What a link's text points at: an http(s) URL, else a file path — `~` expanded, and a
+    /// trailing `:line` or `:line:col` taken as the line to open it at.
+    fn parse(text: &str) -> Self {
+        if text.starts_with("http://") || text.starts_with("https://") {
+            return Self::Url(text.to_string());
+        }
+        let (mut path, mut line) = (text, None);
+        for _ in 0..2 {
+            match path.rsplit_once(':').map(|(p, n)| (p, n.parse::<u32>())) {
+                Some((p, Ok(n))) => (path, line) = (p, Some(n)),
+                _ => break,
+            }
+        }
+        let home = std::env::var_os("HOME").or_else(|| {
+            if cfg!(windows) {
+                std::env::var_os("USERPROFILE")
+            } else {
+                None
+            }
+        });
+        let path = match (path.strip_prefix("~/"), home) {
+            (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
+            _ => PathBuf::from(path),
+        };
+        Self::File { path, line }
+    }
+
+    /// An OSC-8 hyperlink's target: a `file://` URI is a file, anything else a URL.
+    fn from_uri(uri: &str) -> Self {
+        let Some(rest) = uri.strip_prefix("file://") else {
+            return Self::Url(uri.to_string());
+        };
+        // `file://host/path` — the path starts at the first `/` after the host.
+        let path = rest.find('/').map_or("", |i| &rest[i..]);
+        Self::File {
+            path: PathBuf::from(percent_decode(path)),
+            line: None,
+        }
+    }
+}
+
+/// `%XX` escapes in a URI path decoded (a `%` that isn't one is kept as is).
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = b
+            .get(i + 1..i + 3)
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match (b[i], hex) {
+            (b'%', Some(v)) => {
+                out.push(v);
+                i += 3;
+            }
+            (c, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A scrollbar drag: the cursor y it started at, and how many lines sat above the view then.
+#[derive(Clone, Copy)]
+struct SbDrag {
+    start_y: f32,
+    start_top: f32,
+}
+
+/// The scrollbar as drawn: thumb length and top in its track, lines of scrollback, and how
+/// many of them sit above the view.
+struct Sb {
+    track: f32,
+    len: f32,
+    pos: f32,
+    hist: usize,
+    top: usize,
+}
+
+/// Terminal find: the query box and the match it's on.
+struct TermFind {
+    open: bool,
+    query: Entity<CodeEditor>,
+    _query_sub: gpui::Subscription,
+    /// The query, compiled (`None` while empty).
+    regex: Option<RegexSearch>,
+    /// The current match where it was found, with the scrollback size and scroll offset then
+    /// (the offset adjusted for our own scrolling since) — see [`shifted`].
+    cur: Option<(Match, usize, isize)>,
+    /// Matches in the whole buffer at the last scan, and which is current (1 = newest; 0 =
+    /// none).
+    count: usize,
+    index: usize,
+    scanned: Option<Instant>,
+    /// The re-count held back by [`FIND_RESCAN`], so one still follows the last output.
+    rescan: Option<gpui::Task<()>>,
+}
+
+/// Which match a find scan lands on.
+#[derive(Clone, Copy)]
+enum Pick {
+    /// The query changed: the newest match at or above the bottom of the view.
+    Fresh,
+    /// Toward the top of the scrollback (Enter, ⌘G).
+    Older,
+    /// Toward the live screen (⇧Enter, ⇧⌘G).
+    Newer,
+    /// Just re-count, staying on the current match.
+    Keep,
+}
+
+impl TerminalView {
+    pub fn new(working_dir: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
+        Self::with_env(working_dir, std::collections::HashMap::new(), cx)
+    }
+
+    /// A terminal whose shell gets `env` on top of FerriteMCU's own environment.
+    pub fn with_env(
+        working_dir: Option<PathBuf>,
+        env: std::collections::HashMap<String, String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (tx, rx) = unbounded::<AlacEvent>();
+        let proxy = EventProxy(tx);
+
+        let shell = default_shell();
+        #[cfg(target_os = "macos")]
+        let env = crate::platform::locale::with_lang(env);
+        let options = PtyOptions {
+            shell: Some(Shell::new(shell, Vec::new())),
+            working_directory: working_dir,
+            drain_on_exit: false,
+            env,
+            #[cfg(target_os = "windows")]
+            escape_args: true,
+        };
+
+        let window_size = WindowSize {
+            num_lines: INIT_ROWS,
+            num_cols: INIT_COLS,
+            cell_width: 8,
+            cell_height: 16,
+        };
+
+        let config = Config::default();
+        let term = Term::new(
+            config,
+            &TermSize::new(INIT_COLS as usize, INIT_ROWS as usize),
+            proxy.clone(),
+        );
+        let term = Arc::new(FairMutex::new(term));
+
+        // Blessed expects: spawning the PTY + its event loop can only fail on a fatal OS
+        // condition (exhausted fds / no pty device). The terminal can't exist without them and
+        // this constructor returns `Self`, not `Result`, so a clear panic is the right call.
+        // (Promoting the whole terminal-spawn path to `Result` is a tracked scaffold follow-up.)
+        // `tty::new` is safe; the PTY fd is owned by the returned Pty.
+        #[allow(clippy::expect_used)]
+        let pty = tty::new(&options, window_size, 0).expect("failed to spawn PTY");
+        #[allow(clippy::expect_used)]
+        let event_loop = EventLoop::new(term.clone(), proxy, pty, false, false)
+            .expect("failed to create terminal event loop");
+        let notifier = Notifier(event_loop.channel());
+        let io = event_loop.spawn();
+        Self::pump_events(rx, cx);
+        Self::build(term, Backend::Local { notifier, _io: io }, cx)
+    }
+
+    /// Create a blank terminal grid for tool output without launching CMD, PowerShell, or a
+    /// user shell. It is used for the ESP console and accepts display output only.
+    pub fn output_only(cx: &mut Context<Self>) -> Self {
+        let (tx, rx) = unbounded::<AlacEvent>();
+        let proxy = EventProxy(tx);
+        let term = Term::new(
+            Config::default(),
+            &TermSize::new(INIT_COLS as usize, INIT_ROWS as usize),
+            proxy,
+        );
+        let term = Arc::new(FairMutex::new(term));
+        Self::pump_events(rx, cx);
+        let mut view = Self::build(term, Backend::OutputOnly, cx);
+        view.title = "ESP Console".into();
+        view
+    }
+
+    /// Foreground pump: drain IO-thread events into entity updates (repaint, write-back).
+    fn pump_events(
+        mut rx: futures::channel::mpsc::UnboundedReceiver<AlacEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            while let Some(ev) = rx.next().await {
+                let alive = this
+                    .update(cx, |view, cx| view.on_event(ev, cx))
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn build(
+        term: Arc<FairMutex<Term<EventProxy>>>,
+        backend: Backend,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let output_only = matches!(&backend, Backend::OutputOnly);
+        Self {
+            focus: cx.focus_handle(),
+            term,
+            output_parser: alacritty_terminal::vte::ansi::Processor::new(),
+            backend,
+            output_only,
+            title: "Local".into(),
+            exited: false,
+            last_size: (INIT_COLS, INIT_ROWS),
+            pending_size: None,
+            resized_at: None,
+            cell: (8.0, 16.0),
+            bounds: None,
+            selecting: false,
+            menu_at: None,
+            link: None,
+            shift: 0,
+            scroll_px: 0.0,
+            sb_drag: None,
+            find: None,
+        }
+    }
+
+    /// Handle one event from the IO thread. Returns `false` once the pump should stop.
+    fn on_event(&mut self, ev: AlacEvent, cx: &mut Context<Self>) -> bool {
+        match ev {
+            AlacEvent::Wakeup => {
+                // Shell output may mean files changed (touch/mkdir/git …) — let the
+                // app schedule a debounced git/tree refresh. Emitted per output
+                // batch; the subscriber debounces, so a build's stream of wakeups
+                // costs one refresh after it quiets down.
+                cx.emit(TerminalEvent::Output);
+                // An open find re-counts now and then as output streams in, and once more
+                // after it stops.
+                if let Some(f) = self.find.as_mut().filter(|f| f.open && f.regex.is_some()) {
+                    let since = f.scanned.map_or(FIND_RESCAN, |t| t.elapsed());
+                    if since >= FIND_RESCAN {
+                        self.find_scan(Pick::Keep);
+                    } else if f.rescan.is_none() {
+                        f.rescan = Some(cx.spawn(async move |this, cx| {
+                            cx.background_executor()
+                                .timer(FIND_RESCAN.saturating_sub(since))
+                                .await;
+                            let _ = this.update(cx, |this, cx| {
+                                if let Some(f) = this.find.as_mut() {
+                                    f.rescan = None;
+                                }
+                                if this.find_open() {
+                                    this.find_scan(Pick::Keep);
+                                    cx.notify();
+                                }
+                            });
+                        }));
+                    }
+                }
+                cx.notify();
+            }
+            AlacEvent::MouseCursorDirty => cx.notify(),
+            // The emulator wants bytes written back to the PTY (query replies, etc.).
+            AlacEvent::PtyWrite(text) => self.backend.write(text.into_bytes().into()),
+            AlacEvent::Title(t) => {
+                self.title = t;
+                cx.emit(TerminalEvent::TitleChanged);
+                cx.notify();
+            }
+            AlacEvent::ResetTitle => {
+                self.title = "Local".into();
+                cx.emit(TerminalEvent::TitleChanged);
+                cx.notify();
+            }
+            AlacEvent::ClipboardStore(_, text) => {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+            }
+            AlacEvent::ClipboardLoad(_, format) => {
+                if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+                    self.backend.write(format(&text).into_bytes().into());
+                }
+            }
+            AlacEvent::ChildExit(_) | AlacEvent::Exit => {
+                // Shell exited (e.g. `exit` / ^D) → close the tab, like hitting its ×. FerriteMCU's
+                // subscription removes it and hides the panel when it was the last tab.
+                self.exited = true;
+                cx.emit(TerminalEvent::CloseRequested);
+                cx.notify();
+                return false;
+            }
+            AlacEvent::Bell | AlacEvent::CursorBlinkingChange | AlacEvent::ColorRequest(..) => {}
+            AlacEvent::TextAreaSizeRequest(format) => {
+                let (cols, rows) = self.last_size;
+                let ws = WindowSize {
+                    num_lines: rows,
+                    num_cols: cols,
+                    cell_width: self.cell.0 as u16,
+                    cell_height: self.cell.1 as u16,
+                };
+                self.backend.write(format(ws).into_bytes().into());
+            }
+        }
+        true
+    }
+
+    /// The widget's focus handle (so the panel can focus the active tab).
+    pub fn handle(&self) -> FocusHandle {
+        self.focus.clone()
+    }
+
+    /// Write raw bytes to the PTY (typed text, pasted text, key escape sequences).
+    fn write<B: Into<std::borrow::Cow<'static, [u8]>>>(&mut self, bytes: B) {
+        self.backend.write(bytes.into());
+    }
+
+    /// Feed a string to the shell as if typed (used by the screenshot harness to seed a
+    /// realistic session). The PTY buffers it until the shell is ready, so it's race-free.
+    pub fn send_input(&self, text: &str) {
+        self.backend.write(text.as_bytes().to_vec().into());
+    }
+
+    /// Render output from an in-app tool in the terminal grid without sending it to the shell.
+    /// The parser is kept on the view so ANSI control sequences may span multiple writes.
+    pub fn write_output(&mut self, text: &str, cx: &mut Context<Self>) {
+        if text.is_empty() {
+            return;
+        }
+        let normalized;
+        let bytes = if text.as_bytes().contains(&b'\n') {
+            let mut output = Vec::with_capacity(text.len() + text.matches('\n').count());
+            let mut previous = None;
+            for byte in text.bytes() {
+                if byte == b'\n' && previous != Some(b'\r') {
+                    output.push(b'\r');
+                }
+                output.push(byte);
+                previous = Some(byte);
+            }
+            normalized = output;
+            normalized.as_slice()
+        } else {
+            text.as_bytes()
+        };
+        {
+            let mut term = self.term.lock();
+            self.output_parser.advance(&mut *term, bytes);
+        }
+        self.scroll(Scroll::Bottom);
+        cx.notify();
+    }
+
+    /// Relay a key's raw bytes to the PTY and repaint.
+    fn send_key(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        self.scroll(Scroll::Bottom);
+        cx.notify();
+        self.write(bytes);
+    }
+
+    /// Re-size the grid + PTY when the panel geometry changes, always together. A change after
+    /// a quiet spell applies at once (a sidebar toggle stays instant); one that follows within
+    /// [`RESIZE_SETTLE`] — a live window drag — waits until the size holds that long. Returns
+    /// whether a size is still settling, so the caller paints again to apply it.
+    fn resize(&mut self, cols: u16, rows: u16, cell_w: f32, cell_h: f32, now: Instant) -> bool {
+        self.cell = (cell_w, cell_h);
+        if cols == 0 || rows == 0 {
+            return false;
+        }
+        let mut term = self.term.lock();
+        if (cols, rows) == self.last_size {
+            self.pending_size = None;
+            if (term.columns(), term.screen_lines()) == (cols as usize, rows as usize) {
+                return false;
+            }
+        } else {
+            let quiet = self
+                .resized_at
+                .is_none_or(|t| now.duration_since(t) >= RESIZE_SETTLE);
+            match self.pending_size {
+                None if quiet => {}
+                Some((size, since))
+                    if size == (cols, rows) && now.duration_since(since) >= RESIZE_SETTLE => {}
+                Some((size, _)) if size == (cols, rows) => return true,
+                _ => {
+                    self.pending_size = Some(((cols, rows), now));
+                    return true;
+                }
+            }
+        }
+        self.pending_size = None;
+        self.resized_at = Some(now);
+        self.last_size = (cols, rows);
+        term.resize(TermSize::new(cols as usize, rows as usize));
+        drop(term);
+        self.backend.resize(WindowSize {
+            num_lines: rows,
+            num_cols: cols,
+            cell_width: cell_w as u16,
+            cell_height: cell_h as u16,
+        });
+        false
+    }
+
+    /// Translate a key event to PTY bytes. Returns whether it was handled.
+    fn on_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        let m = &ks.modifiers;
+        let key = ks.key.as_str();
+
+        // Cmd-V paste / Cmd-C copy-selection (Ctrl-C still sends SIGINT, handled below).
+        if m.platform && key == "v" {
+            self.paste(cx);
+            return;
+        }
+        if m.platform && key == "c" {
+            self.copy_selection(cx);
+            return;
+        }
+        // Any other ⌘-combo (⌘T new tab, ⌘W, …) is an app shortcut, never PTY input — let it
+        // bubble to the action system instead of typing a stray character.
+        if m.platform {
+            return;
+        }
+
+        if let Some(bytes) = key_bytes(key, m.control, ks.key_char.as_deref()) {
+            if !bytes.is_empty() {
+                self.send_key(bytes, cx);
+            }
+        }
+    }
+
+    /// Paste clipboard text, honouring bracketed-paste mode when the program enabled it.
+    fn paste(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+            self.paste_text(text, cx);
+        }
+    }
+
+    /// Linux: a middle click pastes the PRIMARY selection (the last text selected with the
+    /// mouse, here or in any other app), as every Linux terminal does.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn paste_primary(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus);
+        if let Some(text) = cx.read_from_primary().and_then(|i| i.text()) {
+            self.paste_text(text, cx);
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    fn paste_primary(&mut self, _: &mut Window, _: &mut Context<Self>) {}
+
+    /// Linux: a finished mouse selection also becomes the PRIMARY selection.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn selection_to_primary(&self, cx: &mut Context<Self>) {
+        if let Some(text) = self.term.lock().selection_to_string() {
+            if !text.is_empty() {
+                cx.write_to_primary(gpui::ClipboardItem::new_string(text));
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    fn selection_to_primary(&self, _: &mut Context<Self>) {}
+
+    /// Send pasted `text` to the shell, honouring bracketed-paste mode.
+    fn paste_text(&mut self, text: String, cx: &mut Context<Self>) {
+        let bracketed = self.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
+        if bracketed {
+            self.write(b"\x1b[200~".to_vec());
+            self.write(text.into_bytes());
+            self.write(b"\x1b[201~".to_vec());
+        } else {
+            self.write(text.replace('\n', "\r").into_bytes());
+        }
+        cx.notify();
+    }
+
+    /// Clear the scrollback + screen (iTerm "Clear Buffer"): drop history, scroll to the live
+    /// region, and send Ctrl-L so the shell redraws a fresh prompt (keeping any typed input).
+    fn clear_screen(&mut self, cx: &mut Context<Self>) {
+        {
+            let mut t = self.term.lock();
+            t.grid_mut().clear_history();
+            t.scroll_display(Scroll::Bottom);
+        }
+        if let Some(f) = self.find.as_mut() {
+            f.cur = None;
+        }
+        self.write(b"\x0c".to_vec());
+        cx.notify();
+    }
+
+    pub(crate) fn clear_screen_from_panel(&mut self, cx: &mut Context<Self>) {
+        self.clear_screen(cx);
+    }
+
+    pub(crate) fn has_selection(&self) -> bool {
+        self.term
+            .lock()
+            .selection_to_string()
+            .is_some_and(|text| !text.is_empty())
+    }
+
+    /// Return the current terminal history as plain text for opening in the editor.
+    /// The snapshot is bounded by Alacritty's configured scrollback size.
+    pub(crate) fn scrollback_text(&self) -> String {
+        let term = self.term.lock();
+        let grid = term.grid();
+        let first = term.topmost_line();
+        let mut output = String::new();
+        let mut line_number = first;
+        let mut line = String::new();
+        for cell in grid.iter_from(GridPoint::new(first, Column(0))) {
+            if cell.point.line != line_number {
+                while line.ends_with(' ') {
+                    line.pop();
+                }
+                output.push_str(&line);
+                output.push('\n');
+                line.clear();
+                line_number = cell.point.line;
+            }
+            if !cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                line.push(if cell.c == '\0' { ' ' } else { cell.c });
+            }
+        }
+        while line.ends_with(' ') {
+            line.pop();
+        }
+        output.push_str(&line);
+        output
+    }
+
+    /// Clear the current (unsubmitted) command-line input — the shell's "kill whole line".
+    /// Sends Ctrl-E (→ end of line) then Ctrl-U (kill line) so the entire input is wiped in
+    /// both zsh (Ctrl-U = kill-whole-line) and bash (Ctrl-U = kill-to-start, hence Ctrl-E
+    /// first), regardless of cursor position. A no-op at an empty prompt. The shell echoes the
+    /// erase, so no manual repaint of the grid is needed.
+    fn clear_input(&mut self, cx: &mut Context<Self>) {
+        self.write(vec![0x05, 0x15]); // Ctrl-E, Ctrl-U
+        cx.notify();
+    }
+
+    /// Scroll the scrollback buffer by a number of lines (positive = up/back in history).
+    fn scroll_lines(&mut self, lines: i32, cx: &mut Context<Self>) {
+        if lines != 0 {
+            self.scroll(Scroll::Delta(lines));
+            cx.notify();
+        }
+    }
+
+    /// Scroll the view. Everything that scrolls comes through here, so an open find can tell
+    /// its own scrolling from output pushing lines up (see [`shifted`]).
+    fn scroll(&mut self, s: Scroll) {
+        let mut t = self.term.lock();
+        let before = t.grid().display_offset();
+        t.scroll_display(s);
+        let after = t.grid().display_offset();
+        drop(t);
+        if let Some((_, _, off)) = self.find.as_mut().and_then(|f| f.cur.as_mut()) {
+            *off += after as isize - before as isize;
+        }
+    }
+
+    /// The scrollbar, when there's scrollback to scroll through and the pane has painted.
+    fn scrollbar(&self) -> Option<Sb> {
+        let b = self.bounds?;
+        let t = self.term.lock();
+        let (hist, off) = (t.grid().history_size(), t.grid().display_offset());
+        drop(t);
+        if hist == 0 {
+            return None;
+        }
+        let ch = self.cell.1.max(1.0);
+        let track = f32::from(b.size.height);
+        let top = hist.saturating_sub(off);
+        let (len, pos) =
+            crate::ui::scrollbar_thumb(track, hist as f32 * ch, -(top as f32) * ch, SB_END);
+        Some(Sb {
+            track,
+            len,
+            pos,
+            hist,
+            top,
+        })
+    }
+
+    /// Press in the scrollbar gutter at window `y`: on the thumb, grab it; elsewhere, jump
+    /// the thumb's middle there first — either way it then follows the cursor.
+    fn sb_press(&mut self, y: f32, cx: &mut Context<Self>) {
+        let (Some(sb), Some(b)) = (self.scrollbar(), self.bounds) else {
+            return;
+        };
+        let rel = y - f32::from(b.top());
+        let on_thumb = rel >= sb.pos && rel <= sb.pos + sb.len;
+        let mut start_top = sb.top as f32;
+        if !on_thumb {
+            let span = sb.track - sb.len - 2.0 * SB_END;
+            if span > 0.0 {
+                let frac = ((rel - SB_END - sb.len / 2.0) / span).clamp(0.0, 1.0);
+                start_top = frac * sb.hist as f32;
+                self.scroll_to_top_lines(start_top);
+            }
+        }
+        self.sb_drag = Some(SbDrag {
+            start_y: y,
+            start_top,
+        });
+        cx.notify();
+    }
+
+    /// The thumb follows a drag to window `y`.
+    fn sb_drag_to(&mut self, y: f32, cx: &mut Context<Self>) {
+        let (Some(d), Some(sb)) = (self.sb_drag, self.scrollbar()) else {
+            return;
+        };
+        let span = sb.track - sb.len - 2.0 * SB_END;
+        if span <= 0.0 {
+            return;
+        }
+        self.scroll_to_top_lines(d.start_top + (y - d.start_y) * sb.hist as f32 / span);
+        cx.notify();
+    }
+
+    /// Scroll so `top` lines of scrollback sit above the view.
+    fn scroll_to_top_lines(&mut self, top: f32) {
+        let t = self.term.lock();
+        let (hist, off) = (t.grid().history_size(), t.grid().display_offset());
+        drop(t);
+        let top = (top.round().max(0.0) as usize).min(hist);
+        let delta = (hist - top) as i32 - off as i32;
+        if delta != 0 {
+            self.scroll(Scroll::Delta(delta));
+        }
+    }
+
+    /// Whether the find bar is open.
+    fn find_open(&self) -> bool {
+        self.find.as_ref().is_some_and(|f| f.open)
+    }
+
+    /// Open the find bar (⌘F) with its query selected, so typing replaces it.
+    pub(crate) fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let f = self.find_state(cx);
+        f.open = true;
+        let query = f.query.clone();
+        query.update(cx, |e, cx| {
+            let n = e.text().len();
+            e.select_range(0..n, cx);
+        });
+        window.focus(&query.read(cx).focus_handle);
+        if let Some(m) = self.find_scan(Pick::Fresh) {
+            self.reveal(&m);
+        }
+        cx.notify();
+    }
+
+    /// The find state, built the first time it's needed.
+    fn find_state(&mut self, cx: &mut Context<Self>) -> &mut TermFind {
+        self.find.get_or_insert_with(|| {
+            let query = cx.new(|cx| {
+                let mut e = CodeEditor::single_line(cx, "Find");
+                // Enter / ⇧Enter / Escape: the find bar's keys, ahead of the terminal's.
+                e.ctx_override = Some("FindBar");
+                e
+            });
+            let sub = cx.subscribe(&query, |this, _q, ev: &EditorEvent, cx| {
+                if matches!(ev, EditorEvent::Changed) {
+                    this.find_query_changed(cx);
+                }
+            });
+            TermFind {
+                open: false,
+                query,
+                _query_sub: sub,
+                regex: None,
+                cur: None,
+                count: 0,
+                index: 0,
+                scanned: None,
+                rescan: None,
+            }
+        })
+    }
+
+    /// Close the find bar and hand the keyboard back to the shell.
+    fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(f) = self.find.as_mut() {
+            f.open = false;
+            f.cur = None;
+        }
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    /// The query was edited: search for it afresh.
+    fn find_query_changed(&mut self, cx: &mut Context<Self>) {
+        let Some(f) = self.find.as_mut() else {
+            return;
+        };
+        let q = f.query.read(cx).text().to_string();
+        f.regex = (!q.is_empty())
+            .then(|| RegexSearch::new(&literal_regex(&q)).ok())
+            .flatten();
+        f.cur = None;
+        if let Some(m) = self.find_scan(Pick::Fresh) {
+            self.reveal(&m);
+        }
+        cx.notify();
+    }
+
+    /// Step to the next match up or down the buffer and bring it into view.
+    fn find_step(&mut self, pick: Pick, cx: &mut Context<Self>) {
+        if let Some(m) = self.find_scan(pick) {
+            self.reveal(&m);
+        }
+        cx.notify();
+    }
+
+    /// Search the whole buffer for the query and land on the match `pick` says — returned,
+    /// for scrolling to (`None` with no match, or for a [`Pick::Keep`] re-count).
+    fn find_scan(&mut self, pick: Pick) -> Option<Match> {
+        let f = self.find.as_mut()?;
+        f.scanned = Some(Instant::now());
+        let Some(regex) = f.regex.as_mut() else {
+            (f.cur, f.count, f.index) = (None, 0, 0);
+            return None;
+        };
+        let term = self.term.lock();
+        let all = scan_all(&term, regex);
+        let grid = term.grid();
+        let (hist, off) = (grid.history_size(), grid.display_offset());
+        let now = f.cur.as_ref().and_then(|c| shifted(&term, c));
+        let bottom = Line(term.screen_lines() as i32 - 1 - off as i32);
+        drop(term);
+        let n = all.len();
+        let last = n.checked_sub(1);
+        let i = match (pick, &now) {
+            _ if n == 0 => None,
+            (Pick::Keep, Some(c)) => all.iter().position(|m| m == c),
+            (Pick::Keep, None) => None,
+            (Pick::Fresh, _) => all.iter().rposition(|m| m.start().line <= bottom).or(last),
+            (Pick::Older, Some(c)) => all.iter().rposition(|m| m.start() < c.start()).or(last),
+            (Pick::Newer, Some(c)) => all.iter().position(|m| m.start() > c.start()).or(Some(0)),
+            (Pick::Older | Pick::Newer, None) => last,
+        };
+        f.count = n;
+        f.index = i.map_or(0, |i| n - i);
+        let m = i.map(|i| all[i].clone());
+        // A re-count that can't find the current match any more (cleared, scrolled off the
+        // top, or lost track of once the scrollback is full) drops it.
+        f.cur = m.clone().map(|m| (m, hist, off as isize));
+        m.filter(|_| !matches!(pick, Pick::Keep))
+    }
+
+    /// Scroll `m` to the middle of the view, unless it's already all on screen.
+    fn reveal(&mut self, m: &Match) {
+        let t = self.term.lock();
+        let rows = t.screen_lines() as i32;
+        let (hist, off) = (
+            t.grid().history_size() as i32,
+            t.grid().display_offset() as i32,
+        );
+        drop(t);
+        let (first, last) = (m.start().line.0, m.end().line.0);
+        if first >= -off && last < rows - off {
+            return;
+        }
+        let target = (rows / 2 - first).clamp(0, hist);
+        self.scroll(Scroll::Delta(target - off));
+    }
+
+    /// The open find's matches on screen, and its current match if it's one of them.
+    fn visible_matches(&mut self) -> (Vec<Match>, Option<Match>) {
+        let Some(f) = self.find.as_mut().filter(|f| f.open) else {
+            return (Vec::new(), None);
+        };
+        let Some(regex) = f.regex.as_mut() else {
+            return (Vec::new(), None);
+        };
+        let term = self.term.lock();
+        let off = term.grid().display_offset() as i32;
+        let top = GridPoint::new(Line(-off), Column(0));
+        let bottom = GridPoint::new(
+            Line(term.screen_lines() as i32 - 1 - off),
+            term.last_column(),
+        );
+        let on_screen: Vec<Match> =
+            RegexIter::new(top, bottom, Direction::Right, &term, regex).collect();
+        // Only outlined where a match still is: with the scrollback full, output scrolls the
+        // text without moving any count `shifted` can follow.
+        let cur = f
+            .cur
+            .as_ref()
+            .and_then(|c| shifted(&term, c))
+            .filter(|c| on_screen.contains(c));
+        (on_screen, cur)
+    }
+
+    /// Map a window-space cursor position to a grid point + which half of the cell it's in.
+    /// Accounts for the current scrollback offset so a selection in history stays anchored.
+    fn point_at(&self, pos: gpui::Point<Pixels>) -> Option<(GridPoint, Side)> {
+        let b = self.bounds?;
+        let (cw, ch) = self.cell;
+        if cw <= 0.0 || ch <= 0.0 {
+            return None;
+        }
+        let lx = f32::from(pos.x - b.left());
+        let ly = f32::from(pos.y - b.top());
+        let t = self.term.lock();
+        let cols = t.columns() as i32;
+        let off = t.grid().display_offset() as i32;
+        drop(t);
+        let col_f = (lx / cw).floor();
+        let row = ((ly / ch).floor() as i32 - i32::from(self.shift)).max(0);
+        let col = (col_f as i32).clamp(0, (cols - 1).max(0)) as usize;
+        let side = if lx - col_f * cw < cw / 2.0 {
+            Side::Left
+        } else {
+            Side::Right
+        };
+        Some((GridPoint::new(Line(row - off), Column(col)), side))
+    }
+
+    /// Begin a text selection (Simple drag / Semantic double-click / Lines triple-click).
+    fn start_selection(
+        &mut self,
+        pos: gpui::Point<Pixels>,
+        ty: SelectionType,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((p, side)) = self.point_at(pos) {
+            self.term.lock().selection = Some(Selection::new(ty, p, side));
+            self.selecting = true;
+            cx.notify();
+        }
+    }
+
+    /// Extend the in-progress selection to the current cursor position.
+    fn update_selection(&mut self, pos: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        if let Some((p, side)) = self.point_at(pos) {
+            let mut t = self.term.lock();
+            if let Some(sel) = t.selection.as_mut() {
+                sel.update(p, side);
+                drop(t);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Copy the current selection to the clipboard (Cmd-C). No-op with no selection.
+    pub(crate) fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = self.term.lock().selection_to_string() {
+            if !text.is_empty() {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+            }
+        }
+    }
+
+    /// The link at a window-space position — an OSC-8 hyperlink if the cell carries one,
+    /// else a URL or file path scanned out of that grid row. `None` off the drawn rows.
+    fn link_at(&self, pos: gpui::Point<Pixels>) -> Option<Link> {
+        if !self.bounds?.contains(&pos) {
+            return None;
+        }
+        let (p, _) = self.point_at(pos)?;
+        let t = self.term.lock();
+        let grid = t.grid();
+        let off = i32::try_from(grid.display_offset()).unwrap_or(0);
+        if p.line.0 + off >= i32::try_from(t.screen_lines()).unwrap_or(0) {
+            return None;
+        }
+        let cell = |c: usize| &grid[GridPoint::new(p.line, Column(c))];
+        let at = p.column.0;
+        if let Some(h) = cell(at).hyperlink() {
+            let same = |c: &usize| cell(*c).hyperlink().as_ref() == Some(&h);
+            let start = (0..at).rev().take_while(same).last().unwrap_or(at);
+            let end = (at..t.columns()).take_while(same).count() + at;
+            return Some(Link {
+                line: p.line,
+                cols: start..end,
+                target: Target::from_uri(h.uri()),
+            });
+        }
+        let row: Vec<char> = (0..t.columns()).map(|c| cell(c).c).collect();
+        let (cols, target) = link_in(&row, at)?;
+        Some(Link {
+            line: p.line,
+            cols,
+            target,
+        })
+    }
+
+    /// Follow the link under the mouse while ⌘ is `held`, repainting only when it changes.
+    fn hover_link(&mut self, pos: gpui::Point<Pixels>, held: bool, cx: &mut Context<Self>) {
+        let link = if held { self.link_at(pos) } else { None };
+        if link != self.link {
+            self.link = link;
+            cx.notify();
+        }
+    }
+}
+
+/// The link token in `row` covering char column `col`: the columns it spans, and where it
+/// goes.
+fn link_in(row: &[char], col: usize) -> Option<(std::ops::Range<usize>, Target)> {
+    let r = link_spans(row).find(|r| r.contains(&col))?;
+    let text: String = row[r.clone()].iter().collect();
+    Some((r, Target::parse(&text)))
+}
+
+/// Every link token in `chars`, as char ranges: http(s) URLs, and absolute (or `~/`) file
+/// paths with at least two parts, so `/compact` isn't one — `:line[:col]` included. Pure
+/// text, no disk: it runs on every drawn row each frame. Wrapping punctuation is trimmed, so
+/// `see (https://x.com).` captures neither bracket nor the period, and `Read(/a/b.rs)` the
+/// path alone.
+fn link_spans(chars: &[char]) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        while i < chars.len() {
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
+            let mut start = i;
+            while i < chars.len() && !chars[i].is_whitespace() {
+                i += 1;
+            }
+            let mut end = i;
+            while start < end && matches!(chars[start], '(' | '[' | '<' | '"' | '\'' | '`') {
+                start += 1;
+            }
+            while end > start
+                && matches!(
+                    chars[end - 1],
+                    '.' | ',' | ':' | ';' | ')' | ']' | '}' | '"' | '\'' | '>' | '`'
+                )
+            {
+                end -= 1;
+            }
+            let token = &chars[start..end];
+            if token.starts_with(&['h', 't', 't', 'p', ':', '/', '/'])
+                || token.starts_with(&['h', 't', 't', 'p', 's', ':', '/', '/'])
+            {
+                return Some(start..end);
+            }
+            // A path starts the token, or follows a bracket or quote inside it.
+            let path_at = (start..end).find(|&s| {
+                let lead = s == start || matches!(chars[s - 1], '(' | '[' | '<' | '"' | '\'' | '=');
+                let p = &chars[s..end];
+                lead && match p {
+                    ['/', c, rest @ ..] => *c != '/' && rest.contains(&'/'),
+                    ['~', '/', _, ..] => true,
+                    _ => false,
+                }
+            });
+            if let Some(s) = path_at {
+                return Some(s..end);
+            }
+        }
+        None
+    })
+}
+
+/// `query` as a regex that matches it literally.
+fn literal_regex(query: &str) -> String {
+    let mut out = String::with_capacity(query.len() * 2);
+    for c in query.chars() {
+        if "\\.+*?()|[]{}^$#&-~".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Every match of `regex` in `term` — scrollback and screen — top to bottom.
+fn scan_all<T>(term: &Term<T>, regex: &mut RegexSearch) -> Vec<Match> {
+    let start = GridPoint::new(term.topmost_line(), Column(0));
+    let end = GridPoint::new(term.bottommost_line(), term.last_column());
+    RegexIter::new(start, end, Direction::Right, term, regex).collect()
+}
+
+/// Where a find's current match `(m, history size, scroll offset)` is now. Output pushes
+/// lines up: by as many as the scrollback grew, or — once it's full and stops growing — as
+/// many as a scrolled-back view moved to stay on them (our own scrolling is already taken
+/// out of the offset). `None` once it's gone off the top or the scrollback shrank (cleared).
+fn shifted<T>(term: &Term<T>, (m, hist, off): &(Match, usize, isize)) -> Option<Match> {
+    let grid = term.grid();
+    let grew = grid.history_size() as isize - *hist as isize;
+    if grew < 0 {
+        return None;
+    }
+    let moved = grid.display_offset() as isize - off;
+    let up = i32::try_from(grew.max(moved)).ok()?;
+    let lift = |p: &GridPoint| GridPoint::new(Line(p.line.0 - up), p.column);
+    let (a, b) = (lift(m.start()), lift(m.end()));
+    (a.line >= term.topmost_line() && b.line <= term.bottommost_line()).then_some(a..=b)
+}
+
+/// Dropped paths as the terminal's shell takes them: one quoted word each, space-separated,
+/// with one trailing space so the next word starts clear of them. A path that isn't UTF-8 or
+/// holds a control character types nothing: the tty and line editor act on ESC, CR and Ctrl-C
+/// even inside quotes (a crafted name could end a bracketed paste or run a command), and a
+/// lossy copy of a non-UTF-8 name points at no file.
+fn shell_quoted(paths: &[PathBuf]) -> String {
+    let mut out = String::new();
+    for p in paths {
+        let Some(s) = p.to_str().filter(|s| !s.contains(char::is_control)) else {
+            continue;
+        };
+        // POSIX shells and fish: single quotes, with each `'` and `\` written outside them
+        // (`'\''`, `'\\'`). Fish reads `\'` and `\\` as escapes even inside single quotes, so a
+        // `\` left inside could end the quote early.
+        #[cfg(not(target_os = "windows"))]
+        {
+            out.push('\'');
+            for c in s.chars() {
+                match c {
+                    '\'' => out.push_str(r"'\''"),
+                    '\\' => out.push_str(r"'\\'"),
+                    c => out.push(c),
+                }
+            }
+            out.push_str("' ");
+        }
+        // cmd.exe doesn't quote with `'`; double quotes do, and a Windows path can't hold `"`.
+        #[cfg(target_os = "windows")]
+        {
+            out.push('"');
+            out.push_str(s);
+            out.push_str("\" ");
+        }
+    }
+    out
+}
+
+/// Open a URI in the OS default handler.
+fn open_uri(uri: &str) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(uri).spawn();
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open").arg(uri).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = crate::platform::windows::open_with_system(uri);
+}
+
+impl Focusable for TerminalView {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl Drop for TerminalView {
+    fn drop(&mut self) {
+        // Closing a tab drops this entity. Tell the IO thread to shut down so it drains +
+        // exits, closes the PTY (the child shell gets SIGHUP), and frees the grid/scrollback.
+        // Without this the thread keeps running detached — leaking MBs of grid + a zombie shell.
+        match &self.backend {
+            Backend::Local { notifier, .. } => {
+                let _ = notifier.0.send(Msg::Shutdown);
+            }
+            Backend::OutputOnly => {}
+        }
+    }
+}
+
+/// Emitted so the panel (FerriteMCU) can react: repaint the tab label on a title change, or close
+/// this tab when the terminal's own context menu requests it (tabs live on `FerriteMCU`).
+pub enum TerminalEvent {
+    TitleChanged,
+    CloseRequested,
+    /// The shell produced output — files may have changed (subscriber debounces).
+    Output,
+    /// "Open Scrollback in Editor" from its menu.
+    OpenScrollback(String),
+    /// A file path in it was ⌘-clicked: open it (at `line`, when it named one).
+    OpenFile {
+        path: PathBuf,
+        line: Option<u32>,
+    },
+}
+impl EventEmitter<TerminalEvent> for TerminalView {}
+
+impl Render for TerminalView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity();
+        let menu_at = self.menu_at;
+        div()
+            .id("terminal")
+            .track_focus(&self.focus)
+            .key_context("Terminal")
+            .relative()
+            .size_full()
+            .bg(TermColors::current().bg)
+            // Files dropped from a file manager are typed in as shell-quoted paths, sent the
+            // way a paste is (bracketed when the program asked for it), so an image dropped on
+            // The path is pasted into the shell. Tinted like a tree folder while it hovers.
+            .drag_over::<gpui::ExternalPaths>(|s, _, _, _| s.bg(theme::get().selected_bg))
+            .on_drop(cx.listener(|this, ep: &gpui::ExternalPaths, window, cx| {
+                window.focus(&this.focus);
+                let text = shell_quoted(ep.paths());
+                if !text.is_empty() {
+                    this.paste_text(text, cx);
+                }
+            }))
+            // ⌘K clears the current (unsubmitted) input line — overrides the global commit
+            // binding in this context.
+            .on_action(cx.listener(|this, _: &crate::ClearTerminal, window, cx| {
+                if this.focus.is_focused(window) {
+                    this.clear_input(cx);
+                }
+            }))
+            // ⌘F searches the scrollback. While the bar is open, Enter / ⌘G step up to older
+            // matches, ⇧Enter / ⇧⌘G back down, Escape closes it; closed, they're the app's.
+            .on_action(cx.listener(|this, _: &crate::TerminalFind, window, cx| {
+                this.open_find(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::FindNext, _w, cx| {
+                if this.find_open() {
+                    this.find_step(Pick::Older, cx);
+                } else {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &crate::FindPrev, _w, cx| {
+                if this.find_open() {
+                    this.find_step(Pick::Newer, cx);
+                } else {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &crate::CloseFind, window, cx| {
+                if this.find_open() {
+                    this.close_find(window, cx);
+                } else {
+                    cx.propagate();
+                }
+            }))
+            // Enter / Backspace / Escape are also app shortcuts. gpui dispatches
+            // binding actions before on_key_down and consumes the key, so we relay the PTY byte
+            // here rather than let it fall through to the app action (which deleted the selected
+            // file / closed a modal). Mirrors how the editor binds backspace to a buffer action.
+            .on_action(cx.listener(|this, _: &crate::TerminalEnter, _w, cx| {
+                this.send_key(b"\r".to_vec(), cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::TerminalBackspace, _w, cx| {
+                this.send_key(vec![0x7f], cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::TerminalEscape, _w, cx| {
+                this.send_key(vec![0x1b], cx);
+            }))
+            // ⌘C / ⌘V are the file tree's copy / paste at the app root; here they're the
+            // terminal's (selection → clipboard, clipboard → the shell).
+            .on_action(cx.listener(|this, _: &crate::TerminalCopy, _w, cx| {
+                this.copy_selection(cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::TerminalPaste, _w, cx| this.paste(cx)))
+            // Pin the mono font + a fixed size so the cell metrics the element measures (the
+            // `M` advance) match the glyphs it actually shapes — otherwise the cursor, placed
+            // at `col × cell_w`, drifts off the text (it inherits a proportional UI font).
+            // The UI size (dense like a real terminal),
+            // unless Match desktop gives the user's own terminal font.
+            .font_family(theme::font::terminal_family())
+            .text_size(px(theme::font::terminal_size()))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, e: &MouseDownEvent, window, cx| {
+                    window.focus(&this.focus);
+                    // Cmd-click (Ctrl-click off macOS) opens a URL or file under the cursor; a
+                    // plain click starts a selection (double = word, triple = line).
+                    if e.modifiers.secondary() {
+                        match this.link_at(e.position).map(|l| l.target) {
+                            Some(Target::Url(url)) => open_uri(&url),
+                            Some(Target::File { path, line }) => {
+                                cx.emit(TerminalEvent::OpenFile { path, line });
+                            }
+                            None => {}
+                        }
+                        return;
+                    }
+                    let ty = match e.click_count {
+                        2 => SelectionType::Semantic,
+                        n if n >= 3 => SelectionType::Lines,
+                        _ => SelectionType::Simple,
+                    };
+                    this.start_selection(e.position, ty, cx);
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _w, cx| {
+                if this.selecting {
+                    this.update_selection(e.position, cx);
+                }
+                this.hover_link(e.position, e.modifiers.secondary(), cx);
+            }))
+            // ⌘ pressed or let go over a link shows or hides it as one, without a mouse move.
+            .on_modifiers_changed(cx.listener(|this, e: &ModifiersChangedEvent, window, cx| {
+                this.hover_link(window.mouse_position(), e.modifiers.secondary(), cx);
+            }))
+            .on_hover(cx.listener(|this, hovered: &bool, _w, cx| {
+                if !*hovered {
+                    this.hover_link(gpui::Point::default(), false, cx);
+                }
+            }))
+            .when(self.link.is_some(), Styled::cursor_pointer)
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _e: &MouseUpEvent, _w, cx| {
+                    if this.selecting {
+                        this.selection_to_primary(cx);
+                    }
+                    this.selecting = false;
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(|this, _e: &MouseDownEvent, window, cx| this.paste_primary(window, cx)),
+            )
+            // Right-click → context menu (Paste / Clear / Close) at the cursor.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, e: &MouseDownEvent, window, cx| {
+                    window.focus(&this.focus);
+                    this.menu_at = Some(e.position);
+                    cx.notify();
+                }),
+            )
+            // Keys typed in the find box aren't the shell's.
+            .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
+                if this.focus.is_focused(window) {
+                    this.on_key(e, cx);
+                }
+            }))
+            .on_scroll_wheel(cx.listener(|this, e: &ScrollWheelEvent, _w, cx| {
+                let ch = this.cell.1.max(1.0);
+                if matches!(e.touch_phase, gpui::TouchPhase::Started) {
+                    this.scroll_px = 0.0;
+                }
+                this.scroll_px += f32::from(e.delta.pixel_delta(px(ch)).y);
+                let lines = (this.scroll_px / ch).trunc();
+                this.scroll_px -= lines * ch;
+                this.scroll_lines(lines as i32, cx);
+            }))
+            .flex()
+            .flex_row()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .child(TerminalElement { view }),
+            )
+            .child(self.render_scrollbar(cx))
+            .children(
+                self.find
+                    .as_ref()
+                    .filter(|f| f.open)
+                    .map(|f| self.render_find(f, cx)),
+            )
+            .children(menu_at.map(|at| self.render_context_menu(at, window, cx)))
+    }
+}
+
+impl TerminalView {
+    /// The scrollbar's gutter at the right edge — always there, so the grid doesn't reflow
+    /// when scrollback first appears; the thumb shows once there's something to scroll.
+    fn render_scrollbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme::get();
+        let sb = self.scrollbar();
+        let dragging = self.sb_drag.is_some();
+        div()
+            .id("term-scrollbar")
+            .w(px(SB_BAR))
+            .flex_none()
+            .h_full()
+            .relative()
+            .when(sb.is_some(), |d| {
+                d.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, e: &MouseDownEvent, _w, cx| {
+                        cx.stop_propagation();
+                        this.sb_press(f32::from(e.position.y), cx);
+                    }),
+                )
+            })
+            .children(sb.map(|sb| {
+                div()
+                    .absolute()
+                    .left(px((SB_BAR - SB_THUMB) / 2.0))
+                    .top(px(sb.pos))
+                    .w(px(SB_THUMB))
+                    .h(px(sb.len))
+                    .rounded_full()
+                    .bg(t.line_number)
+                    .opacity(if dragging { 0.85 } else { 0.5 })
+                    .hover(|s| s.opacity(0.85))
+                    .cursor_pointer()
+            }))
+    }
+
+    /// The find bar, floated at the top right over the output.
+    fn render_find(&self, f: &TermFind, cx: &mut Context<Self>) -> impl IntoElement {
+        let (next, prev) = crate::FIND_STEP_KEYS;
+        let bar = crate::ui::find::Bar::new(
+            "term-find",
+            f.query.clone(),
+            crate::ui::find::match_label(f.regex.is_some(), f.count, f.index),
+        )
+        .on_up(
+            format!("Older match  ({next})"),
+            cx.listener(|this, _e, _w, cx| this.find_step(Pick::Older, cx)),
+        )
+        .on_down(
+            format!("Newer match  ({prev})"),
+            cx.listener(|this, _e, _w, cx| this.find_step(Pick::Newer, cx)),
+        )
+        .on_close(cx.listener(|this, _e, window, cx| this.close_find(window, cx)));
+        crate::ui::find::floating(bar)
+    }
+
+    /// Right-click menu: a transparent dismiss backdrop + a small box anchored at the click.
+    fn render_context_menu(
+        &self,
+        at: gpui::Point<Pixels>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let t = theme::get();
+        let has_selection = self
+            .term
+            .lock()
+            .selection_to_string()
+            .is_some_and(|s| !s.is_empty());
+        // A row: its label, the shortcut (muted) on the right; greyed out when `enabled` is off.
+        let item = |label: &'static str, key: String, enabled: bool| {
+            div()
+                .id(label)
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_6()
+                .px_3()
+                .py_1()
+                .text_size(px(13.0))
+                .rounded_md()
+                .text_color(if enabled { t.text } else { t.line_number })
+                .when(enabled, |d| {
+                    d.cursor_pointer().hover(|d| d.bg(t.selected_bg))
+                })
+                .child(div().flex_1().child(label))
+                .child(div().text_color(t.line_number).child(key))
+        };
+        let close = |this: &mut Self, cx: &mut Context<Self>| {
+            this.menu_at = None;
+            cx.notify();
+        };
+        // The terminal's own keys: ⌘C / ⌘V on macOS, Ctrl+Shift+C / V elsewhere.
+        let term_key = |key: &str| crate::pretty_key(&format!("{}-{key}", crate::TERMINAL_MOD));
+        let scrollback_key = if cfg!(target_os = "macos") {
+            "⌥⌘E".to_string()
+        } else {
+            crate::pretty_key("cmd-alt-e")
+        };
+        let panel = div()
+            .flex()
+            .flex_col()
+            .min_w(px(220.0))
+            .p_1()
+            .bg(t.panel_bg)
+            .border_1()
+            .border_color(t.divider)
+            .rounded_md()
+            .shadow_md()
+            .font_family(theme::font::ui_family())
+            .child(
+                item("Copy", term_key("c"), has_selection).when(has_selection, |d| {
+                    d.on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _e, _w, cx| {
+                            cx.stop_propagation();
+                            close(this, cx);
+                            this.copy_selection(cx);
+                        }),
+                    )
+                }),
+            )
+            .child(item("Paste", term_key("v"), true).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _e, _w, cx| {
+                    cx.stop_propagation();
+                    close(this, cx);
+                    this.paste(cx);
+                }),
+            ))
+            .child(
+                item("Open Scrollback in Editor", scrollback_key, true).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _e, _w, cx| {
+                        cx.stop_propagation();
+                        close(this, cx);
+                        cx.emit(TerminalEvent::OpenScrollback(this.scrollback_text()));
+                    }),
+                ),
+            )
+            .child(item("Clear Screen", String::new(), true).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _e, _w, cx| {
+                    cx.stop_propagation();
+                    close(this, cx);
+                    this.clear_screen(cx);
+                }),
+            ))
+            .child(item("Close", String::new(), true).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _e, _w, cx| {
+                    cx.stop_propagation();
+                    close(this, cx);
+                    // Tabs live on FerriteMCU — ask it to close this one.
+                    cx.emit(TerminalEvent::CloseRequested);
+                }),
+            ));
+        // Drawn over everything (not clipped by the pane), at the cursor — flipped / nudged
+        // back inside the window near an edge — over a window-wide backdrop: any click
+        // outside closes it.
+        let viewport = window.viewport_size();
+        gpui::deferred(
+            gpui::anchored().position(point(px(0.0), px(0.0))).child(
+                div()
+                    .w(viewport.width)
+                    .h(viewport.height)
+                    .occlude()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _e, _w, cx| close(this, cx)),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, _e, _w, cx| close(this, cx)),
+                    )
+                    .child(
+                        gpui::anchored()
+                            .position(at)
+                            .snap_to_window_with_margin(px(8.0))
+                            .child(panel),
+                    ),
+            ),
+        )
+        .with_priority(1)
+    }
+}
+
+// ── the painting element ──────────────────────────────────────────
+struct TerminalElement {
+    view: Entity<TerminalView>,
+}
+
+struct Prepaint {
+    /// One shaped line per visible grid row (dense, top→bottom).
+    lines: Vec<ShapedLine>,
+    /// Background quads (cell rects with a non-default bg), painted under the text.
+    bg_quads: Vec<gpui::PaintQuad>,
+    /// Find matches on screen (the current one outlined), over the backgrounds.
+    find_quads: Vec<gpui::PaintQuad>,
+    /// Block/bar cursor quad, if visible (not in scrollback, not hidden).
+    cursor: Option<gpui::PaintQuad>,
+    line_height: Pixels,
+    /// Rows to push everything down by (bottom-anchoring).
+    shift: f32,
+}
+
+impl IntoElement for TerminalElement {
+    type Element = Self;
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for TerminalElement {
+    type RequestLayoutState = ();
+    type PrepaintState = Prepaint;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        let mut style = Style::default();
+        style.size.width = relative(1.0).into();
+        style.size.height = relative(1.0).into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        (): &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Prepaint {
+        let style = window.text_style();
+        let font = style.font();
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let line_height = window.line_height();
+
+        // Monospace cell width = advance of a representative glyph.
+        let cell_w = window
+            .text_system()
+            .shape_line(
+                "M".into(),
+                font_size,
+                &[TextRun {
+                    len: 1,
+                    font: font.clone(),
+                    color: theme::get().text.into(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }],
+                None,
+            )
+            .width;
+        let cell_w_f = f32::from(cell_w).max(1.0);
+        let cell_h_f = f32::from(line_height).max(1.0);
+
+        let cols = (f32::from(bounds.size.width) / cell_w_f).floor().max(1.0) as u16;
+        let rows = (f32::from(bounds.size.height) / cell_h_f).floor().max(1.0) as u16;
+
+        // Push geometry changes back to the grid/PTY before reading the content. While a new
+        // size settles the old grid is drawn, clipped to the pane (see `paint`).
+        let settling = self.view.update(cx, |v, _| {
+            v.resize(cols, rows, cell_w_f, cell_h_f, Instant::now())
+        });
+        if settling {
+            window.request_animation_frame();
+        }
+        let (found, current) = self.view.update(cx, |v, _| v.visible_matches());
+
+        let view = self.view.read(cx);
+        let term = view.term.lock();
+        let content = term.renderable_content();
+        let pal = TermColors::current();
+        let (default_fg, default_bg) = (pal.fg, pal.bg);
+        // Where the cursor is drawn — only on the live screen (no scrollback offset) and when
+        // shown — and whether it's a filled block (focused, and not a beam or underline).
+        let cursor_at = (content.display_offset == 0
+            && content.cursor.shape != CursorShape::Hidden)
+            .then_some(content.cursor.point);
+        let focused = view.focus.is_focused(window);
+        let filled_cursor = focused
+            && !matches!(
+                content.cursor.shape,
+                CursorShape::Beam | CursorShape::Underline
+            );
+
+        // URLs and file paths read as links — in the terminal's blue — so it's plain a
+        // ⌘-click opens them.
+        let link_fg = resolve(
+            AnsiColor::Named(NamedColor::Blue),
+            default_fg,
+            content.colors,
+            &pal.ansi,
+        );
+
+        let selection = content.selection;
+        let sel_bg: Hsla = theme::get().selected_bg.into();
+        let mut lines: Vec<ShapedLine> = Vec::new();
+        // Background and selection runs — one quad per run of same-coloured cells, not per
+        // cell: a full-width coloured line was ~200 quads, and quads were most of a frame.
+        // Laid out once the shift is known.
+        let mut bg_runs: Vec<BgRun> = Vec::new();
+        let mut sel_runs: Vec<BgRun> = Vec::new();
+        let mut base_line: Option<i32> = None;
+        // Each cell's char, colour, and whether it's in the ⌘-hovered link (underlined).
+        let mut cur_row: Vec<(char, Hsla, bool)> = Vec::new();
+        let mut cur_line_idx: i32 = i32::MIN;
+
+        // Reused across rows: the link scan's chars, without an allocation per row.
+        let mut chars: Vec<char> = Vec::new();
+        let mut flush_row = |lines: &mut Vec<ShapedLine>, row: &mut Vec<(char, Hsla, bool)>| {
+            // Coalesce a row into one shaped line with a run per color / underline change.
+            let text: String = row.iter().map(|(c, ..)| *c).collect();
+            // Every link has a `/` in it; most rows have none, and skip the scan.
+            if text.contains('/') {
+                chars.clear();
+                chars.extend(row.iter().map(|(c, ..)| *c));
+                for r in link_spans(&chars) {
+                    for (_, color, _) in &mut row[r] {
+                        *color = Hsla {
+                            a: color.a,
+                            ..link_fg
+                        };
+                    }
+                }
+            }
+            let mut runs: Vec<TextRun> = Vec::new();
+            for &(c, color, link) in row.iter() {
+                let len = c.len_utf8();
+                if let Some(last) = runs.last_mut() {
+                    if last.color == color && last.underline.is_some() == link {
+                        last.len += len;
+                        continue;
+                    }
+                }
+                runs.push(TextRun {
+                    len,
+                    font: font.clone(),
+                    color,
+                    background_color: None,
+                    underline: link.then(|| UnderlineStyle {
+                        thickness: px(1.0),
+                        color: Some(color),
+                        wavy: false,
+                    }),
+                    strikethrough: None,
+                });
+            }
+            lines.push(
+                window
+                    .text_system()
+                    .shape_line(text.into(), font_size, &runs, None),
+            );
+            row.clear();
+        };
+
+        for cell in content.display_iter {
+            let line = cell.point.line.0;
+            let col = cell.point.column.0;
+            if base_line.is_none() {
+                base_line = Some(line);
+                cur_line_idx = line;
+            }
+            // New grid row → flush the accumulated one.
+            if line != cur_line_idx {
+                flush_row(&mut lines, &mut cur_row);
+                cur_line_idx = line;
+            }
+            // Second half of a wide char is a spacer — skip (the wide glyph already shaped).
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            let row_idx = line - base_line.unwrap_or(line);
+            let mut fg = resolve(cell.fg, default_fg, content.colors, &pal.ansi);
+            let mut bg = resolve_opt(cell.bg, content.colors, &pal.ansi);
+            // Bold text in the default colour takes the look's bold colour, when it has one.
+            if let Some(bold) = pal.bold {
+                if cell.flags.contains(Flags::BOLD)
+                    && cell.fg == AnsiColor::Named(NamedColor::Foreground)
+                {
+                    fg = bold;
+                }
+            }
+            if cell.flags.contains(Flags::INVERSE) {
+                let f = fg;
+                fg = bg.unwrap_or(default_bg);
+                bg = Some(f);
+            }
+            if cell.hyperlink().is_some() {
+                fg = link_fg;
+            }
+            // SGR dim (faint).
+            if cell.flags.contains(Flags::DIM) {
+                fg = fg.opacity(DIM_ALPHA);
+            }
+            if cell.flags.contains(Flags::HIDDEN) {
+                fg = bg.unwrap_or(default_bg);
+            }
+            // The character under a filled block cursor, in the look's cursor text colour.
+            if let Some(text) = pal.cursor_text {
+                if filled_cursor && cursor_at == Some(cell.point) {
+                    fg = text;
+                }
+            }
+            // Selection tint wins over the cell's own bg (its runs paint after).
+            let selected = selection.as_ref().is_some_and(|s| s.contains(cell.point));
+            let width = if cell.flags.contains(Flags::WIDE_CHAR) {
+                2
+            } else {
+                1
+            };
+            if let Some(bg) = bg {
+                push_run(&mut bg_runs, row_idx, col, width, bg);
+            }
+            if selected {
+                push_run(&mut sel_runs, row_idx, col, width, sel_bg);
+            }
+            let ch = cell.c;
+            let in_link = view
+                .link
+                .as_ref()
+                .is_some_and(|l| l.line == cell.point.line && l.cols.contains(&col));
+            cur_row.push((if ch == '\0' { ' ' } else { ch }, fg, in_link));
+        }
+        flush_row(&mut lines, &mut cur_row);
+
+        let shift = 0.0;
+        let quad = |row: i32, col: usize, len: usize, color: Hsla| {
+            let x = bounds.left() + px(col as f32 * cell_w_f);
+            let y = bounds.top() + line_height * (row as f32 + shift);
+            fill(
+                Bounds::new(
+                    point(x, y),
+                    gpui::size(px(len as f32 * cell_w_f), line_height),
+                ),
+                color,
+            )
+        };
+        let bg_quads: Vec<gpui::PaintQuad> = bg_runs
+            .iter()
+            .chain(&sel_runs)
+            .map(|r| quad(r.row, r.col, r.len, r.color))
+            .collect();
+        let off = i32::try_from(content.display_offset).unwrap_or(0);
+        let last_col = term.columns().saturating_sub(1);
+        let find_bg: Hsla = theme::get().find_match_bg.into();
+        let mut find_quads: Vec<gpui::PaintQuad> = found
+            .iter()
+            .flat_map(|m| match_rows(m, off, i32::from(rows), last_col))
+            .map(|(row, c0, c1)| quad(row, c0, c1 - c0 + 1, find_bg))
+            .collect();
+        if let Some(m) = &current {
+            let caret: Hsla = theme::get().caret.into();
+            find_quads.extend(
+                match_rows(m, off, i32::from(rows), last_col)
+                    .into_iter()
+                    .map(|(row, c0, c1)| {
+                        quad(row, c0, c1 - c0 + 1, find_bg)
+                            .border_widths(px(1.0))
+                            .border_color(caret)
+                    }),
+            );
+        }
+
+        // Block cursor, where `cursor_at` says.
+        let cursor = if let Some(at) = cursor_at {
+            let base = base_line.unwrap_or(0);
+            let row = at.line.0 - base;
+            let col = at.column.0.min(usize::from(cols).saturating_sub(1));
+            if row >= 0 && (row as u16) < rows {
+                let x = bounds.left() + px(col as f32 * cell_w_f);
+                let y = bounds.top() + line_height * (row as f32 + shift);
+                let color = pal.cursor;
+                let rect = match content.cursor.shape {
+                    CursorShape::Beam => Bounds::new(point(x, y), gpui::size(px(2.0), line_height)),
+                    CursorShape::Underline => Bounds::new(
+                        point(x, y + line_height - px(2.0)),
+                        gpui::size(px(cell_w_f), px(2.0)),
+                    ),
+                    // Block: filled when focused, hollow-ish (thin) when not.
+                    _ if focused => Bounds::new(point(x, y), gpui::size(px(cell_w_f), line_height)),
+                    _ => Bounds::new(point(x, y), gpui::size(px(cell_w_f), px(2.0))),
+                };
+                Some(fill(rect, color))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        drop(term);
+        self.view.update(cx, |v, _| v.shift = 0);
+        Prepaint {
+            lines,
+            bg_quads,
+            find_quads,
+            cursor,
+            line_height,
+            shift,
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        (): &mut (),
+        pre: &mut Prepaint,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        // Clipped: while a new pane size settles (see `resize`) the grid can be the old,
+        // larger one.
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            for q in pre.bg_quads.drain(..).chain(pre.find_quads.drain(..)) {
+                window.paint_quad(q);
+            }
+            // Cursor under the glyph so an inverse block still shows the character.
+            if let Some(c) = pre.cursor.take() {
+                window.paint_quad(c);
+            }
+            let lh = pre.line_height;
+            for (i, line) in pre.lines.iter().enumerate() {
+                let origin = point(bounds.left(), bounds.top() + lh * (i as f32 + pre.shift));
+                let _ = line.paint(origin, lh, window, cx);
+            }
+        });
+        self.view.update(cx, |v, _| v.bounds = Some(bounds));
+        // A scrollbar drag follows the cursor anywhere in the window, until the button's up.
+        if self.view.read(cx).sb_drag.is_some() {
+            let view = self.view.clone();
+            window.on_mouse_event(move |e: &MouseMoveEvent, phase, _w, cx| {
+                if phase == DispatchPhase::Bubble {
+                    view.update(cx, |v, cx| v.sb_drag_to(f32::from(e.position.y), cx));
+                }
+            });
+            let view = self.view.clone();
+            window.on_mouse_event(move |_: &MouseUpEvent, phase, _w, cx| {
+                if phase == DispatchPhase::Bubble {
+                    view.update(cx, |v, cx| {
+                        v.sb_drag = None;
+                        cx.notify();
+                    });
+                }
+            });
+        }
+    }
+}
+
+/// A run of same-coloured cell backgrounds on one row (painted as one quad).
+struct BgRun {
+    row: i32,
+    col: usize,
+    len: usize,
+    color: Hsla,
+}
+
+/// Add `width` cells at (`row`, `col`) to `runs`, extending the last run when they continue
+/// it in its colour.
+fn push_run(runs: &mut Vec<BgRun>, row: i32, col: usize, width: usize, color: Hsla) {
+    if let Some(r) = runs.last_mut() {
+        if r.row == row && r.col + r.len == col && r.color == color {
+            r.len += width;
+            return;
+        }
+    }
+    runs.push(BgRun {
+        row,
+        col,
+        len: width,
+        color,
+    });
+}
+
+/// The screen rows `m` covers — `(row, first column, last column)` — given the view's scroll
+/// offset; rows off screen are left out.
+fn match_rows(m: &Match, off: i32, rows: i32, last_col: usize) -> Vec<(i32, usize, usize)> {
+    let (a, b) = (m.start(), m.end());
+    (a.line.0..=b.line.0)
+        .filter(|l| (0..rows).contains(&(l + off)))
+        .map(|l| {
+            let c0 = if l == a.line.0 { a.column.0 } else { 0 };
+            let c1 = if l == b.line.0 { b.column.0 } else { last_col };
+            (l + off, c0, c1.max(c0))
+        })
+        .collect()
+}
+
+/// What a terminal draws with: the theme's colours and `ANSI_PALETTE` (FerriteMCU's terminal), with
+/// the Terminal look (Settings → Appearance → Terminal on Linux) laid over where it sets one.
+/// The panel chrome around the terminal keeps the theme.
+#[derive(Debug, PartialEq)]
+struct TermColors {
+    /// Default text.
+    fg: Hsla,
+    /// Background, painted behind the whole terminal.
+    bg: Hsla,
+    /// The 16 ANSI colours (named, and indexed 0–15).
+    ansi: [Rgb; 16],
+    /// Bold text in the default colour; `None` = `fg`.
+    bold: Option<Hsla>,
+    /// The cursor.
+    cursor: Hsla,
+    /// The character under a filled block cursor; `None` = its own colour.
+    cursor_text: Option<Hsla>,
+}
+
+impl TermColors {
+    /// The colours in force now.
+    fn current() -> Self {
+        Self::of(&theme::get(), &theme::terminal_look())
+    }
+
+    fn of(t: &theme::Theme, look: &theme::TerminalLook) -> Self {
+        let mut ansi = ANSI_PALETTE;
+        for (slot, color) in ansi.iter_mut().zip(look.ansi) {
+            if let Some(c) = color {
+                *slot = color_rgb(c);
+            }
+        }
+        Self {
+            fg: look.foreground.unwrap_or(t.text).into(),
+            bg: look.background.unwrap_or(t.main_bg).into(),
+            ansi,
+            bold: look.bold.map(Into::into),
+            cursor: look.cursor.unwrap_or(t.primary).into(),
+            cursor_text: look.cursor_text.map(Into::into),
+        }
+    }
+}
+
+/// A theme colour as the terminal's 8-bit RGB.
+fn color_rgb(c: ferritemcu_color::Color) -> Rgb {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // clamped to 0–255
+    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    Rgb {
+        r: byte(c.r),
+        g: byte(c.g),
+        b: byte(c.b),
+    }
+}
+
+/// Resolve an alacritty cell color to an `Hsla`, falling back to `default` for the
+/// default-foreground sentinel. `ansi` is the 16-colour palette in force.
+fn resolve(
+    color: AnsiColor,
+    default: Hsla,
+    colors: &alacritty_terminal::term::color::Colors,
+    ansi: &[Rgb; 16],
+) -> Hsla {
+    match color {
+        AnsiColor::Named(NamedColor::Foreground) => default,
+        AnsiColor::Named(n) => named_rgb(n, colors, ansi).map_or(default, rgb_to_hsla),
+        AnsiColor::Spec(rgb) => rgb_to_hsla(rgb),
+        AnsiColor::Indexed(i) => rgb_to_hsla(indexed_rgb(i, colors, ansi)),
+    }
+}
+
+/// Like `resolve` but returns `None` for the default background (so it isn't painted).
+fn resolve_opt(
+    color: AnsiColor,
+    colors: &alacritty_terminal::term::color::Colors,
+    ansi: &[Rgb; 16],
+) -> Option<Hsla> {
+    match color {
+        AnsiColor::Named(NamedColor::Background) => None,
+        AnsiColor::Named(n) => named_rgb(n, colors, ansi).map(rgb_to_hsla),
+        AnsiColor::Spec(rgb) => Some(rgb_to_hsla(rgb)),
+        AnsiColor::Indexed(i) => Some(rgb_to_hsla(indexed_rgb(i, colors, ansi))),
+    }
+}
+
+fn rgb_to_hsla(rgb: Rgb) -> Hsla {
+    gpui::rgb((u32::from(rgb.r) << 16) | (u32::from(rgb.g) << 8) | u32::from(rgb.b)).into()
+}
+
+/// Named ANSI color → RGB: prefer an OSC-overridden value, else the palette in force.
+fn named_rgb(
+    n: NamedColor,
+    colors: &alacritty_terminal::term::color::Colors,
+    ansi: &[Rgb; 16],
+) -> Option<Rgb> {
+    if let Some(c) = colors[n] {
+        return Some(c);
+    }
+    ansi.get(n as usize).copied()
+}
+
+/// Indexed color → RGB: an OSC-overridden value, else the palette in force for 0–15 and the
+/// standard cube + grey ramp above.
+fn indexed_rgb(i: u8, colors: &alacritty_terminal::term::color::Colors, ansi: &[Rgb; 16]) -> Rgb {
+    colors[i as usize].unwrap_or_else(|| {
+        ansi.get(usize::from(i))
+            .copied()
+            .unwrap_or_else(|| default_indexed(i))
+    })
+}
+
+/// The standard 256-color cube + grayscale ramp for indices the program hasn't overridden.
+fn default_indexed(i: u8) -> Rgb {
+    match i {
+        0..=15 => ANSI_PALETTE[i as usize],
+        16..=231 => {
+            let i = i - 16;
+            let r = i / 36;
+            let g = (i % 36) / 6;
+            let b = i % 6;
+            let step = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+            Rgb {
+                r: step(r),
+                g: step(g),
+                b: step(b),
+            }
+        }
+        _ => {
+            let v = 8 + (i - 232) * 10;
+            Rgb { r: v, g: v, b: v }
+        }
+    }
+}
+
+/// Translate a (non-⌘) key press to the bytes to write to the PTY, or `None` if the key
+/// produces nothing. Pure (no gpui / no PTY) so the mapping is unit-testable:
+/// - Ctrl + letter → its control byte (Ctrl-A = 0x01 … Ctrl-Z = 0x1a; Ctrl-C = 0x03 = SIGINT).
+/// - Named keys → their terminal escape sequences (arrows = shell history / line editing,
+///   Backspace = DEL 0x7f, Enter = CR, Tab, Esc, Home/End/Delete/PageUp/PageDown).
+/// - Anything else → the key's typed character (`key_char`), e.g. plain letters / symbols.
+pub(crate) fn key_bytes(key: &str, control: bool, key_char: Option<&str>) -> Option<Vec<u8>> {
+    if control && key.len() == 1 {
+        if let Some(c) = key.chars().next() {
+            let lc = c.to_ascii_lowercase();
+            if lc.is_ascii_alphabetic() {
+                return Some(vec![(lc as u8 - b'a') + 1]);
+            }
+        }
+    }
+    match key {
+        // GPUI may report Space as a named key without a printable `key_char`, notably on
+        // Windows. Handle it explicitly so the shell receives the byte in every backend.
+        "space" | " " => Some(b" ".to_vec()),
+        "enter" => Some(b"\r".to_vec()),
+        "backspace" => Some(vec![0x7f]),
+        "tab" => Some(b"\t".to_vec()),
+        "escape" => Some(vec![0x1b]),
+        // Arrows drive shell history (Up/Down) + line editing (Left/Right).
+        "up" => Some(b"\x1b[A".to_vec()),
+        "down" => Some(b"\x1b[B".to_vec()),
+        "right" => Some(b"\x1b[C".to_vec()),
+        "left" => Some(b"\x1b[D".to_vec()),
+        "home" => Some(b"\x1b[H".to_vec()),
+        "end" => Some(b"\x1b[F".to_vec()),
+        "delete" => Some(b"\x1b[3~".to_vec()),
+        "pageup" => Some(b"\x1b[5~".to_vec()),
+        "pagedown" => Some(b"\x1b[6~".to_vec()),
+        _ => key_char.map(|s| s.as_bytes().to_vec()),
+    }
+}
+
+/// 16-color ANSI palette (a balanced dark-theme set tuned to match FerriteMCU's chrome).
+const ANSI_PALETTE: [Rgb; 16] = [
+    Rgb {
+        r: 0x1e,
+        g: 0x20,
+        b: 0x24,
+    }, // black
+    Rgb {
+        r: 0xe0,
+        g: 0x6c,
+        b: 0x75,
+    }, // red
+    Rgb {
+        r: 0x98,
+        g: 0xc3,
+        b: 0x79,
+    }, // green
+    Rgb {
+        r: 0xe5,
+        g: 0xc0,
+        b: 0x7b,
+    }, // yellow
+    Rgb {
+        r: 0x61,
+        g: 0xaf,
+        b: 0xef,
+    }, // blue
+    Rgb {
+        r: 0xc6,
+        g: 0x78,
+        b: 0xdd,
+    }, // magenta
+    Rgb {
+        r: 0x56,
+        g: 0xb6,
+        b: 0xc2,
+    }, // cyan
+    Rgb {
+        r: 0xab,
+        g: 0xb2,
+        b: 0xbf,
+    }, // white
+    Rgb {
+        r: 0x5c,
+        g: 0x63,
+        b: 0x70,
+    }, // bright black
+    Rgb {
+        r: 0xe0,
+        g: 0x6c,
+        b: 0x75,
+    }, // bright red
+    Rgb {
+        r: 0x98,
+        g: 0xc3,
+        b: 0x79,
+    }, // bright green
+    Rgb {
+        r: 0xe5,
+        g: 0xc0,
+        b: 0x7b,
+    }, // bright yellow
+    Rgb {
+        r: 0x61,
+        g: 0xaf,
+        b: 0xef,
+    }, // bright blue
+    Rgb {
+        r: 0xc6,
+        g: 0x78,
+        b: 0xdd,
+    }, // bright magenta
+    Rgb {
+        r: 0x56,
+        g: 0xb6,
+        b: 0xc2,
+    }, // bright cyan
+    Rgb {
+        r: 0xff,
+        g: 0xff,
+        b: 0xff,
+    }, // bright white
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_shell_uses_comspec_with_cmd_fallback() {
+        assert_eq!(
+            windows_shell_from_comspec(Some(r"C:\Windows\System32\cmd.exe".to_string())),
+            r"C:\Windows\System32\cmd.exe"
+        );
+        assert_eq!(windows_shell_from_comspec(None), "cmd.exe");
+        assert_eq!(
+            windows_shell_from_comspec(Some("  ".to_string())),
+            "cmd.exe"
+        );
+    }
+
+    /// Off macOS a missing `SHELL` falls back to the login shell, then `/bin/sh` — never to
+    /// a `/bin/zsh` that most Linux systems don't have.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn shell_falls_back_to_the_login_shell_then_sh() {
+        let none = || -> Option<String> { None };
+        let fish = || Some("/usr/bin/fish".to_string());
+        assert_eq!(shell_from(Some("/bin/bash".into()), fish), "/bin/bash");
+        assert_eq!(shell_from(None, fish), "/usr/bin/fish");
+        assert_eq!(shell_from(Some(" ".into()), fish), "/usr/bin/fish");
+        assert_eq!(shell_from(None, none), "/bin/sh");
+        // The real lookup: this user's entry, when the system has one, is an absolute path.
+        assert!(passwd_shell().is_none_or(|s| s.starts_with('/')));
+    }
+
+    /// Holding ⌘ over a URL marks it as a link (underlined, pointing hand) — so it's plain
+    /// a click will open it — and letting go of ⌘ unmarks it.
+    #[cfg(unix)]
+    #[gpui::test]
+    fn cmd_over_a_url_marks_it_as_a_link(cx: &mut gpui::TestAppContext) {
+        let (view, vcx) = cx.add_window_view(|_w, cx| TerminalView::new(None, cx));
+        view.update(vcx, |v, _| {
+            let mut p: alacritty_terminal::vte::ansi::Processor =
+                alacritty_terminal::vte::ansi::Processor::new();
+            p.advance(
+                &mut *v.term.lock(),
+                b"opened https://github.com/o/r/pull/491.\r\n",
+            );
+        });
+        vcx.run_until_parked();
+        let (bounds, (cw, ch)) = view.read_with(vcx, |v, _| (v.bounds.unwrap(), v.cell));
+        let over_url = bounds.origin + gpui::point(gpui::px(cw * 12.5), gpui::px(ch * 0.5));
+        let link = |vcx: &mut gpui::VisualTestContext| view.read_with(vcx, |v, _| v.link.clone());
+
+        vcx.update(|w, cx| w.focus(&view.read(cx).focus));
+        vcx.simulate_mouse_move(over_url, None, gpui::Modifiers::secondary_key());
+        let l = link(vcx).expect("⌘ over the URL marks it");
+        assert_eq!(
+            l.target,
+            Target::Url("https://github.com/o/r/pull/491".into())
+        );
+        assert_eq!(l.cols, 7..38, "the whole URL, not the period after it");
+        vcx.simulate_modifiers_change(gpui::Modifiers::none());
+        assert_eq!(link(vcx), None, "letting go of ⌘ unmarks it");
+    }
+
+    #[test]
+    fn indexed_palette_covers_all_256_without_panicking() {
+        // The 256-color resolver is hit per visible cell; make sure every index maps to a
+        // concrete RGB across the three regions (16 ANSI / 216 cube / 24 grayscale) with no
+        // arithmetic panic (the cube/ramp math casts u8s).
+        for i in 0u8..=255 {
+            let _ = default_indexed(i);
+        }
+        // Cube corners: index 16 = origin (black), 231 = white max.
+        assert_eq!(default_indexed(16), Rgb { r: 0, g: 0, b: 0 });
+        assert_eq!(
+            default_indexed(231),
+            Rgb {
+                r: 255,
+                g: 255,
+                b: 255
+            }
+        );
+        // Grayscale ramp is monotonic.
+        assert!(default_indexed(232).r < default_indexed(255).r);
+    }
+
+    /// Perf guard: find re-scans the whole
+    /// buffer per keystroke / step, so a full 10k-line scrollback must scan fast. Also pins the
+    /// query being literal (`a.b` isn't a regex) and smart-case (lowercase = any case).
+    #[test]
+    fn perf_find_scans_full_scrollback() {
+        let mut term = Term::new(
+            Config::default(),
+            &TermSize::new(120, 40),
+            alacritty_terminal::event::VoidListener,
+        );
+        let mut parser: alacritty_terminal::vte::ansi::Processor =
+            alacritty_terminal::vte::ansi::Processor::new();
+        let mut out = String::new();
+        for i in 0..10_000 {
+            let tag = if i % 2 == 0 { "a.b" } else { "AxB" };
+            out.push_str(&format!(
+                "line {i} {tag} the quick brown fox jumps over\r\n"
+            ));
+        }
+        parser.advance(&mut term, out.as_bytes());
+        let count = |q: &str, term: &Term<_>| {
+            let mut re = RegexSearch::new(&literal_regex(q)).unwrap();
+            scan_all(term, &mut re).len()
+        };
+        let t0 = Instant::now();
+        let fox = count("fox", &term);
+        let took = t0.elapsed();
+        // 10k written, minus the lines scrolled past the 10k-line history cap.
+        assert!(fox > 9_900, "{fox}");
+        assert!(
+            took < Duration::from_secs(2),
+            "full-buffer find took {took:?}"
+        );
+        assert_eq!(count("a.b", &term), fox / 2 + fox % 2, "a.b is literal");
+        assert_eq!(count("axb", &term), fox / 2, "lowercase matches AxB");
+        assert_eq!(count("AXB", &term), 0, "uppercase is case-sensitive");
+    }
+
+    /// A find's current match follows output up the scrollback, and is gone once the
+    /// scrollback is cleared — even from a scrolled-back view, whose offset drops with it.
+    #[test]
+    fn find_match_follows_output_and_goes_with_a_clear() {
+        let mut term = Term::new(
+            Config::default(),
+            &TermSize::new(40, 5),
+            alacritty_terminal::event::VoidListener,
+        );
+        let mut parser: alacritty_terminal::vte::ansi::Processor =
+            alacritty_terminal::vte::ansi::Processor::new();
+        let mut re = RegexSearch::new(&literal_regex("needle")).unwrap();
+        parser.advance(&mut term, b"needle\r\n");
+        let m = scan_all(&term, &mut re).remove(0);
+        let cur = (m, term.grid().history_size(), 0);
+        parser.advance(&mut term, b"1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n");
+        let now = shifted(&term, &cur).unwrap();
+        assert_eq!(now, scan_all(&term, &mut re)[0]);
+        term.scroll_display(Scroll::Delta(3));
+        let cur = (now, term.grid().history_size(), 3);
+        // What `clear` sends.
+        parser.advance(&mut term, b"\x1b[H\x1b[2J\x1b[3J");
+        assert_eq!(shifted(&term, &cur), None);
+    }
+
+    /// A headless terminal that has been sent `bytes`.
+    fn term_with(
+        cols: usize,
+        rows: usize,
+        bytes: &[u8],
+    ) -> Term<alacritty_terminal::event::VoidListener> {
+        let mut term = Term::new(
+            Config::default(),
+            &TermSize::new(cols, rows),
+            alacritty_terminal::event::VoidListener,
+        );
+        let mut parser: alacritty_terminal::vte::ansi::Processor =
+            alacritty_terminal::vte::ansi::Processor::new();
+        parser.advance(&mut term, bytes);
+        term
+    }
+
+    #[test]
+    fn link_in_finds_urls_and_file_paths_under_the_column() {
+        let at = |line: &str, col| link_in(&line.chars().collect::<Vec<_>>(), col);
+        let url = |u: &str| Target::Url(u.to_string());
+        let file = |p: &str, line| Target::File {
+            path: PathBuf::from(p),
+            line,
+        };
+        let line = "see https://example.com/path. and clang++ next";
+        // Inside the URL → it and its span, the trailing period left out.
+        assert_eq!(at(line, 10), Some((4..28, url("https://example.com/path"))));
+        assert_eq!(at(line, 0), None);
+        assert_eq!(at(line, 35), None);
+        // Markdown's brackets around a URL aren't part of it.
+        assert_eq!(
+            at("(https://x.com/a).", 3),
+            Some((1..16, url("https://x.com/a")))
+        );
+        // An absolute path, with the line and column included.
+        assert_eq!(
+            at("edit /Users/k/src/main.rs:42:7, then", 8),
+            Some((5..30, file("/Users/k/src/main.rs", Some(42))))
+        );
+        // Inside a tool call's brackets.
+        assert_eq!(
+            at("Read(/tmp/a/b.rs)", 7),
+            Some((5..16, file("/tmp/a/b.rs", None)))
+        );
+        // A slash command or a lone root dir isn't a path; nor is a relative one.
+        assert_eq!(at("run /compact now", 6), None);
+        assert_eq!(at("and/or src/a.rs", 9), None);
+        // `~/` is home.
+        if let Some(home) = std::env::var_os("HOME").or_else(|| {
+            if cfg!(windows) {
+                std::env::var_os("USERPROFILE")
+            } else {
+                None
+            }
+        }) {
+            assert_eq!(
+                at("sh ~/x.sh", 4).map(|(_, t)| t),
+                Some(Target::File {
+                    path: PathBuf::from(home).join("x.sh"),
+                    line: None
+                })
+            );
+        }
+    }
+
+    /// Every drawn row with a `/` is scanned for links each frame (see `prepaint`); a
+    /// screenful of long link-heavy rows must stay cheap. Loose budget on purpose — see
+    /// Performance regression tests.
+    #[test]
+    fn perf_link_spans() {
+        let row: Vec<char> = "see https://x.com/o/r/pull/491, (/Users/k/src/a.rs:42). a/b "
+            .repeat(8)
+            .chars()
+            .collect();
+        let t0 = Instant::now();
+        let mut n = 0;
+        for _ in 0..10_000 {
+            n += link_spans(&row).count();
+        }
+        let took = t0.elapsed();
+        assert_eq!(n, 160_000);
+        assert!(took < Duration::from_secs(2), "link scan took {took:?}");
+    }
+
+    fn dropped(ps: &[&str]) -> String {
+        shell_quoted(&ps.iter().map(PathBuf::from).collect::<Vec<_>>())
+    }
+
+    /// A name the tty or line editor would act on types nothing, on every OS: Ctrl-C then a
+    /// command and CR, and an early end of bracketed paste (ESC and C1 CSI forms).
+    #[test]
+    fn dropped_paths_with_control_chars_type_nothing() {
+        let crafted = [
+            "/tmp/a\x03cmd\r.png",
+            "/tmp/b\x1b[201~.png",
+            "/tmp/c\u{9b}201~.png",
+        ];
+        assert_eq!(dropped(&crafted), "");
+        let mixed = dropped(&["/tmp/a.png", crafted[0], crafted[1], "/tmp/b.png"]);
+        assert!(!mixed.contains(char::is_control), "{mixed:?}");
+        assert!(
+            mixed.contains("a.png") && mixed.contains("b.png"),
+            "{mixed:?}"
+        );
+    }
+
+    /// A non-UTF-8 name types nothing (a lossy copy would point at no file).
+    #[cfg(unix)]
+    #[test]
+    fn dropped_non_utf8_path_types_nothing() {
+        use std::os::unix::ffi::OsStrExt;
+        let latin1 = PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/caf\xe9.png"));
+        assert_eq!(shell_quoted(&[latin1]), "");
+    }
+
+    /// Dropped paths are typed in as one shell word each, whatever printable characters they hold.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn dropped_paths_are_single_quoted_shell_words() {
+        assert_eq!(dropped(&[]), "");
+        assert_eq!(dropped(&["/tmp/shot.png"]), "'/tmp/shot.png' ");
+        assert_eq!(
+            dropped(&["/tmp/My Shots/a b.png"]),
+            "'/tmp/My Shots/a b.png' "
+        );
+        assert_eq!(dropped(&["/tmp/it's.png"]), r"'/tmp/it'\''s.png' ");
+        assert_eq!(dropped(&["/tmp/café 日本.png"]), "'/tmp/café 日本.png' ");
+        assert_eq!(dropped(&[r"/tmp/a\b"]), r"'/tmp/a'\\'b' ");
+        let all = [
+            "/a",
+            "/My Shots/b c.png",
+            "/it's",
+            "/\"$HOME\" `x` \\y",
+            "/café 日本.png",
+            // Would end fish's quote early: a trailing `\`, and `\` before a `'`.
+            "/ends\\",
+            "/b\\'; echo pwned; echo \\",
+        ];
+        // A POSIX shell, and fish where installed (CI's Linux job has it), reads each back as
+        // exactly the path, nothing expanded or run.
+        #[cfg(unix)]
+        for shell in ["sh", "fish"] {
+            let Ok(out) = std::process::Command::new(shell)
+                .arg("-c")
+                .arg(format!("printf '%s\\n' {}", dropped(&all)))
+                .output()
+            else {
+                assert_ne!(shell, "sh", "sh is always there");
+                continue;
+            };
+            assert_eq!(
+                String::from_utf8(out.stdout).unwrap(),
+                all.join("\n") + "\n",
+                "{shell}"
+            );
+        }
+    }
+
+    /// cmd.exe doesn't quote with `'`, so on Windows each path is double-quoted.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn dropped_paths_are_double_quoted_on_windows() {
+        assert_eq!(dropped(&[]), "");
+        assert_eq!(dropped(&[r"C:\shot.png"]), "\"C:\\shot.png\" ");
+        assert_eq!(
+            dropped(&[r"C:\My Shots\it's.png", r"C:\café 日本.png"]),
+            "\"C:\\My Shots\\it's.png\" \"C:\\café 日本.png\" "
+        );
+    }
+
+    #[test]
+    fn named_foreground_uses_caller_default() {
+        let colors = alacritty_terminal::term::color::Colors::default();
+        let def: Hsla = gpui::rgb(0x123456).into();
+        assert_eq!(
+            resolve(
+                AnsiColor::Named(NamedColor::Foreground),
+                def,
+                &colors,
+                &ANSI_PALETTE
+            ),
+            def
+        );
+        // Default background resolves to None (not painted).
+        assert!(resolve_opt(
+            AnsiColor::Named(NamedColor::Background),
+            &colors,
+            &ANSI_PALETTE
+        )
+        .is_none());
+    }
+
+    /// Terminal = FerriteMCU (no look set): exactly the theme's colours and FerriteMCU's own palette, as
+    /// the terminal drew before the Terminal choice existed.
+    #[test]
+    fn ferritemcus_terminal_keeps_the_themes_colours() {
+        for (_, t) in theme::Theme::presets() {
+            let c = TermColors::of(&t, &theme::TerminalLook::default());
+            let hsla = |c: ferritemcu_color::Color| -> Hsla { c.into() };
+            assert_eq!(c.fg, hsla(t.text));
+            assert_eq!(c.bg, hsla(t.main_bg));
+            assert_eq!(c.cursor, hsla(t.primary));
+            assert_eq!(c.ansi, ANSI_PALETTE);
+            assert_eq!((c.bold, c.cursor_text), (None, None));
+        }
+    }
+
+    /// Your terminal: black, silver text and the VGA palette, the cursor still FerriteMCU's; named
+    /// and indexed colours both take the look's palette, the cube above 15 stays standard.
+    #[test]
+    fn your_terminal_draws_with_its_own_colours() {
+        let rgb = |hex: u32| ferritemcu_color::Color::rgb(hex);
+        let vga = [
+            0x000000, 0x800000, 0x008000, 0x808000, 0x000080, 0x800080, 0x008080, 0xC0C0C0,
+            0x808080, 0xFF0000, 0x00FF00, 0xFFFF00, 0x0000FF, 0xFF00FF, 0x00FFFF, 0xFFFFFF,
+        ];
+        let look = theme::TerminalLook {
+            background: Some(rgb(0x000000)),
+            foreground: Some(rgb(0xC0C0C0)),
+            ansi: vga.map(|c| Some(rgb(c))),
+            ..theme::TerminalLook::default()
+        };
+        let t = theme::Theme::default();
+        let c = TermColors::of(&t, &look);
+        assert_eq!(c.bg, gpui::rgb(0x000000).into());
+        assert_eq!(c.fg, gpui::rgb(0xC0C0C0).into());
+        assert_eq!(c.cursor, Hsla::from(t.primary));
+        let colors = alacritty_terminal::term::color::Colors::default();
+        let default = c.fg;
+        assert_eq!(
+            resolve(
+                AnsiColor::Named(NamedColor::Blue),
+                default,
+                &colors,
+                &c.ansi
+            ),
+            gpui::rgb(0x000080).into()
+        );
+        assert_eq!(
+            resolve(AnsiColor::Indexed(9), default, &colors, &c.ansi),
+            gpui::rgb(0xFF0000).into()
+        );
+        assert_eq!(
+            resolve(AnsiColor::Indexed(16), default, &colors, &c.ansi),
+            rgb_to_hsla(default_indexed(16))
+        );
+        // A slot the look leaves unset keeps FerriteMCU's.
+        let partial = theme::TerminalLook {
+            ansi: [None; 16],
+            ..look
+        };
+        assert_eq!(TermColors::of(&t, &partial).ansi, ANSI_PALETTE);
+    }
+
+    #[test]
+    fn key_bytes_translates_named_keys_and_control() {
+        // Backspace = DEL (0x7f) — the byte a Unix shell expects (the thing the user hit).
+        assert_eq!(key_bytes("backspace", false, None), Some(vec![0x7f]));
+        assert_eq!(key_bytes("enter", false, None), Some(b"\r".to_vec()));
+        assert_eq!(key_bytes("tab", false, None), Some(b"\t".to_vec()));
+        assert_eq!(key_bytes("escape", false, None), Some(vec![0x1b]));
+        // Arrows = CSI sequences (Up/Down drive shell history).
+        assert_eq!(key_bytes("up", false, None), Some(b"\x1b[A".to_vec()));
+        assert_eq!(key_bytes("down", false, None), Some(b"\x1b[B".to_vec()));
+        assert_eq!(key_bytes("left", false, None), Some(b"\x1b[D".to_vec()));
+        assert_eq!(key_bytes("right", false, None), Some(b"\x1b[C".to_vec()));
+        // Ctrl-C = 0x03 (SIGINT), Ctrl-D = 0x04 (EOF → shell exits → tab closes), Ctrl-A = 0x01.
+        assert_eq!(key_bytes("c", true, Some("c")), Some(vec![0x03]));
+        assert_eq!(key_bytes("d", true, Some("d")), Some(vec![0x04]));
+        assert_eq!(key_bytes("a", true, Some("a")), Some(vec![0x01]));
+        // Plain typed char falls through to key_char; an unknown key with no char → None.
+        assert_eq!(key_bytes("a", false, Some("a")), Some(b"a".to_vec()));
+        assert_eq!(key_bytes("f5", false, None), None);
+    }
+}

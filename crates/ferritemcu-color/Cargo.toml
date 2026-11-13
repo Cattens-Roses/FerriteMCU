@@ -1,0 +1,18 @@
+[package]
+name = "ferritemcu-color"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Tiny RGBA colour value shared by FerriteMCU's pure model crates. No deps; optional gpui conversions behind the `gpui` feature."
+
+[dependencies]
+# Only pulled when a UI consumer opts in (the binary + ferritemcu-ui). Pure consumers
+# (ferritemcu-theme/ferritemcu-syntax built standalone) stay gpui-free.
+gpui = { workspace = true, optional = true }
+
+[features]
+gpui = ["dep:gpui"]
+
+[lints]
+workspace = true

@@ -1,0 +1,1580 @@
+//! Browse (code) view — file tree, editor pane, markdown preview, font preview, and the
+//! open-file / preview-tab logic. Crate-root child module.
+
+use crate::*;
+use futures::StreamExt;
+
+impl FerriteMCU {
+    fn completion_insert_text(item: &serde_json::Value, label: &str) -> String {
+        let raw = item["textEdit"]["newText"]
+            .as_str()
+            .or_else(|| item["insertText"].as_str())
+            .unwrap_or(label);
+        if item["insertTextFormat"].as_u64() != Some(2) {
+            return raw.to_owned();
+        }
+        let mut output = String::with_capacity(raw.len());
+        let mut chars = raw.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch != '$' {
+                output.push(ch);
+                continue;
+            }
+            if chars.peek() == Some(&'{') {
+                chars.next();
+                while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                    chars.next();
+                }
+                if chars.peek() == Some(&':') {
+                    chars.next();
+                    let mut depth = 0usize;
+                    while let Some(c) = chars.next() {
+                        match c {
+                            '{' => {
+                                depth += 1;
+                                output.push(c);
+                            }
+                            '}' if depth == 0 => break,
+                            '}' => {
+                                depth -= 1;
+                                output.push(c);
+                            }
+                            _ => output.push(c),
+                        }
+                    }
+                } else {
+                    for c in chars.by_ref() {
+                        if c == '}' {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                    chars.next();
+                }
+            }
+        }
+        output
+    }
+
+    pub(crate) fn request_lsp(&mut self, method: lsp::RequestMethod, offset: usize) {
+        let (Some(rel), Some(client)) = (
+            self.browse.lsp_active.clone(),
+            self.browse.lsp_client.clone(),
+        ) else {
+            return;
+        };
+        let Some(doc) = self.browse.lsp_documents.get_mut(&rel) else {
+            return;
+        };
+        if !doc.open {
+            return;
+        }
+        let position = ferritemcu_lsp::byte_to_utf16_position(
+            &doc.last_synced_text,
+            offset.min(doc.last_synced_text.len()),
+        )
+        .unwrap_or_default();
+        let uri = match ferritemcu_lsp::path_to_uri(&doc.path) {
+            Ok(uri) => uri,
+            Err(_) => return,
+        };
+        let params = match method {
+            lsp::RequestMethod::Formatting => {
+                serde_json::json!({"textDocument":{"uri":uri},"options":{"tabSize":4,"insertSpaces":true}})
+            }
+            _ => {
+                serde_json::json!({"textDocument":{"uri":uri},"position":{"line":position.0,"character":position.1},"context":{"triggerKind":1}})
+            }
+        };
+        let id = client.request(doc.path.clone(), doc.version, method, params);
+        doc.latest_requests.insert(method, id);
+    }
+
+    pub(crate) fn lsp_close_active(&mut self, cx: &mut Context<Self>) {
+        if let Some(path) = self.browse.lsp_active.take() {
+            if let Some(doc) = self.browse.lsp_documents.get_mut(&path) {
+                if doc.open {
+                    if let Some(client) = &self.browse.lsp_client {
+                        client.close(doc.path.clone());
+                    }
+                    doc.open = false;
+                    doc.diagnostics.clear();
+                    doc.latest_requests.clear();
+                }
+            }
+            self.browse.editor.update(cx, |e, cx| {
+                e.set_lsp_diagnostics(Vec::new(), Vec::new(), cx)
+            });
+        }
+    }
+
+    pub(crate) fn stop_lsp_project(&mut self, cx: &mut Context<Self>) {
+        self.lsp_close_active(cx);
+        if let Some(client) = self.browse.lsp_client.take() {
+            client.stop();
+        }
+        self.browse.lsp_root = None;
+        self.browse.lsp_documents.clear();
+        self.browse.lsp_status = lsp::Status::Off;
+    }
+
+    fn set_lsp_document(&mut self, rel: &PathBuf, text: &str, cx: &mut Context<Self>) {
+        let rust_enabled = self.rust_analyzer_enabled
+            && self.plugins.is_installed("rust")
+            && highlight::Lang::from_path(rel) == highlight::Lang::Rust;
+        let full_path = if rel.is_absolute() {
+            rel.clone()
+        } else {
+            let Some(root) = self.repo_root.as_ref() else {
+                self.lsp_close_active(cx);
+                self.browse.lsp_status = lsp::Status::Off;
+                return;
+            };
+            root.join(rel)
+        };
+        let Some(root) = rust_enabled
+            .then(|| ferritemcu_lsp::cargo_root(&full_path))
+            .flatten()
+        else {
+            self.lsp_close_active(cx);
+            self.browse.lsp_status = lsp::Status::Off;
+            return;
+        };
+        if self.browse.lsp_active.as_ref() == Some(rel) {
+            if let Some(doc) = self.browse.lsp_documents.get_mut(rel) {
+                if doc.last_synced_text != text {
+                    doc.version = doc.version.saturating_add(1);
+                    doc.last_synced_text = text.to_owned();
+                    if let Some(client) = &self.browse.lsp_client {
+                        client.change(doc.path.clone(), text.to_owned(), doc.version);
+                    }
+                }
+            }
+            return;
+        }
+        self.lsp_close_active(cx);
+        if self.browse.lsp_root.as_ref() != Some(&root) {
+            if let Some(client) = self.browse.lsp_client.take() {
+                client.stop();
+            }
+            self.browse.lsp_documents.clear();
+            self.browse.lsp_root = Some(root.clone());
+            self.browse.lsp_status = lsp::Status::Starting;
+            let (event_tx, mut event_rx) = futures::channel::mpsc::unbounded();
+            self.browse.lsp_client = Some(lsp::Client::start(root.clone(), event_tx));
+            cx.spawn(async move |this, cx| {
+                while let Some(event) = event_rx.next().await {
+                    let alive = this
+                        .update(cx, |app, cx| match event {
+                            lsp::Event::Status { root, status } => {
+                                if app.browse.lsp_root.as_ref() == Some(&root) {
+                                    app.browse.lsp_status = status;
+                                    cx.notify();
+                                }
+                            }
+                            lsp::Event::Diagnostics {
+                                path,
+                                version,
+                                items,
+                            } => {
+                                let Some(doc) = app.browse.lsp_documents.get_mut(&path) else {
+                                    return;
+                                };
+                                if version != Some(doc.version) {
+                                    return;
+                                }
+                                doc.diagnostics = items;
+                                if app.browse.lsp_active.as_ref() == Some(&path) {
+                                    let text = &doc.last_synced_text;
+                                    let mapped: Vec<_> = doc
+                                        .diagnostics
+                                        .iter()
+                                        .filter_map(|d| {
+                                            let start = ferritemcu_lsp::utf16_position_to_byte(
+                                                text, d.range.0, d.range.1,
+                                            )?;
+                                            let end = ferritemcu_lsp::utf16_position_to_byte(
+                                                text, d.range.2, d.range.3,
+                                            )?;
+                                            let range = start
+                                                ..end.max(start.saturating_add(1)).min(text.len());
+                                            (!range.is_empty())
+                                                .then(|| (range, d.message.clone(), d.severity))
+                                        })
+                                        .collect();
+                                    let ranges = mapped.iter().map(|(r, _, _)| r.clone()).collect();
+                                    let messages =
+                                        mapped.into_iter().map(|(r, m, _)| (r, m)).collect();
+                                    app.browse.editor.update(cx, |e, cx| {
+                                        e.set_lsp_diagnostics(ranges, messages, cx)
+                                    });
+                                }
+                            }
+                            lsp::Event::RequestResult {
+                                id,
+                                path,
+                                version,
+                                method,
+                                result,
+                                error,
+                            } => {
+                                let Some((rel, doc)) = app
+                                    .browse
+                                    .lsp_documents
+                                    .iter()
+                                    .find(|(_, d)| d.path == path)
+                                else {
+                                    return;
+                                };
+                                if doc.version != version
+                                    || doc.latest_requests.get(&method) != Some(&id)
+                                    || app.browse.lsp_active.as_ref() != Some(rel)
+                                {
+                                    return;
+                                }
+                                let text = doc.last_synced_text.clone();
+                                if let Some(message) = error {
+                                    app.browse.lsp_status = lsp::Status::Error(format!(
+                                        "rust-analyzer request failed: {message}"
+                                    ));
+                                    cx.notify();
+                                    return;
+                                }
+                                match method {
+                                    lsp::RequestMethod::Completion => {
+                                        let items = result
+                                            .as_array()
+                                            .cloned()
+                                            .or_else(|| result["items"].as_array().cloned())
+                                            .unwrap_or_default()
+                                            .into_iter()
+                                            .filter_map(|item| {
+                                                let label = item["label"].as_str()?.to_owned();
+                                                let detail = item["detail"]
+                                                    .as_str()
+                                                    .unwrap_or("")
+                                                    .to_owned();
+                                                let insert =
+                                                    Self::completion_insert_text(&item, &label);
+                                                let range = item["textEdit"]["range"]
+                                                    .as_object()
+                                                    .map(|r| {
+                                                        let start = &r["start"];
+                                                        let end = &r["end"];
+                                                        let a =
+                                                            ferritemcu_lsp::utf16_position_to_byte(
+                                                                &text,
+                                                                start["line"].as_u64()? as u32,
+                                                                start["character"].as_u64()? as u32,
+                                                            )?;
+                                                        let b =
+                                                            ferritemcu_lsp::utf16_position_to_byte(
+                                                                &text,
+                                                                end["line"].as_u64()? as u32,
+                                                                end["character"].as_u64()? as u32,
+                                                            )?;
+                                                        Some(a..b)
+                                                    })
+                                                    .and_then(|x| x)
+                                                    .unwrap_or_else(|| {
+                                                        let caret = app
+                                                            .browse
+                                                            .editor
+                                                            .read(cx)
+                                                            .selection()
+                                                            .end
+                                                            .min(text.len());
+                                                        let start = text[..caret]
+                                                            .char_indices()
+                                                            .rev()
+                                                            .take_while(|(_, c)| {
+                                                                c.is_alphanumeric() || *c == '_'
+                                                            })
+                                                            .last()
+                                                            .map(|(i, _)| i)
+                                                            .unwrap_or(caret);
+                                                        start..caret
+                                                    });
+                                                Some((label, detail, insert, range))
+                                            })
+                                            .collect();
+                                        app.browse
+                                            .editor
+                                            .update(cx, |e, cx| e.set_lsp_completions(items, cx));
+                                    }
+                                    lsp::RequestMethod::Hover => {
+                                        let contents = &result["contents"];
+                                        let hover = contents
+                                            .as_str()
+                                            .map(str::to_owned)
+                                            .or_else(|| {
+                                                contents["value"].as_str().map(str::to_owned)
+                                            })
+                                            .or_else(|| {
+                                                contents.as_array().map(|parts| {
+                                                    parts
+                                                        .iter()
+                                                        .filter_map(|p| {
+                                                            p.as_str()
+                                                                .or_else(|| p["value"].as_str())
+                                                        })
+                                                        .collect::<Vec<_>>()
+                                                        .join("\n")
+                                                })
+                                            })
+                                            .filter(|s| !s.is_empty());
+                                        app.browse
+                                            .editor
+                                            .update(cx, |e, cx| e.set_lsp_hover(hover, cx));
+                                    }
+                                    lsp::RequestMethod::Definition => {
+                                        let location = result
+                                            .as_array()
+                                            .and_then(|a| a.first())
+                                            .unwrap_or(&result);
+                                        let uri = location["uri"]
+                                            .as_str()
+                                            .or_else(|| location["targetUri"].as_str());
+                                        if let Some(uri) =
+                                            uri.and_then(|u| ferritemcu_lsp::uri_to_path(u).ok())
+                                        {
+                                            let range = location
+                                                .get("range")
+                                                .or_else(|| location.get("targetSelectionRange"))
+                                                .unwrap_or(&serde_json::Value::Null);
+                                            let start = &range["start"];
+                                            let line = start["line"].as_u64().unwrap_or(0) as u32;
+                                            let character =
+                                                start["character"].as_u64().unwrap_or(0) as u32;
+                                            let target_rel =
+                                                app.repo_root.as_ref().and_then(|root| {
+                                                    uri.strip_prefix(root).ok().map(PathBuf::from)
+                                                });
+                                            if let Some(target_rel) = target_rel {
+                                                app.open_file(target_rel, cx);
+                                                let target_text =
+                                                    app.browse.editor.read(cx).text().to_owned();
+                                                let offset =
+                                                    ferritemcu_lsp::utf16_position_to_byte(
+                                                        &target_text,
+                                                        line,
+                                                        character,
+                                                    )
+                                                    .unwrap_or(0);
+                                                app.browse.editor.update(cx, |e, cx| {
+                                                    e.select_range(offset..offset + 1, cx)
+                                                });
+                                            } else if uri == path {
+                                                let offset =
+                                                    ferritemcu_lsp::utf16_position_to_byte(
+                                                        &text, line, character,
+                                                    )
+                                                    .unwrap_or(0);
+                                                app.browse.editor.update(cx, |e, cx| {
+                                                    e.select_range(offset..offset + 1, cx)
+                                                });
+                                            }
+                                        }
+                                    }
+                                    lsp::RequestMethod::Formatting => {
+                                        let edits: Vec<_> = result
+                                            .as_array()
+                                            .into_iter()
+                                            .flatten()
+                                            .filter_map(|edit| {
+                                                let r = &edit["range"];
+                                                let a = ferritemcu_lsp::utf16_position_to_byte(
+                                                    &text,
+                                                    r["start"]["line"].as_u64()? as u32,
+                                                    r["start"]["character"].as_u64()? as u32,
+                                                )?;
+                                                let b = ferritemcu_lsp::utf16_position_to_byte(
+                                                    &text,
+                                                    r["end"]["line"].as_u64()? as u32,
+                                                    r["end"]["character"].as_u64()? as u32,
+                                                )?;
+                                                Some((a..b, edit["newText"].as_str()?.to_owned()))
+                                            })
+                                            .collect();
+                                        app.browse
+                                            .editor
+                                            .update(cx, |e, cx| e.apply_text_edits(edits, cx));
+                                    }
+                                }
+                            }
+                        })
+                        .is_ok();
+                    if !alive {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        } else {
+            self.browse.lsp_status = lsp::Status::Indexing {
+                task: String::new(),
+                percentage: None,
+            };
+        }
+        let path = full_path;
+        let doc = self
+            .browse
+            .lsp_documents
+            .entry(rel.clone())
+            .or_insert_with(|| LspDocumentState {
+                path: path.clone(),
+                ..Default::default()
+            });
+        doc.path = path.clone();
+        doc.version = 1;
+        doc.last_synced_text = text.to_owned();
+        doc.open = true;
+        doc.diagnostics.clear();
+        if let Some(client) = &self.browse.lsp_client {
+            client.open(path, text.to_owned(), doc.version);
+        }
+        self.browse.lsp_active = Some(rel.clone());
+        self.browse.editor.update(cx, |e, cx| {
+            e.set_lsp_diagnostics(Vec::new(), Vec::new(), cx)
+        });
+    }
+
+    pub(crate) fn sync_lsp_change(&mut self, cx: &mut Context<Self>) {
+        let (Some(path), text) = (
+            self.browse.open_path.clone(),
+            self.browse.editor.read(cx).text().to_owned(),
+        ) else {
+            return;
+        };
+        self.set_lsp_document(&path, &text, cx);
+    }
+
+    /// The flattened Browse tree rows: the repo root, its expanded descendants (only when
+    /// the root is open), then a virtual "Scratches" folder + its files at the bottom.
+    /// Depths are offset by one so everything nests under the root row. The "Scratches"
+    /// sentinel path can't collide with a real file.
+    pub(crate) fn browse_visible_rows(&self) -> Vec<tree::Row> {
+        let mut visible = self.browse.tree.visible_with_root(&self.browse.expanded);
+        let scratch_group = scratch_group_path();
+        if !self.browse.scratches.is_empty() {
+            visible.push(tree::Row {
+                path: scratch_group.clone(),
+                is_dir: true,
+                depth: 0,
+            });
+            if self.browse.expanded.contains(&scratch_group) {
+                for s in &self.browse.scratches {
+                    visible.push(tree::Row {
+                        path: s.clone(),
+                        is_dir: false,
+                        depth: 1,
+                    });
+                }
+            }
+        }
+        visible
+    }
+
+    /// The Browse right-hand pane: the no-file shortcuts screen when no tab is open,
+    /// otherwise the tab bar + optional install/find banners + the editor area (inline
+    /// image preview, font view, code editor, or the editor | markdown-preview split).
+    fn render_editor_pane(
+        &mut self,
+        ui: &'static str,
+        fs: gpui::Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let right = if self.browse.open_tabs.is_empty() {
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .child(self.render_no_file(ui, cx))
+        } else {
+            let image = self.browse.open_path.clone().filter(|p| is_image(p));
+            let editor_area = if let Some(rel) = &image {
+                // Inline image preview, centered, scaled to fit the pane.
+                let abs = self
+                    .repo_root
+                    .as_ref()
+                    .map_or_else(|| rel.clone(), |r| r.join(rel));
+                div()
+                    .id("image-scroll")
+                    .overflow_scroll()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p_4()
+                    .child(img(abs).max_w_full().max_h_full())
+                    .into_any_element()
+            } else if self
+                .browse
+                .open_path
+                .as_ref()
+                .is_some_and(|p| is_font_file(p))
+            {
+                self.render_font_view(cx).into_any_element()
+            } else {
+                // One `overflow_scroll` div holds the editor inside an explicit-width wrapper
+                // (its content width), so long lines overflow the viewport and the horizontal
+                // scrollbar appears; `min_h_full` keeps the click target covering short files.
+                // `with_scrollbars` sizes this div to the pane — keep it the direct parent of
+                // that wrapper (an extra level lets the content's min-width win, and a
+                // side-by-side pane like the markdown preview then refuses to shrink).
+                let content_w = self.browse.editor.read(cx).content_width();
+                let editor_pane = div()
+                    .id("editor-scroll")
+                    .overflow_scroll()
+                    .track_scroll(&self.browse.editor_scroll)
+                    // A click in the empty area below a short file forwards to the editor,
+                    // so the caret jumps to the last line (the editor consumes its own text
+                    // clicks via `stop_propagation`, so this only fires for the gap).
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, e: &gpui::MouseDownEvent, window, cx| {
+                            let fe = this.browse.editor.clone();
+                            fe.update(cx, |ed, cx| {
+                                ed.click_at(e.position, e.modifiers.shift, window, cx);
+                            });
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(content_w))
+                            .min_h_full()
+                            .child(self.browse.editor.clone()),
+                    );
+                let island_w = self.editor_island_w(window);
+                let editor = self.with_scrollbars(
+                    editor_pane,
+                    self.browse.editor_scroll.clone(),
+                    island_w,
+                    SbView::Editor,
+                    window,
+                    cx,
+                );
+                // Markdown + the markdown plugin installed → editor | live preview side by side.
+                let md = self
+                    .browse
+                    .open_path
+                    .as_ref()
+                    .is_some_and(|p| matches!(Lang::from_path(p), Lang::Markdown))
+                    && self.plugins.is_installed("markdown");
+                if md {
+                    let text = self.browse.editor.read(cx).text().to_string();
+                    // Two side-by-side panes, each with its own reusable scrollbars: the code
+                    // editor (left, `md_editor_w` wide, drag-resizable divider) and the rendered
+                    // preview (right, the remaining width). Each is wrapped in an explicit-width
+                    // container so the split keeps its proportions.
+                    let preview_w =
+                        (island_w - self.browse.md_editor_w - theme::FRAME_GAP).max(120.0);
+                    let code_pane = div()
+                        .id("md-editor-scroll")
+                        .overflow_scroll()
+                        .track_scroll(&self.browse.md_editor_scroll)
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(content_w))
+                                .min_h_full()
+                                .child(self.browse.editor.clone()),
+                        );
+                    // `flex flex_col` is load-bearing: the `with_scrollbars` output is `flex_1`,
+                    // which only resolves to the pane height when its parent is a flex column.
+                    // Without it the pane grew to content height → never overflowed → no thumb.
+                    let left = div()
+                        .flex()
+                        .flex_col()
+                        .flex_none()
+                        .w(px(self.browse.md_editor_w))
+                        .h_full()
+                        .min_h_0()
+                        .child(self.with_scrollbars(
+                            code_pane,
+                            self.browse.md_editor_scroll.clone(),
+                            self.browse.md_editor_w,
+                            SbView::MdEditor,
+                            window,
+                            cx,
+                        ));
+                    // Persistent selectable rendered-markdown view (keeps its text selection
+                    // across frames); re-parses only when the source actually changes.
+                    // Directory of the open markdown file, for resolving relative image paths.
+                    let base_dir = self.browse.open_path.as_ref().and_then(|p| {
+                        self.repo_root
+                            .as_ref()
+                            .map(|r| r.join(p))
+                            .and_then(|abs| abs.parent().map(std::path::Path::to_path_buf))
+                    });
+                    let mv = self
+                        .browse
+                        .md_view
+                        .get_or_insert_with(|| {
+                            cx.new(|cx| mdview::MarkdownView::new(&text, base_dir.clone(), cx))
+                        })
+                        .clone();
+                    mv.update(cx, |v, cx| v.set_text(&text, base_dir.clone(), cx));
+                    let preview_pane = div()
+                        .id("md-preview-scroll")
+                        .overflow_y_scroll()
+                        .track_scroll(&self.browse.md_preview_scroll)
+                        .child(mv);
+                    let right = div()
+                        .flex()
+                        .flex_col()
+                        .flex_none()
+                        .w(px(preview_w))
+                        .h_full()
+                        .min_h_0()
+                        .child(self.with_scrollbars(
+                            preview_pane,
+                            self.browse.md_preview_scroll.clone(),
+                            preview_w,
+                            SbView::MdPreview,
+                            window,
+                            cx,
+                        ));
+                    div()
+                        .id("md-split")
+                        .flex_1()
+                        .flex()
+                        .flex_row()
+                        .min_h_0()
+                        .child(left)
+                        .child(
+                            div()
+                                .id("md-divider")
+                                .w(px(theme::FRAME_GAP))
+                                .flex_none()
+                                .h_full()
+                                .cursor_col_resize()
+                                .bg(theme::get().divider)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, e: &gpui::MouseDownEvent, window, cx| {
+                                        this.start_divider_drag(
+                                            Divider::MdSplit,
+                                            e.position,
+                                            window,
+                                        );
+                                        cx.notify();
+                                    }),
+                                ),
+                        )
+                        .child(right)
+                        .into_any_element()
+                } else {
+                    editor
+                }
+            };
+            // Right-click in the editor pane: git commands (Commit / Rollback / Push)
+            // plus the buffer sort ops — Sort Lines when the selection spans ≥2 lines,
+            // Sort Object Keys when the click lands in a JSON/JS/TS object. Availability
+            // is computed HERE (menu-open), not in the render arm, so an open menu never
+            // re-parses the buffer per frame.
+            let menu_path = self.browse.open_path.clone();
+            // The find bar (⌘F) floats over the editor's top right — not over an image.
+            let find_bar = image
+                .is_none()
+                .then(|| self.find_bar(FindHost::Main, cx))
+                .flatten();
+            let editor_area = div()
+                .relative()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .child(editor_area)
+                .children(find_bar)
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, e: &gpui::MouseDownEvent, _w, cx| {
+                        if let Some(p) = menu_path.clone() {
+                            // Caret under the pointer first (kept if clicking inside the
+                            // selection), so the sort ops target what was clicked.
+                            this.browse
+                                .editor
+                                .update(cx, |ed, cx| ed.caret_to(e.position, cx));
+                            let (lines, keys) = {
+                                let ed = this.browse.editor.read(cx);
+                                let sel = ed.selection();
+                                let keys =
+                                    highlight::sort_object_keys(ed.text(), ed.lang, sel.clone())
+                                        .is_some();
+                                // Sort Lines also shows inside an object — there it
+                                // delegates to the key sort (issue #43).
+                                let lines =
+                                    keys || editor::sort_lines_in(ed.text(), sel.clone()).is_some();
+                                (lines, keys)
+                            };
+                            this.open_menu(e.position, MenuTarget::EditorGit(p, lines, keys), cx);
+                        }
+                    }),
+                );
+            let mut r = div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                // Without min_w_0 the wide editor content (long code lines) lets this column
+                // grow past the island, and the island's overflow_hidden then clips its right
+                // edge — which is exactly where the tab-bar's trailing controls live, so the
+                // `▾` overflow button vanished once tabs/content got wide.
+                .min_w_0()
+                .child(self.render_tab_bar(ui, fs, self.editor_island_w(window), cx));
+            // Install banner only applies to text/code files, not image previews.
+            if image.is_none() {
+                // Unresolved-conflict banner first — resolving beats installing a grammar.
+                if let Some(p) = self.open_file_conflict() {
+                    r = r.child(self.render_conflict_file_banner(p, ui, fs, cx));
+                }
+                if let (Some(pack), Some(path)) =
+                    (self.pending_pack(), self.browse.open_path.clone())
+                {
+                    r = r.child(self.render_install_banner(pack, &path, false, ui, fs, cx));
+                }
+            }
+            r.child(editor_area)
+        };
+        right.into_any_element()
+    }
+
+    pub(crate) fn render_browse(
+        &mut self,
+        ui: &'static str,
+        fs: gpui::Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        // Show the repo root as the top row; everything else nests one level under it,
+        // and collapsing the root hides the whole tree.
+        let root_name = self.project_name();
+        let visible = self.browse_visible_rows();
+        let scratch_group = scratch_group_path();
+        // O(1) status lookup per row (was `self.files.iter().find()` — O(changed) per row,
+        // i.e. O(rows×changed) for the whole tree on every frame).
+        let status_by_path: std::collections::HashMap<&PathBuf, FileStatus> =
+            self.files.iter().map(|f| (&f.path, f.status)).collect();
+        let rows: Vec<gpui::AnyElement> = visible
+            .into_iter()
+            .map(|r| {
+                let is_root = r.path.as_os_str().is_empty();
+                let name: SharedString = if is_root {
+                    root_name.clone().into()
+                } else if r.path == scratch_group {
+                    "Scratches".into()
+                } else {
+                    r.path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                        .into()
+                };
+                let expanded = self.browse.expanded.contains(&r.path);
+                let selected = self.browse.selected_path.as_ref() == Some(&r.path)
+                    || self.browse.multi_selected.contains(&r.path);
+                let (p_act, p_ctx) = (r.path.clone(), r.path.clone());
+                let is_dir = r.is_dir;
+                // Color changed files by their git status (modified/added/…), matching the
+                // commit view; unchanged files use the normal text color.
+                let name_color = (!is_dir)
+                    .then(|| status_by_path.get(&r.path))
+                    .flatten()
+                    .map_or(theme::get().text, |&s| status_color(s));
+                // Drag & drop (issue #65): every real repo file/folder is a drag source;
+                // real directories (incl. the repo-root row, path "") are drop targets that
+                // move the dropped path inside them. Scratch rows (absolute paths / the
+                // "Scratches" pseudo-group) are excluded — they live outside the project.
+                let is_scratch = r.path.is_absolute() || r.path == scratch_group;
+                let draggable = !is_root && !is_scratch;
+                let on_drop: Option<ui::tree::OnDrop<Self>> = (is_dir && !is_scratch).then(|| {
+                    let dest = r.path.clone();
+                    let f: ui::tree::OnDrop<Self> = Box::new(move |this: &mut Self, src, cx| {
+                        this.drop_onto_dir(src, dest.clone(), cx);
+                    });
+                    f
+                });
+                // Finder files dropped ON this row (issue #67): a folder takes them inside
+                // itself; a file takes them into its parent folder — so the highlighted row
+                // is exactly where they'll land.
+                let on_ext_drop: Option<ui::tree::OnExtDrop<Self>> = (!is_scratch).then(|| {
+                    let dest = if is_dir {
+                        r.path.clone()
+                    } else {
+                        r.path
+                            .parent()
+                            .map(std::path::Path::to_path_buf)
+                            .unwrap_or_default()
+                    };
+                    let f: ui::tree::OnExtDrop<Self> =
+                        Box::new(move |this: &mut Self, paths, cx| {
+                            this.drop_external_paths(paths, dest.clone(), cx);
+                        });
+                    f
+                });
+                ui::tree::item(
+                    cx,
+                    self.dragging(Divider::Tree),
+                    &r.path,
+                    is_dir,
+                    expanded,
+                    r.depth,
+                    selected,
+                    name,
+                    name_color,
+                    None,
+                    None,
+                    draggable,
+                    on_drop,
+                    on_ext_drop,
+                    move |this, e, window, cx| {
+                        // Cmd-click on a FILE toggles it in the multi-selection (for
+                        // "Compare Selected" — issue #42) without opening it. The
+                        // previously highlighted file seeds the set, so cmd-clicking a
+                        // second file selects the natural pair. (Ctrl-click off macOS.)
+                        if !is_dir && e.modifiers.secondary() {
+                            if let Some(i) =
+                                this.browse.multi_selected.iter().position(|p| p == &p_act)
+                            {
+                                this.browse.multi_selected.remove(i);
+                            } else {
+                                if this.browse.multi_selected.is_empty() {
+                                    if let Some(prev) =
+                                        this.browse.selected_path.clone().filter(|p| {
+                                            p != &p_act
+                                                && (this.browse.all_files.contains(p)
+                                                    || this.browse.scratches.contains(p))
+                                        })
+                                    {
+                                        this.browse.multi_selected.push(prev);
+                                    }
+                                }
+                                this.browse.multi_selected.push(p_act.clone());
+                            }
+                            this.browse.selected_path = Some(p_act.clone());
+                            cx.notify();
+                            return;
+                        }
+                        // Folders toggle expansion. Files (VS Code-style): single click opens in
+                        // the temporary *preview* tab (reused by the next single-click), double
+                        // click opens a permanent tab.
+                        this.browse.multi_selected.clear();
+                        this.browse.selected_path = Some(p_act.clone());
+                        // Focus the tree: the arrow keys walk it, and the "FerriteMCU"-context
+                        // Backspace (delete) / ⌘C / ⌘V bindings act on the selected row.
+                        window.focus(&this.browse.tree_focus);
+                        if is_dir {
+                            this.toggle_dir(p_act.clone(), cx);
+                        } else if e.click_count >= 2 {
+                            this.open_file(p_act.clone(), cx);
+                        } else {
+                            this.preview_file(p_act.clone(), cx);
+                        }
+                        cx.notify();
+                    },
+                    |_this, _cx| {},
+                    move |this, pos, cx| {
+                        this.open_menu(pos, MenuTarget::BrowseFile(p_ctx.clone(), is_dir), cx);
+                    },
+                )
+            })
+            .collect();
+        let t = theme::get();
+        // Header strip with a `−` minimize button at the top-right.
+        // Collapse button — absolutely positioned in the tree's top-right corner so it floats
+        // over the rows instead of consuming a whole header line.
+        let tree_minimize = ui::icon_btn("tree-minimize", 22.0)
+            .absolute()
+            .top(px(4.0))
+            // Clear the 12px scrollbar gutter on the right so the bar never sits under it.
+            .right(px(8.0))
+            .text_size(px(16.0))
+            .bg(t.panel_bg)
+            .tooltip(ui::tip("Collapse file tree"))
+            .child("−")
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _e, _w, cx| {
+                    this.browse.tree_collapsed = true;
+                    cx.notify();
+                }),
+            );
+        // Keyboard: arrows walk + fold, ⏎ opens, space previews, ⇧F10 menu (issue #81).
+        let tree = nav_keys(
+            div()
+                .id("browse-tree-pane")
+                .track_focus(&self.browse.tree_focus)
+                .key_context("NavList NavTree"),
+            NavTarget::BrowseTree,
+            cx,
+        )
+        .flex()
+        .flex_col()
+        .relative()
+        .w(px(self.browse.tree_width))
+        .flex_none()
+        .h_full()
+        .py_1()
+        .bg(t.panel_bg)
+        .rounded(px(theme::ISLAND_RADIUS))
+        .text_color(t.text)
+        .font_family(ui)
+        // A touch larger than the editor/code size for readability.
+        .text_size(px(theme::get().tree_font_size()))
+        // Catch-all for Finder files dropped on the tree's EMPTY area (below the rows):
+        // they go to the repo root. Drops onto a row are handled per-row (with that
+        // row highlighted) — see `on_ext_drop` above (issue #67). No pane-wide tint here,
+        // so the highlight only ever marks the specific target folder.
+        .on_drop(cx.listener(|this, ep: &gpui::ExternalPaths, _w, cx| {
+            this.drop_external_paths(ep.paths().to_vec(), PathBuf::new(), cx);
+        }))
+        .child({
+            let rows_pane = div()
+                .id("browse-tree")
+                .overflow_y_scroll()
+                .track_scroll(&self.browse.tree_scroll)
+                .flex()
+                .flex_col()
+                .children(rows);
+            self.with_scrollbars(
+                rows_pane,
+                self.browse.tree_scroll.clone(),
+                self.browse.tree_width,
+                SbView::Tree,
+                window,
+                cx,
+            )
+        })
+        .child(tree_minimize);
+        // Collapsed: a thin strip with an expand button where the tree was.
+        let collapsed_strip = ui::collapsed_strip().child(
+            ui::icon_btn("tree-expand", 24.0)
+                .text_size(px(15.0))
+                .tooltip(ui::tip("Expand file tree"))
+                .child("»")
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _e, _w, cx| {
+                        this.browse.tree_collapsed = false;
+                        cx.notify();
+                    }),
+                ),
+        );
+
+        // The frame-colored gap between the two islands doubles as the resize handle.
+        // No hover/active tint — just the resize cursor.
+        let divider = div()
+            .id("browse-divider")
+            .w(px(theme::FRAME_GAP))
+            .h_full()
+            .flex_none()
+            .cursor_col_resize()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, e: &gpui::MouseDownEvent, window, cx| {
+                    this.start_divider_drag(Divider::Tree, e.position, window);
+                    cx.notify();
+                }),
+            );
+
+        // No tabs open → show useful shortcuts instead of the empty editor.
+        let right = self.render_editor_pane(ui, fs, window, cx);
+
+        let editor_island = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            // `relative` so the floated tab-overflow button anchors to the island's right
+            // edge; `overflow_hidden` keeps it (and the tab strip) clipped to the island.
+            .bg(theme::get().main_bg)
+            .rounded(px(theme::ISLAND_RADIUS))
+            .overflow_hidden()
+            .child(right);
+
+        let mut row = div().flex().flex_row().flex_1();
+        row = if self.browse.tree_collapsed {
+            row.child(collapsed_strip)
+                .child(div().w(px(theme::FRAME_GAP)).flex_none().h_full())
+        } else {
+            row.child(tree).child(divider)
+        };
+        row.child(editor_island).into_any_element()
+    }
+
+    fn render_font_view(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let t = theme::get();
+        let base = div()
+            .id("font-view")
+            .overflow_y_scroll()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .bg(t.main_bg);
+        if !self.plugins.is_installed("font") {
+            return base
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .font_family(theme::font::ui_family())
+                .child(
+                    div()
+                        .text_color(t.text)
+                        .child("Install Font Preview support to view this file."),
+                )
+                .child(
+                    btn_primary("install-font", "Install Font Preview").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _e, _w, cx| this.install_pack("font", cx)),
+                    ),
+                );
+        }
+        let Some((_, family)) = self.font_preview.clone() else {
+            return base
+                .items_center()
+                .justify_center()
+                .font_family(theme::font::ui_family())
+                .child(
+                    div()
+                        .text_color(t.line_number)
+                        .child("Could not read this font file."),
+                );
+        };
+        let quote = "Me fail English? That's unpossible.";
+        let fam = family.clone();
+        let line = move |sz: f32| {
+            div()
+                .font_family(fam.clone())
+                .text_size(px(sz))
+                .text_color(t.text)
+                .child(quote)
+        };
+        base.p_6()
+            .gap_3()
+            .child(
+                div()
+                    .font_family(theme::font::ui_family())
+                    .text_color(t.line_number)
+                    .text_size(px(12.0))
+                    .child(family.clone()),
+            )
+            .child(line(13.0))
+            .child(line(18.0))
+            .child(line(24.0))
+            .child(line(32.0))
+            .child(line(48.0))
+            .child(
+                div()
+                    .font_family(family)
+                    .text_size(px(20.0))
+                    .text_color(t.secondary_text)
+                    .child("ABCDEFG abcdefg 0123456789 !?&@#"),
+            )
+    }
+
+    /// Expand/collapse a directory in the Browse tree.
+    pub(crate) fn toggle_dir(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        if !self.browse.expanded.remove(&dir) {
+            self.browse.expanded.insert(dir);
+        }
+        cx.notify();
+    }
+
+    /// "Select Opened File in Tree" (IntelliJ-style): switch to Browse, expand
+    /// every ancestor of the active file, select its row, and scroll it into
+    /// view. Falls back to the highlighted row if no file is open.
+    pub(crate) fn reveal_in_tree(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self
+            .browse
+            .open_path
+            .clone()
+            .or_else(|| self.browse.selected_path.clone())
+        else {
+            return;
+        };
+        self.mode = Mode::Browse;
+        // Expand every ancestor dir (incl. the root `""`) so the row is visible.
+        for anc in target.ancestors().skip(1) {
+            self.browse.expanded.insert(anc.to_path_buf());
+        }
+        self.browse.selected_path = Some(target.clone());
+        // Scroll its row (same flattened order render_browse uses) into view.
+        let idx = self
+            .browse_visible_rows()
+            .iter()
+            .position(|r| r.path == target);
+        if let Some(i) = idx {
+            self.browse.tree_scroll.scroll_to_item(i);
+        }
+        cx.notify();
+    }
+
+    /// Open `rel` as a permanent tab (double-click, finder, "Open", restore, …). If it was
+    /// the preview tab, it's promoted (the preview slot clears).
+    pub(crate) fn open_file(&mut self, rel: PathBuf, cx: &mut Context<Self>) {
+        self.open_file_inner(rel, false, cx);
+    }
+
+    /// Move keyboard focus into the Browse editor (so you can type immediately) — used right
+    /// after creating + opening a file. Focuses now and again via `window.defer`, since on
+    /// the first open the editor element isn't in the window tree yet (the name-prompt trick).
+    pub(crate) fn focus_editor(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = self.browse.editor.read(cx).focus_handle.clone();
+        window.focus(&handle);
+        window.defer(cx, move |window, _cx| window.focus(&handle));
+    }
+
+    /// Open `rel` as the VS Code-style *preview* (temporary) tab: a single-click in the tree.
+    /// Reuses the one preview slot — a subsequent single-click on a different file replaces it
+    /// in place rather than opening a new tab. Clicking a file that's already open as a
+    /// permanent tab just activates it (no demotion).
+    pub(crate) fn preview_file(&mut self, rel: PathBuf, cx: &mut Context<Self>) {
+        self.open_file_inner(rel, true, cx);
+    }
+
+    fn open_file_inner(&mut self, rel: PathBuf, preview: bool, cx: &mut Context<Self>) {
+        self.nav_record(&rel);
+        if self
+            .browse
+            .lsp_active
+            .as_ref()
+            .is_some_and(|active| active != &rel)
+        {
+            self.lsp_close_active(cx);
+        }
+        // Images preview via `img()` and font files preview in their own typeface (see
+        // render_browse) — don't load their binary bytes into the text editor.
+        if !is_image(&rel) && !is_font_file(&rel) {
+            // Scratch files live outside the repo (absolute paths) — read them straight
+            // from disk. Repo-relative files go through the repo's working tree when this is
+            // a git repo, else straight from disk under the project root (non-git Browse).
+            let content = if rel.is_absolute() {
+                std::fs::read_to_string(&rel).unwrap_or_default()
+            } else if let Some(repo) = self.repo() {
+                repo.working_content(&rel).ok().unwrap_or_default()
+            } else if let Some(root) = self.repo_root.as_ref() {
+                std::fs::read_to_string(root.join(&rel)).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            // Local history: baseline on first sight / "External change" when the disk
+            // moved under us — decided (and written) off the UI thread.
+            self.lh_note_open(&rel, &content, cx);
+            let lang = self.effective_lang(&rel);
+            let errs = self.errors_enabled_for(lang);
+            let links = self.links_enabled_for(lang);
+            self.set_lsp_document(&rel, &content, cx);
+            self.browse.editor.update(cx, |e, cx| {
+                e.line_numbers = true;
+                // Flags first so `set_content`'s recompute already parses (or
+                // skips) errors/links for the new file's toggles.
+                e.set_error_highlight(errs, cx);
+                e.set_link_navigation(links, cx);
+                e.set_content(content, lang, cx);
+            });
+            // New buffer → the previous file's imported-defs index is gone
+            // (set_content cleared it); force a fresh compute for this file.
+            self.browse.ext_defs_targets.clear();
+            self.refresh_external_defs(cx);
+            // Point the editor at whichever scroll container it renders in, so caret-follow
+            // and drag auto-scroll move the right one: the Markdown split uses
+            // `md_editor_scroll`, plain Browse uses `editor_scroll` (mirrors the `md` gate in
+            // render_browse).
+            let md = matches!(highlight::Lang::from_path(&rel), highlight::Lang::Markdown)
+                && self.plugins.is_installed("markdown");
+            let h = if md {
+                self.browse.md_editor_scroll.clone()
+            } else {
+                self.browse.editor_scroll.clone()
+            };
+            self.browse.editor.update(cx, |e, _| e.set_scroll_handle(h));
+        }
+        self.browse.selected_path = Some(rel.clone());
+        if self.browse.open_tabs.contains(&rel) {
+            // Already open. A permanent open promotes it out of the preview slot; a preview
+            // open of an already-permanent tab leaves its permanence alone (just activates).
+            if !preview && self.browse.preview_tab.as_ref() == Some(&rel) {
+                self.browse.preview_tab = None;
+            }
+        } else if preview {
+            // Reuse the single preview slot: replace its path in place if one exists, else
+            // append. The replaced file's tab vanishes — exactly one temporary tab at a time.
+            match self
+                .browse
+                .preview_tab
+                .take()
+                .and_then(|prev| self.browse.open_tabs.iter().position(|t| t == &prev))
+            {
+                Some(i) => self.browse.open_tabs[i] = rel.clone(),
+                None => self.browse.open_tabs.push(rel.clone()),
+            }
+            self.browse.preview_tab = Some(rel.clone());
+        } else {
+            self.browse.open_tabs.push(rel.clone());
+        }
+        self.browse.open_path = Some(rel);
+        // Scroll the (possibly off-screen) active tab into view on next paint.
+        if let Some(i) = self
+            .browse
+            .open_path
+            .as_ref()
+            .and_then(|p| self.browse.open_tabs.iter().position(|t| t == p))
+        {
+            self.browse.tab_scroll.scroll_to_item(i);
+            // Re-issue once shortly after: a scroll requested BEFORE the strip's
+            // first paint (session restore, burst opens) gets consumed by gpui
+            // against a zeroed container-bounds snapshot and lands at offset 0.
+            // By the retry the strip has painted, so the request applies for real.
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(60))
+                    .await;
+                this.update(cx, |k, cx| {
+                    let active = k
+                        .browse
+                        .open_path
+                        .as_ref()
+                        .and_then(|p| k.browse.open_tabs.iter().position(|t| t == p));
+                    if let Some(i) = active {
+                        k.browse.tab_scroll.scroll_to_item(i);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+        self.load_font_preview(cx);
+    }
+
+    /// If the open file is a font and the "font" plugin is installed, parse its family name
+    /// and register it with the text system so the preview pane can render it. Otherwise
+    /// clears the cached preview. Cheap + idempotent (skips re-registering the same path).
+    pub(crate) fn load_font_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(rel) = self.browse.open_path.clone().filter(|p| is_font_file(p)) else {
+            self.font_preview = None;
+            return;
+        };
+        if !self.plugins.is_installed("font") {
+            self.font_preview = None;
+            return;
+        }
+        if self.font_preview.as_ref().is_some_and(|(p, _)| *p == rel) {
+            return; // already loaded
+        }
+        let abs = self
+            .repo_root
+            .as_ref()
+            .map_or_else(|| rel.clone(), |r| r.join(&rel));
+        let Ok(bytes) = std::fs::read(&abs) else {
+            self.font_preview = None;
+            return;
+        };
+        let Some(family) = font_family_name(&bytes) else {
+            self.font_preview = None;
+            return;
+        };
+        // Register the face so `.font_family(family)` resolves to it (idempotent in gpui).
+        let _ = cx
+            .text_system()
+            .add_fonts(vec![std::borrow::Cow::Owned(bytes)]);
+        self.font_preview = Some((rel, SharedString::from(family)));
+    }
+
+    // ── sort ops (issues #43 / #41) ───────────────────────────────
+    /// Sort the Browse editor's selected lines alphabetically — but inside a
+    /// JSON/JS/TS object "sort lines" MEANS "sort this object's keys" (issue
+    /// #43): a textual line sort there would move entries without their commas
+    /// and break the syntax, so it delegates to the key sort. Undo-recorded via
+    /// `replace_range_text`; the sorted block stays selected. No-op outside
+    /// Browse, with no file open, or (textual path) under two selected lines.
+    pub(crate) fn sort_selected_lines(&mut self, cx: &mut Context<Self>) {
+        if self.mode != Mode::Browse || self.browse.open_path.is_none() {
+            return;
+        }
+        if self.object_sort(cx) {
+            return;
+        }
+        let Some((r, sorted)) = ({
+            let ed = self.browse.editor.read(cx);
+            editor::sort_lines_in(ed.text(), ed.selection())
+        }) else {
+            return;
+        };
+        if self.browse.editor.read(cx).text()[r.clone()] == sorted {
+            return; // already sorted — don't dirty the buffer
+        }
+        self.browse.editor.update(cx, |e, cx| {
+            let end = r.start + sorted.len();
+            e.replace_range_text(r.clone(), &sorted, cx);
+            e.select_range(r.start..end, cx);
+        });
+    }
+
+    /// Sort the keys of the JSON/JS/TS object at the Browse editor's caret,
+    /// recursively (see `ferritemcu_syntax::sort_object_keys`). Same guards + undo/
+    /// selection behavior as [`sort_selected_lines`](Self::sort_selected_lines).
+    pub(crate) fn sort_object_keys_at_caret(&mut self, cx: &mut Context<Self>) {
+        if self.mode != Mode::Browse || self.browse.open_path.is_none() {
+            return;
+        }
+        self.object_sort(cx);
+    }
+
+    /// Key-sort the object at the caret if there is one. Returns whether an
+    /// object was FOUND — found-but-already-sorted still counts, so
+    /// `sort_selected_lines` never falls back to a syntax-breaking textual sort
+    /// inside JSON/JS.
+    fn object_sort(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((r, text)) = ({
+            let ed = self.browse.editor.read(cx);
+            highlight::sort_object_keys(ed.text(), ed.lang, ed.selection())
+        }) else {
+            return false;
+        };
+        if self.browse.editor.read(cx).text()[r.clone()] != text {
+            self.browse.editor.update(cx, |e, cx| {
+                let end = r.start + text.len();
+                e.replace_range_text(r.clone(), &text, cx);
+                e.select_range(r.start..end, cx);
+            });
+        }
+        true
+    }
+
+    pub(crate) fn act_sort_lines(
+        &mut self,
+        _: &SortLines,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sort_selected_lines(cx);
+    }
+
+    pub(crate) fn act_sort_keys(
+        &mut self,
+        _: &SortKeys,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sort_object_keys_at_caret(cx);
+    }
+
+    // ── back/forward file navigation (⌘⌥← / ⌘⌥→) ─────────────────
+    /// Record a visit in the file-navigation history. Opening a new file after
+    /// going back discards the forward branch (the IDE convention); navigating
+    /// via back/forward itself records nothing (`nav_suppress`). Consecutive
+    /// duplicates collapse; capped at 100 entries.
+    fn nav_record(&mut self, rel: &PathBuf) {
+        if self.browse.nav_suppress {
+            return;
+        }
+        let h = &mut self.browse.nav_history;
+        if h.get(self.browse.nav_index) == Some(rel) {
+            return; // re-activating the current file (tab click) — no new entry
+        }
+        h.truncate(self.browse.nav_index.saturating_add(1).min(h.len()));
+        h.push(rel.clone());
+        if h.len() > 100 {
+            h.remove(0);
+        }
+        self.browse.nav_index = h.len() - 1;
+    }
+
+    /// ⌘⌥← — reopen the previously visited file (no-op at the start of history).
+    pub(crate) fn nav_back(&mut self, cx: &mut Context<Self>) {
+        if self.browse.nav_index == 0 {
+            return;
+        }
+        self.browse.nav_index -= 1;
+        self.nav_open_current(cx);
+    }
+
+    /// ⌘⌥→ — reopen the next file (no-op at the end of history).
+    pub(crate) fn nav_forward(&mut self, cx: &mut Context<Self>) {
+        if self.browse.nav_index + 1 >= self.browse.nav_history.len() {
+            return;
+        }
+        self.browse.nav_index += 1;
+        self.nav_open_current(cx);
+    }
+
+    /// Open the history entry at `nav_index` without recording a new visit.
+    /// A file deleted since it was visited just refreshes empty-ish via the
+    /// normal open path (never an error).
+    fn nav_open_current(&mut self, cx: &mut Context<Self>) {
+        let Some(rel) = self.browse.nav_history.get(self.browse.nav_index).cloned() else {
+            return;
+        };
+        self.mode = Mode::Browse;
+        self.browse.nav_suppress = true;
+        self.open_file(rel, cx);
+        self.browse.nav_suppress = false;
+        cx.notify();
+    }
+
+    pub(crate) fn act_nav_back(
+        &mut self,
+        _: &NavBack,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.nav_back(cx);
+    }
+
+    pub(crate) fn act_nav_forward(
+        &mut self,
+        _: &NavForward,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.nav_forward(cx);
+    }
+
+    // ── ⌘-click import navigation (issue #26) ─────────────────────
+    /// Resolve a ⌘-clicked import against the project's file list and open the
+    /// target file. Unresolvable specifiers (npm packages, external crates,
+    /// stdlib modules) are a silent no-op.
+    pub(crate) fn open_import_link(&mut self, link: highlight::ImportLink, cx: &mut Context<Self>) {
+        let Some(cur) = self.browse.open_path.clone() else {
+            return;
+        };
+        let lang = self.browse.editor.read(cx).lang;
+        if let Some(target) = highlight::resolve_import(&link, lang, &cur, &self.browse.all_files) {
+            self.open_file(target, cx);
+        }
+    }
+
+    /// ⌘-click on a symbol the external-defs index already resolved (a method
+    /// on an imported class): open the file and select the definition.
+    pub(crate) fn open_definition_at(
+        &mut self,
+        path: PathBuf,
+        range: std::ops::Range<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_file(path, cx);
+        self.browse
+            .editor
+            .update(cx, |e, cx| e.select_range(range, cx));
+    }
+
+    /// (Re)build the imported-files definition index for the open buffer —
+    /// resolves each import to a project file, reads + indexes those files'
+    /// definitions IN THE BACKGROUND, and pushes the map into the editor
+    /// (`set_external_defs`). Skips recomputing when the buffer's import
+    /// target set hasn't changed. This is what lets ⌘-click resolve
+    /// `obj.method()` when the method lives with an imported class.
+    pub(crate) fn refresh_external_defs(&mut self, cx: &mut Context<Self>) {
+        let Some(cur) = self.browse.open_path.clone() else {
+            return;
+        };
+        let lang = self.effective_lang(&cur);
+        if !self.links_enabled_for(lang) {
+            return;
+        }
+        let targets = self.browse.editor.read(cx).import_targets();
+        if targets == self.browse.ext_defs_targets {
+            return; // same imports → index still valid
+        }
+        self.browse.ext_defs_targets = targets;
+        self.browse.ext_defs_gen = self.browse.ext_defs_gen.wrapping_add(1);
+        let gen = self.browse.ext_defs_gen;
+        // Resolve on the UI thread (cheap, needs all_files); read + parse the
+        // handful of target files on a background thread. Files are read from
+        // disk via the project root — ferritemcu autosaves every edit, so disk is
+        // current.
+        let content = self.browse.editor.read(cx).text().to_string();
+        let files = self.browse.all_files.clone();
+        let root = self.repo_root.clone();
+        cx.spawn(async move |this, cx| {
+            let map = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut map: std::collections::HashMap<
+                        String,
+                        (PathBuf, std::ops::Range<usize>),
+                    > = std::collections::HashMap::new();
+                    let mut seen: std::collections::HashSet<PathBuf> =
+                        std::collections::HashSet::new();
+                    for link in highlight::import_links(&content, lang) {
+                        let Some(target) = highlight::resolve_import(&link, lang, &cur, &files)
+                        else {
+                            continue;
+                        };
+                        if !seen.insert(target.clone()) {
+                            continue;
+                        }
+                        let abs = match (&root, target.is_absolute()) {
+                            (_, true) => target.clone(),
+                            (Some(r), false) => r.join(&target),
+                            (None, false) => continue,
+                        };
+                        let Ok(text) = std::fs::read_to_string(&abs) else {
+                            continue;
+                        };
+                        // Index under the TARGET file's own language (same
+                        // grammar family in practice for TS/JS mixes).
+                        let tl = Lang::from_path(&target);
+                        for (name, r) in highlight::definition_sites(&text, tl) {
+                            // First definition wins (files in import order).
+                            map.entry(name).or_insert((target.clone(), r));
+                        }
+                    }
+                    map
+                })
+                .await;
+            this.update(cx, |k, cx| {
+                if k.browse.ext_defs_gen == gen {
+                    k.browse
+                        .editor
+                        .update(cx, |e, cx| e.set_external_defs(map, cx));
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// ⌘-click on a USE of an imported symbol: open the import's file (a new
+    /// tab if not already open) and land the caret on `name`'s definition
+    /// there. No definition found (or unresolvable module) → the file still
+    /// opens (or nothing happens), never an error.
+    pub(crate) fn open_import_symbol(
+        &mut self,
+        link: highlight::ImportLink,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(cur) = self.browse.open_path.clone() else {
+            return;
+        };
+        let lang = self.browse.editor.read(cx).lang;
+        let Some(target) = highlight::resolve_import(&link, lang, &cur, &self.browse.all_files)
+        else {
+            return;
+        };
+        self.open_file(target.clone(), cx);
+        // The editor now holds the target file — find the symbol's definition in
+        // its (possibly PlainText-gated) effective language and select it.
+        let tl = self.effective_lang(&target);
+        let def = {
+            let ed = self.browse.editor.read(cx);
+            highlight::definition_sites(ed.text(), tl)
+                .into_iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, r)| r)
+        };
+        if let Some(r) = def {
+            self.browse.editor.update(cx, |e, cx| e.select_range(r, cx));
+        }
+    }
+}

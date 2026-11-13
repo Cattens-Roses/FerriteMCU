@@ -1,0 +1,849 @@
+//! Different toolchains source and installation tools.
+
+#[cfg(windows)]
+use crate::env::set_env;
+use crate::{
+    cli::InstallOpts,
+    env::{create_export_file, get_export_file, print_post_install_msg},
+    error::Error,
+    host_triple::get_host_triple,
+    targets::Target,
+    toolchain::{
+        gcc::{Gcc, RISCV_GCC, XTENSA_GCC},
+        llvm::Llvm,
+        rust::{RiscVTarget, XtensaRust, check_rust_installation, get_toolchain_path},
+    },
+};
+use async_trait::async_trait;
+use flate2::bufread::GzDecoder;
+use log::{debug, info, warn};
+use miette::Result;
+use reqwest::{StatusCode, blocking::Client, header};
+use retry::{OperationResult, delay::Fixed, retry};
+use std::{
+    env,
+    fs::{File, OpenOptions, create_dir_all, remove_file},
+    io::{BufReader, Write, copy},
+    path::{Path, PathBuf},
+    sync::atomic::{self, AtomicBool, AtomicUsize},
+};
+use tar::Archive;
+use tokio::{fs::remove_dir_all, task::JoinSet};
+use tokio_retry2::{Retry, RetryError, strategy::FixedInterval};
+use tokio_stream::StreamExt;
+use xz2::read::XzDecoder;
+use zip::ZipArchive;
+
+pub mod gcc;
+pub mod llvm;
+pub mod rust;
+#[cfg(any(windows, test))]
+mod version_marker;
+
+lazy_static::lazy_static! {
+    pub static ref PROCESS_BARS: indicatif::MultiProgress = indicatif::MultiProgress::new();
+    pub static ref DOWNLOAD_CNT: AtomicUsize = AtomicUsize::new(0);
+}
+
+static DISABLE_HTTP_TIMEOUTS: AtomicBool = AtomicBool::new(false);
+
+pub enum InstallMode {
+    Install,
+    Update,
+}
+
+#[async_trait]
+pub trait Installable {
+    /// Install some application, returning a vector of any required exports
+    async fn install(&self) -> Result<Vec<String>, Error>;
+    /// Returns the name of the toolchain being installeds
+    fn name(&self) -> String;
+}
+
+/// Get https proxy from environment variables(if any)
+///
+/// sadly there is not standard on the environment variable name for the proxy, but it seems
+/// that the most common are:
+///
+/// - https_proxy(or http_proxy for http)
+/// - HTTPS_PROXY(or HTTP_PROXY for http)
+/// - all_proxy
+/// - ALL_PROXY
+///
+/// hence we will check for all of them
+fn https_proxy() -> Option<String> {
+    for proxy in ["https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"] {
+        if let Ok(proxy_addr) = std::env::var(proxy) {
+            info!("Using HTTPS proxy from environment variable {proxy}");
+            return Some(proxy_addr);
+        }
+    }
+    None
+}
+
+fn disable_http_timeouts() -> bool {
+    DISABLE_HTTP_TIMEOUTS.load(atomic::Ordering::Relaxed)
+}
+
+fn set_disable_http_timeouts(disable: bool) {
+    DISABLE_HTTP_TIMEOUTS.store(disable, atomic::Ordering::Relaxed);
+}
+
+/// Build a reqwest client with proxy if env var is set
+fn build_proxy_blocking_client() -> Result<Client, Error> {
+    let mut builder = reqwest::blocking::Client::builder();
+    if disable_http_timeouts() {
+        debug!("HTTP timeouts disabled for blocking client");
+        builder = builder.timeout(None);
+    }
+    if let Some(proxy) = https_proxy() {
+        builder = builder.proxy(reqwest::Proxy::https(&proxy).unwrap());
+    }
+    let client = builder.build()?;
+    Ok(client)
+}
+
+/// Build a reqwest client with proxy if env var is set
+fn build_proxy_async_client() -> Result<reqwest::Client, Error> {
+    let mut builder = reqwest::Client::builder();
+    if disable_http_timeouts() {
+        debug!("HTTP timeouts disabled; async client already uses no timeout by default");
+    }
+    if let Some(proxy) = https_proxy() {
+        builder = builder.proxy(reqwest::Proxy::https(&proxy).unwrap());
+    }
+    let client = builder.build()?;
+    Ok(client)
+}
+
+fn create_download_progress_bar(file_name: &str, total_len: Option<u64>) -> indicatif::ProgressBar {
+    let sty = indicatif::ProgressStyle::with_template(
+        "[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}",
+    )
+    .unwrap()
+    .progress_chars("##-");
+    let bar = total_len
+        .map(indicatif::ProgressBar::new)
+        .unwrap_or(indicatif::ProgressBar::no_length());
+    let bar = PROCESS_BARS.add(bar);
+    bar.set_style(sty);
+    bar.set_message(file_name.to_string());
+    DOWNLOAD_CNT.fetch_add(1, atomic::Ordering::Relaxed);
+    bar
+}
+
+fn finish_download_progress_bar(bar: indicatif::ProgressBar, message: String) {
+    bar.finish_with_message(message);
+    if DOWNLOAD_CNT.fetch_sub(1, atomic::Ordering::Relaxed) == 1 {
+        PROCESS_BARS.clear().unwrap();
+        info!("All downloads complete");
+    }
+}
+
+async fn download_file_with_resume(
+    url: &str,
+    file_name: &str,
+    destination: &Path,
+) -> Result<(), Error> {
+    const MAX_DOWNLOAD_RETRIES: usize = 10;
+
+    let client = build_proxy_async_client()?;
+    let mut downloaded = destination
+        .metadata()
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let bar = create_download_progress_bar(file_name, None);
+    if downloaded > 0 {
+        bar.set_position(downloaded);
+        info!("Found partial download for '{file_name}', resuming from byte {downloaded}");
+    }
+
+    let mut retries = 0;
+    loop {
+        let mut request = client.get(url);
+        if downloaded > 0 {
+            request = request.header(header::RANGE, format!("bytes={downloaded}-"));
+        }
+
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(err) if retries < MAX_DOWNLOAD_RETRIES => {
+                retries += 1;
+                warn!(
+                    "Download of '{file_name}' failed before receiving data, retrying ({retries}/{MAX_DOWNLOAD_RETRIES}): {err}"
+                );
+                continue;
+            }
+            Err(err) => {
+                finish_download_progress_bar(bar, format!("{file_name} download failed"));
+                return Err(err.into());
+            }
+        };
+
+        match response.status() {
+            status if downloaded == 0 && status.is_success() => {}
+            reqwest::StatusCode::PARTIAL_CONTENT if downloaded > 0 => {}
+            reqwest::StatusCode::RANGE_NOT_SATISFIABLE if downloaded > 0 => {
+                warn!(
+                    "Partial download for '{file_name}' can no longer be resumed, restarting from scratch"
+                );
+                remove_file(destination)?;
+                downloaded = 0;
+                bar.set_position(0);
+                continue;
+            }
+            status if downloaded > 0 && status.is_success() => {
+                warn!("Server ignored resume request for '{file_name}', restarting from scratch");
+                remove_file(destination)?;
+                downloaded = 0;
+                bar.set_position(0);
+                continue;
+            }
+            status => {
+                finish_download_progress_bar(bar, format!("{file_name} download failed"));
+                return Err(Error::HttpError(status.to_string()));
+            }
+        }
+
+        let total_len = if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+            response
+                .content_length()
+                .map(|remaining| remaining + downloaded)
+        } else {
+            response.content_length()
+        };
+        if let Some(total_len) = total_len {
+            bar.set_length(total_len);
+        }
+
+        let mut output = OpenOptions::new()
+            .create(true)
+            .append(downloaded > 0)
+            .truncate(downloaded == 0)
+            .write(true)
+            .open(destination)?;
+
+        let mut stream = response.bytes_stream();
+        let mut completed = true;
+        while let Some(chunk_result) = stream.next().await {
+            match chunk_result {
+                Ok(chunk) => {
+                    output.write_all(&chunk)?;
+                    downloaded += chunk.len() as u64;
+                    bar.set_position(downloaded);
+                }
+                Err(err) if retries < MAX_DOWNLOAD_RETRIES => {
+                    retries += 1;
+                    completed = false;
+                    warn!(
+                        "Download of '{file_name}' was interrupted at byte {downloaded}, retrying ({retries}/{MAX_DOWNLOAD_RETRIES}): {err}"
+                    );
+                    break;
+                }
+                Err(err) => {
+                    finish_download_progress_bar(bar, format!("{file_name} download failed"));
+                    return Err(err.into());
+                }
+            }
+        }
+        output.flush()?;
+
+        if completed {
+            if let Some(total_len) = total_len
+                && downloaded < total_len
+            {
+                if retries < MAX_DOWNLOAD_RETRIES {
+                    retries += 1;
+                    warn!(
+                        "Download of '{file_name}' ended early at byte {downloaded}/{total_len}, retrying ({retries}/{MAX_DOWNLOAD_RETRIES})"
+                    );
+                    continue;
+                }
+                finish_download_progress_bar(bar, format!("{file_name} download failed"));
+                return Err(Error::HttpError(format!(
+                    "Incomplete download for '{file_name}': received {downloaded} of {total_len} bytes"
+                )));
+            }
+
+            finish_download_progress_bar(bar, format!("{file_name} download complete"));
+            return Ok(());
+        }
+    }
+}
+
+fn extract_downloaded_file(
+    file_name: &str,
+    archive_path: &Path,
+    output_directory: &str,
+    strip: bool,
+) -> Result<(), Error> {
+    let mut extension = archive_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default();
+
+    // Resumable downloads are stored as '<name>.<ext>.part'.
+    // Detect the real archive extension from the stem when needed.
+    if extension == "part" {
+        extension = archive_path
+            .file_stem()
+            .and_then(|stem| Path::new(stem).extension())
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("part");
+    }
+
+    match extension {
+        "zip" => {
+            let file = File::open(archive_path)?;
+            let mut zipfile = ZipArchive::new(file)?;
+            if strip {
+                for i in 0..zipfile.len() {
+                    let mut file = zipfile.by_index(i)?;
+                    let name = file.name()?.into_owned();
+                    let Some(stripped_name) = name.strip_prefix("esp/") else {
+                        continue;
+                    };
+
+                    // Check after stripping as well: `esp/../outside` is enclosed in
+                    // the archive root, but escapes the destination once `esp/` is removed.
+                    // Reject Windows separators, drive prefixes and normalized dot/space
+                    // suffixes on every host so the same archive is safe everywhere.
+                    if file.enclosed_name().is_none()
+                        || stripped_name.starts_with('/')
+                        || stripped_name.contains(['\\', ':'])
+                        || stripped_name
+                            .split('/')
+                            .any(|part| part.ends_with(['.', ' ']))
+                    {
+                        return Err(Error::UnsafeArchivePath(name));
+                    }
+                    let outpath = Path::new(output_directory).join(stripped_name);
+
+                    if name.ends_with('/') {
+                        create_dir_all(&outpath)?;
+                    } else {
+                        create_dir_all(outpath.parent().unwrap())?;
+                        let mut outfile = File::create(&outpath)?;
+                        copy(&mut file, &mut outfile)?;
+                    }
+                }
+            } else {
+                zipfile.extract(output_directory)?;
+            }
+        }
+        "gz" => {
+            debug!("Extracting tar.gz file to '{output_directory}'");
+            let tarfile = File::open(archive_path)?;
+            let tarfile = GzDecoder::new(BufReader::new(tarfile));
+            let mut archive = Archive::new(tarfile);
+            archive.unpack(output_directory)?;
+        }
+        "xz" => {
+            debug!("Extracting tar.xz file to '{output_directory}'");
+            let tarfile = File::open(archive_path)?;
+            let tarfile = XzDecoder::new(tarfile);
+            let mut archive = Archive::new(tarfile);
+            archive.unpack(output_directory)?;
+        }
+        _ => {
+            return Err(Error::UnsuportedFileExtension(extension.to_string()));
+        }
+    }
+
+    debug!("Extracted '{file_name}' to '{output_directory}'");
+    Ok(())
+}
+
+fn validate_download_file_name(file_name: &str) -> Result<(), Error> {
+    // This value becomes a local child path. Reject separators and Windows drive/stream
+    // syntax on every host so user-controlled artifact versions cannot escape the directory.
+    if file_name.is_empty()
+        || file_name == "."
+        || file_name == ".."
+        || file_name.contains(['/', '\\', ':'])
+    {
+        return Err(Error::InvalidDownloadName(file_name.to_string()));
+    }
+    Ok(())
+}
+
+/// Downloads a file from a URL and uncompresses it, if necesary, to the output directory.
+pub async fn download_file(
+    url: String,
+    file_name: &str,
+    output_directory: &str,
+    uncompress: bool,
+    strip: bool,
+) -> Result<String, Error> {
+    validate_download_file_name(file_name)?;
+    let file_path = Path::new(output_directory).join(file_name);
+    let partial_file_path = PathBuf::from(format!("{}.part", file_path.display()));
+
+    if !Path::new(output_directory).exists() {
+        debug!("Creating directory: '{output_directory}'");
+        create_dir_all(output_directory)
+            .map_err(|_| Error::CreateDirectory(output_directory.to_string()))?;
+    } else if file_path.exists() {
+        warn!(
+            "File '{}' already exists, deleting it before download",
+            file_path.display()
+        );
+        remove_file(&file_path)?;
+    }
+
+    download_file_with_resume(&url, file_name, &partial_file_path).await?;
+
+    if uncompress {
+        extract_downloaded_file(file_name, &partial_file_path, output_directory, strip)?;
+        remove_file(&partial_file_path)?;
+    } else {
+        debug!("Creating file: '{}'", file_path.display());
+        std::fs::rename(&partial_file_path, &file_path)?;
+    }
+
+    Ok(file_path.display().to_string())
+}
+
+/// Installs components concurrently, including observing panics in installer tasks.
+async fn install_all(
+    to_install: Vec<Box<dyn Installable + Send + Sync>>,
+) -> Result<Vec<String>, Error> {
+    let mut tasks = JoinSet::new();
+    for app in to_install {
+        tasks.spawn(async move {
+            let retry_strategy = FixedInterval::from_millis(50).take(3);
+            Retry::spawn(retry_strategy, || async {
+                let res = app.install().await;
+                if let Err(ref err) = res {
+                    warn!(
+                        "Installation for '{}' failed, retrying. Error: {}",
+                        app.name(),
+                        err
+                    );
+                }
+                res.map_err(RetryError::transient)
+            })
+            .await
+        });
+    }
+
+    let mut exports = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        // Dropping the JoinSet on error also aborts any remaining async tasks.
+        exports.extend(result??);
+    }
+    Ok(exports)
+}
+
+/// Installs or updates the Espressif Rust ecosystem.
+pub async fn install(args: InstallOpts, install_mode: InstallMode) -> Result<()> {
+    let toolchain_dir = get_toolchain_path(&args.name)?;
+    set_disable_http_timeouts(args.disable_timeouts);
+    if args.disable_timeouts {
+        info!("HTTP timeouts disabled");
+    }
+
+    match install_mode {
+        InstallMode::Install => info!("Installing the Espressif Rust ecosystem"),
+        InstallMode::Update => info!("Updating the Espressif Rust ecosystem"),
+    }
+    let export_file = get_export_file(args.export_file)?;
+    let host_triple = get_host_triple(args.default_host)?;
+    let xtensa_rust_version = if let Some(toolchain_version) = &args.toolchain_version {
+        if !args.skip_version_parse {
+            let toolchain_version = toolchain_version.clone();
+            tokio::task::spawn_blocking(move || {
+                XtensaRust::find_latest_version_on_github(&toolchain_version)
+            })
+            .await
+            .map_err(|err| {
+                Error::GithubConnectivityError(format!("Failed to query GitHub API: {err}"))
+            })??
+        } else {
+            toolchain_version.clone()
+        }
+    } else {
+        // Get the latest version of the Xtensa Rust toolchain
+        XtensaRust::get_latest_version().await.map_err(|e| {
+            warn!("Failed to get latest Xtensa Rust version: {e}");
+            e
+        })?
+    };
+    let llvm: Llvm = Llvm::new(
+        &toolchain_dir,
+        &host_triple,
+        args.extended_llvm,
+        &xtensa_rust_version,
+    )?;
+    let targets = args.targets;
+    let xtensa_rust = if targets.contains(&Target::ESP32)
+        || targets.contains(&Target::ESP32S2)
+        || targets.contains(&Target::ESP32S3)
+    {
+        Some(XtensaRust::new(
+            &xtensa_rust_version,
+            &host_triple,
+            &toolchain_dir,
+        ))
+    } else {
+        None
+    };
+
+    debug!(
+        "Arguments:
+            - Export file: {:?}
+            - Disable timeouts: {}
+            - Host triple: {}
+            - LLVM Toolchain: {:?}
+            - Stable version: {:?}
+            - Rust Toolchain: {:?}
+            - Skip version parsing: {}
+            - Targets: {:?}
+            - Toolchain path: {:?}
+            - Toolchain version: {:?}",
+        export_file,
+        args.disable_timeouts,
+        host_triple,
+        llvm,
+        args.stable_version,
+        xtensa_rust,
+        args.skip_version_parse,
+        targets,
+        toolchain_dir,
+        args.crosstool_toolchain_version,
+    );
+
+    check_rust_installation().await?;
+
+    // Build up a vector of installable applications, all of which implement the
+    // `Installable` async trait.
+    let mut to_install = Vec::<Box<dyn Installable + Send + Sync>>::new();
+
+    if let Some(ref xtensa_rust) = xtensa_rust {
+        to_install.push(Box::new(xtensa_rust.to_owned()));
+    }
+
+    // Check if ther is any Xtensa target
+    if targets.iter().any(|t| t.is_xtensa()) {
+        to_install.push(Box::new(llvm.to_owned()));
+    }
+
+    if targets.iter().any(|t| t.is_riscv()) {
+        let riscv_target = RiscVTarget::new(&args.stable_version);
+        to_install.push(Box::new(riscv_target));
+    }
+
+    if !args.std {
+        if targets
+            .iter()
+            .any(|t| t == &Target::ESP32 || t == &Target::ESP32S2 || t == &Target::ESP32S3)
+        {
+            let xtensa_gcc = Gcc::new(
+                XTENSA_GCC,
+                &host_triple,
+                &toolchain_dir,
+                args.crosstool_toolchain_version.clone(),
+            );
+            to_install.push(Box::new(xtensa_gcc));
+        }
+
+        // By default only install the Espressif RISC-V toolchain if the user explicitly wants to
+        if args.esp_riscv_gcc && targets.iter().any(|t| t != &Target::ESP32) {
+            let riscv_gcc = Gcc::new(
+                RISCV_GCC,
+                &host_triple,
+                &toolchain_dir,
+                args.crosstool_toolchain_version.clone(),
+            );
+            to_install.push(Box::new(riscv_gcc));
+        }
+    }
+
+    let exports = install_all(to_install).await?;
+
+    create_export_file(&export_file, &exports)?;
+    #[cfg(windows)]
+    set_env()?;
+    match install_mode {
+        InstallMode::Install => info!("Installation successfully completed!"),
+        InstallMode::Update => info!("Update successfully completed!"),
+    }
+
+    print_post_install_msg(&export_file)?;
+    Ok(())
+}
+
+/// Queries the GitHub API and returns the JSON response.
+pub fn github_query(url: &str) -> Result<serde_json::Value, Error> {
+    debug!("Querying GitHub API: '{url}'");
+    let mut headers = header::HeaderMap::new();
+    headers.insert(header::USER_AGENT, "espup".parse().unwrap());
+    headers.insert(
+        header::ACCEPT,
+        "application/vnd.github+json".parse().unwrap(),
+    );
+
+    headers.insert("X-GitHub-Api-Version", "2022-11-28".parse().unwrap());
+    // An empty token would still be sent and rejected with 401.
+    let token = env::var("GITHUB_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty());
+    if let Some(token) = &token {
+        info!("Using `GITHUB_TOKEN` to authenticate GitHub API requests");
+        headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+    }
+
+    let client = build_proxy_blocking_client()?;
+
+    // Only retry transient failures: retrying authentication or rate limit
+    // errors cannot succeed and consumes more of the rate limit.
+    retry(Fixed::from_millis(100).take(5), || {
+        let response = match client.get(url).headers(headers.clone()).send() {
+            Ok(response) => response,
+            Err(err) => return OperationResult::Retry(Error::from(err)),
+        };
+        let status = response.status();
+        match status {
+            StatusCode::UNAUTHORIZED if token.is_some() => {
+                return OperationResult::Err(Error::GithubTokenInvalid);
+            }
+            StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS => {
+                return OperationResult::Err(Error::GithubRateLimit);
+            }
+            _ if status.is_server_error() => {
+                return OperationResult::Retry(Error::HttpError(format!(
+                    "GitHub API returned status code: {status}"
+                )));
+            }
+            _ if !status.is_success() => {
+                return OperationResult::Err(Error::HttpError(format!(
+                    "GitHub API returned status code: {status}"
+                )));
+            }
+            _ => {}
+        }
+
+        let body = match response.text() {
+            Ok(body) => body,
+            Err(err) => return OperationResult::Retry(Error::from(err)),
+        };
+        match serde_json::from_str(&body) {
+            Ok(json) => OperationResult::Ok(json),
+            Err(_) => OperationResult::Err(Error::SerializeJson),
+        }
+    })
+    .map_err(|err| err.error)
+}
+
+/// Checks if the directory exists and deletes it if it does.
+pub async fn remove_dir(path: &Path) -> Result<()> {
+    if path.exists() {
+        debug!(
+            "Deleting the Xtensa Rust toolchain located in '{}'",
+            path.display()
+        );
+        remove_dir_all(&path)
+            .await
+            .map_err(|_| Error::RemoveDirectory(path.display().to_string()))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zip::{ZipWriter, write::SimpleFileOptions};
+
+    struct TestInstaller {
+        attempts: std::sync::Arc<AtomicUsize>,
+        failures: usize,
+        panic: bool,
+    }
+
+    #[async_trait]
+    impl Installable for TestInstaller {
+        async fn install(&self) -> Result<Vec<String>, Error> {
+            assert!(!self.panic, "simulated installer panic");
+            if self.attempts.fetch_add(1, atomic::Ordering::SeqCst) < self.failures {
+                return Err(Error::XtensaRust);
+            }
+            Ok(vec!["export TEST=1".into()])
+        }
+
+        fn name(&self) -> String {
+            "test installer".into()
+        }
+    }
+
+    #[tokio::test]
+    async fn download_names_cannot_escape_the_output_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "",
+            ".",
+            "..",
+            "../archive.zip",
+            r"..\archive.zip",
+            "C:archive.zip",
+        ] {
+            assert!(matches!(
+                download_file(
+                    "invalid://archive".into(),
+                    name,
+                    dir.path().to_str().unwrap(),
+                    false,
+                    false,
+                )
+                .await,
+                Err(Error::InvalidDownloadName(invalid)) if invalid == name
+            ));
+        }
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn installer_panic_returns_an_error_instead_of_hanging() {
+        let installer = TestInstaller {
+            attempts: Default::default(),
+            failures: 0,
+            panic: true,
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            install_all(vec![Box::new(installer)]),
+        )
+        .await
+        .expect("installer panic must not hang");
+        assert!(matches!(result, Err(Error::InstallTask(err)) if err.is_panic()));
+    }
+
+    #[tokio::test]
+    async fn installers_retry_failures_and_collect_exports() {
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+        let installer = TestInstaller {
+            attempts: attempts.clone(),
+            failures: 2,
+            panic: false,
+        };
+        assert_eq!(
+            install_all(vec![Box::new(installer)]).await.unwrap(),
+            ["export TEST=1"]
+        );
+        assert_eq!(attempts.load(atomic::Ordering::SeqCst), 3);
+        assert!(install_all(vec![]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn installer_errors_are_propagated_after_retries() {
+        let installer = TestInstaller {
+            attempts: Default::default(),
+            failures: usize::MAX,
+            panic: false,
+        };
+        assert!(matches!(
+            install_all(vec![Box::new(installer)]).await,
+            Err(Error::XtensaRust)
+        ));
+    }
+
+    #[test]
+    fn proxy_logging_does_not_disclose_credentials() {
+        const PROXY: &str = "http://test-user:test-password@localhost:1234";
+        const CHILD_ENV: &str = "ESPUP_TEST_PROXY_LOG_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            crate::logging::initialize_logger("info");
+            assert_eq!(https_proxy().as_deref(), Some(PROXY));
+            return;
+        }
+
+        // Isolate both the global logger and environment from parallel unit tests.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "toolchain::tests::proxy_logging_does_not_disclose_credentials",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env("https_proxy", PROXY)
+            .env("RUST_LOG", "info")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let logs = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            logs.contains("Using HTTPS proxy from environment variable https_proxy"),
+            "{logs}"
+        );
+        assert!(!logs.contains("test-user"), "{logs}");
+        assert!(!logs.contains("test-password"), "{logs}");
+        assert!(!logs.contains(PROXY), "{logs}");
+    }
+
+    fn write_zip(path: &Path, name: &str) {
+        let mut zip = ZipWriter::new(File::create(path).unwrap());
+        zip.start_file(name, SimpleFileOptions::default()).unwrap();
+        zip.write_all(b"archive content").unwrap();
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn stripped_zip_rejects_escaping_paths() {
+        for name in [
+            "esp/../outside",
+            "esp/../../outside",
+            "esp//outside",
+            r"esp/..\outside",
+            "esp/C:/outside",
+            r"esp/C:\outside",
+            "esp/.. /outside",
+            "esp/bin/../../outside",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join("rust.zip.part");
+            let output = dir.path().join("output");
+            let outside = dir.path().join("outside");
+            std::fs::write(&outside, b"untouched").unwrap();
+            write_zip(&archive, name);
+            assert!(
+                matches!(
+                    extract_downloaded_file("rust.zip", &archive, output.to_str().unwrap(), true),
+                    Err(Error::UnsafeArchivePath(_))
+                ),
+                "{name}"
+            );
+            assert_eq!(std::fs::read(&outside).unwrap(), b"untouched");
+            assert!(!output.exists());
+        }
+    }
+
+    #[test]
+    fn stripped_zip_extracts_regular_entries_and_ignores_other_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("rust.zip.part");
+        let output = dir.path().join("output");
+        write_zip(&archive, "esp/bin/rustc.exe");
+        extract_downloaded_file("rust.zip", &archive, output.to_str().unwrap(), true).unwrap();
+        assert_eq!(
+            std::fs::read(output.join("bin/rustc.exe")).unwrap(),
+            b"archive content"
+        );
+        write_zip(&archive, "other/ignored");
+        extract_downloaded_file("rust.zip", &archive, output.to_str().unwrap(), true).unwrap();
+        assert!(!output.join("other").exists());
+    }
+
+    #[test]
+    fn malformed_zip_returns_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("rust.zip.part");
+        std::fs::write(&archive, b"not a zip").unwrap();
+        assert!(matches!(
+            extract_downloaded_file("rust.zip", &archive, dir.path().to_str().unwrap(), true),
+            Err(Error::ZipError(_))
+        ));
+    }
+}

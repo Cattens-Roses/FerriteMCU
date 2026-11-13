@@ -1,0 +1,278 @@
+[package]
+name = "ferritemcu"
+# Literal (NOT version.workspace) because release-please's `rust` strategy bumps
+# `[package].version` and needs a real string here. The shared `[workspace.package].version`
+# below is kept in lockstep via release-please-config.json `extra-files`, so the internal
+# crates that inherit it stay on the same number.
+version = "2.14.1"
+edition.workspace = true
+rust-version.workspace = true
+description = "Native Rust IDE for embedded microcontroller development, built on gpui"
+license.workspace = true
+repository = "https://github.com/ganses-roses/FerriteMCU"
+homepage = "https://github.com/ganses-roses/FerriteMCU"
+
+[lints]
+workspace = true
+
+# Cargo workspace: the binary (this package, root) + the extracted library crates under
+# crates/. Pure-logic crates (git, diff, tree, …) live there so the compiler enforces their
+# boundaries, they get real test targets, and touching one doesn't recompile the others.
+[workspace]
+members = ["crates/*"]
+# vendor/ holds patched copies of crates.io crates, wired in by [patch.crates-io] at the end of
+# this file. They build as dependencies, never as members (not linted or tested as FerriteMCU's own).
+exclude = ["vendor"]
+
+# Shared package metadata — every member inherits via `version.workspace = true`, etc., so the
+# version/edition/MSRV/license live in exactly one place. release-please keeps this `version`
+# in lockstep with the root `[package].version` via the `extra-files` updater in
+# release-please-config.json (it can't bump an inherited `version.workspace` directly).
+# A second `extra-files` entry bumps every path crate's `Cargo.lock` entry (the ones with no
+# `source`): the rust strategy can't expand the `crates/*` glob, so it only bumps `ferritemcu`'s. The
+# vendored crates (vendor/) have no `source` either and keep their own version: that entry
+# names each one to leave out.
+[workspace.package]
+version = "2.14.1"
+edition = "2021"
+rust-version = "1.96"
+license = "Apache-2.0"
+
+# Shared dependency versions — anything used by 2+ members (plus the macOS objc2 stack, kept in
+# lockstep with gpui's own objc2 ABI). Members reference these with `<dep>.workspace = true`,
+# adding crate-specific features locally. gpui is pinned EXACTLY (`=0.2.2`) + Cargo.lock is
+# committed → reproducible builds.
+[workspace.dependencies]
+gpui = "=0.2.2"
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+# Filesystem watcher (FSEvents on macOS) — live external-change detection so local
+# history + git status refresh without waiting for a window refocus.
+notify = "8"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
+
+# Centralized lints for every workspace member (each opts in with `[lints] workspace = true`).
+# `priority = -1` lets the specific allows below override the pedantic group.
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Panicking accessors are banned in shipping code; tests are exempt via clippy.toml.
+unwrap_used = "deny"
+expect_used = "deny"
+# Curated pedantic opt-outs — noise / false-positives for this codebase, not real smells:
+module_name_repetitions = "allow" # `tree::tree_item` etc. read fine in context
+cast_precision_loss = "allow"     # f32 pixel/colour maths: sub-pixel loss is irrelevant
+cast_possible_truncation = "allow" # deliberate usize→u32/f32 in layout/grid maths
+cast_sign_loss = "allow"          # guarded non-negative casts in layout maths
+must_use_candidate = "allow"      # not worth annotating every getter in an app binary
+missing_panics_doc = "allow"      # blessed expects are documented inline already
+missing_errors_doc = "allow"      # error types are self-describing (thiserror messages)
+similar_names = "allow"           # `old`/`new`, `src`/`dst`, `fg`/`bg` are clear pairs
+struct_excessive_bools = "allow"  # UI view-state flags are genuinely independent toggles
+unreadable_literal = "allow"      # `0x3574F0` hex colours read better WITHOUT separators
+unnecessary_debug_formatting = "allow" # `{path:?}` in errors is deliberate (quotes/escapes)
+too_many_lines = "allow"          # gpui render fns are one long declarative element tree
+items_after_statements = "allow"  # local helper fns/consts read fine next to their use
+unused_self = "allow"             # `pub(crate) fn`s on FerriteMCU stay methods for call-site uniformity
+needless_pass_by_value = "allow"  # gpui closures frequently need owned captures
+cast_possible_wrap = "allow"      # usize→i64/i32 in layout maths stays well within range
+match_same_arms = "allow"         # arms kept separate when they document distinct cases
+default_trait_access = "allow"    # `Default::default()` in struct-update position reads fine
+assigning_clones = "allow"        # `clone_from` micro-opt isn't worth the readability hit
+format_push_string = "allow"      # `s.push_str(&format!(..))` is clearer than `write!` here
+large_types_passed_by_value = "allow" # `Theme` is `Copy`; by-value snapshots are intended
+fn_params_excessive_bools = "allow"   # a few git ops take checkout/overwrite/... flags
+format_collect = "allow"          # one-off `map(format!).collect()` is clear enough
+needless_raw_string_hashes = "allow" # grammar query strings keep `r#"…"#` for consistency
+wildcard_imports = "allow"        # `use crate::*` is the documented convention for the
+                                  # binary's feature modules (see DEVELOPMENT.md module wiring)
+
+[dependencies]
+# GUI — Zed's framework. Apache-2.0. Pinned + Cargo.lock committed (see [workspace.dependencies]).
+gpui.workspace = true
+
+# Extracted workspace crates (pure logic, no gpui). Aliased back to their old module names
+# in main.rs (`use ferritemcu_git as git;`) so existing call sites are untouched.
+ferritemcu-git = { path = "crates/ferritemcu-git" }
+ferritemcu-diff = { path = "crates/ferritemcu-diff" }
+ferritemcu-tree = { path = "crates/ferritemcu-tree" }
+ferritemcu-markdown = { path = "crates/ferritemcu-markdown" }
+ferritemcu-update = { path = "crates/ferritemcu-update" }
+ferritemcu-config = { path = "crates/ferritemcu-config" }
+ferritemcu-local-history = { path = "crates/ferritemcu-local-history" }
+ferritemcu-lsp = { path = "crates/ferritemcu-lsp" }
+ferritemcu-theme = { path = "crates/ferritemcu-theme" }
+ferritemcu-ui = { path = "crates/ferritemcu-ui" }
+# Theme/syntax colours are `ferritemcu_color::Color`; the `gpui` feature gives `Color → gpui` so the
+# binary's `.bg()/.text_color()` calls take theme colours unchanged.
+ferritemcu-color = { path = "crates/ferritemcu-color", features = ["gpui"] }
+# Syntax highlighting + all tree-sitter grammars live here; the per-pack features below
+# forward to this crate's features (e.g. binary `rust` → `ferritemcu-syntax/rust`).
+# default-features = false so the binary controls which grammars compile (ferritemcu-syntax's
+# own default is `full`, for standalone testing).
+ferritemcu-syntax = { path = "crates/ferritemcu-syntax", default-features = false }
+
+# Syntax highlighting + the tree-sitter grammars now live in the `ferritemcu-syntax` crate
+# (above); diff in `ferritemcu-diff`, markdown parsing in `ferritemcu-markdown`. The per-pack Cargo
+# features below forward grammars to `ferritemcu-syntax`.
+
+# Fuzzy file search (Go to File)
+fuzzy-matcher = "0.3"
+
+# Live filesystem watching — external creates/edits refresh git status + feed local
+# history without a window refocus (see `FerriteMCU::sync_fs_watcher`). Default features =
+# FSEvents on macOS.
+notify.workspace = true
+
+# Misc
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# In-process Espressif toolchain integrations. CLI shells are not used by the device UI.
+espflash = { version = "4.7", default-features = false, features = ["serialport"] }
+esp-generate = { version = "2.0", default-features = false }
+espup = "0.19"
+serialport = "4.7"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time"] }
+# Provide rustls' ring crypto backend to espup's reqwest client, avoiding the
+# much larger aws-lc native build on Windows/MSVC.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+unicode-segmentation = "1"
+# Parse a .ttf/.otf's family name so opened font files preview in their own typeface.
+ttf-parser = "0.25"
+# Remote (http/https) images in the Markdown preview — OFF by default. Pulls a
+# blocking HTTP+TLS stack (ureq → rustls), kept out of the default build to
+# protect the footprint (see CONTRIBUTING.md). Local-file images need neither.
+ureq = { version = "3", optional = true }
+# Always compiled: the filesystem watcher's wakeup channel (see `FerriteMCU::sync_fs_watcher`)
+# needs it unconditionally, on top of the terminal PTY + remote-image wakeups below.
+futures.workspace = true
+# Embedded terminal — alacritty's VTE/grid/PTY engine (Apache-2.0), same crate Zed uses.
+# Gated behind the `terminal` Cargo feature so a build can drop it entirely: an off
+# feature sheds the grammar-sized ~2MB of `.rodata` parse tables + the read-loop code,
+# exactly like the language packs. `futures` provides the wakeup channel from the PTY
+# read thread back to the gpui foreground.
+alacritty_terminal = { version = "0.26.0", optional = true }
+# Login-shell discovery for the embedded terminal (see src/widgets/terminal.rs).
+libc = { version = "0.2", optional = true }
+
+# Language packs — one feature per pack. A pack's feature pulls in its grammar
+# crate(s); the matching match arms in highlight.rs are `#[cfg]`-gated to the
+# same feature, so an off feature drops both the crate AND the code. `css`
+# serves both CSS and SCSS; `typescript` serves both .ts and .tsx (one crate).
+# `env`/`gitignore` use builtin line-highlighters (no grammar) and are always on.
+
+# macOS dock icon at runtime (no .app bundle) — set via NSApplication. Versions match
+# gpui's own objc2 deps so the ABI lines up.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-foundation = { workspace = true, features = [
+    "NSData",
+    "NSLocale",
+    "NSProcessInfo",
+    "NSString",
+    "NSArray",
+    "NSURL",
+] }
+objc2-app-kit = { workspace = true, features = [
+    "NSApplication",
+    "NSImage",
+    "NSResponder",
+    "NSPasteboard",
+    "NSPasteboardItem",
+] }
+
+# Linux-only crates, all already in the tree for gpui's X11 backend / image loading, at the
+# same versions:
+# - x11rb + image: FerriteMCU's icon on its X11 windows (`_NET_WM_ICON`, see
+#   src/platform/window_icon.rs).
+# - x11-clipboard: files copied in a file manager reach the clipboard as a `text/uri-list`
+#   target, which gpui doesn't read; `platform::clipboard` asks the X server for it (Xwayland
+#   on a Wayland desktop).
+# - xkbcommon: what Shift + a symbol key types on the active keyboard layout, so shortcuts
+#   written with Shift bind on every layout (`platform::keyboard_layout`).
+# - cosmic-text: gpui's Linux text renderer (FerriteMCU's patched copy, see [patch.crates-io]); Text →
+#   Your desktop's chooses how it draws glyphs (`platform::desktop::text`).
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = "0.13"
+image = { version = "0.25", default-features = false, features = ["png"] }
+x11-clipboard = "0.9.3"
+xkbcommon = { version = "0.8", default-features = false }
+cosmic-text = "0.14.2"
+
+# Native Windows file-drop clipboard access (CF_HDROP) for pasting Explorer files into the tree.
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_DataExchange", "Win32_System_Time", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+probe-rs = { version = "0.23", default-features = false, features = ["builtin-targets"] }
+
+# Embeds the app icon + version into ferritemcu.exe at build time (see build.rs).
+# Windows-only; nothing to compile on macOS/Linux.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+# `test-support` exposes gpui's headless `TestAppContext` so we can run the real app
+# (windows, entities, render cycle) in `cargo test` — the only way to catch runtime
+# panics like re-entrant entity updates. Test build only.
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+
+[features]
+default = ["full", "terminal"]
+full = [
+    "rust", "typescript", "javascript", "json", "markdown",
+    "shell", "css", "yaml", "toml", "python", "html", "go", "r", "latex", "java",
+]
+# Embedded multi-tab terminal panel. Pulls alacritty's engine + the futures channel
+# used to wake the UI on new PTY output. Drop with `--no-default-features` (or omit
+# `terminal`) to ship a build with no terminal — ~2MB lighter, faster compile.
+terminal = ["dep:alacritty_terminal", "dep:libc"]
+# Remote http/https images in the Markdown preview. Deliberately NOT in `full` —
+# it's a networking concern, not a language pack, and adds a TLS stack. Local-file
+# images work without it. Build with: `cargo build --features remote-images`.
+remote-images = ["dep:ureq"]
+# Per-pack language features now forward to the `ferritemcu-syntax` crate, which owns the
+# grammar crates + the `#[cfg(feature=…)]` arms. Same names + behaviour as before;
+# `typescript` still pulls `javascript` (TS inherits the base ECMAScript query).
+rust = ["ferritemcu-syntax/rust"]
+typescript = ["ferritemcu-syntax/typescript"]
+javascript = ["ferritemcu-syntax/javascript"]
+json = ["ferritemcu-syntax/json"]
+markdown = ["ferritemcu-syntax/markdown"]
+shell = ["ferritemcu-syntax/shell"]
+css = ["ferritemcu-syntax/css"]
+yaml = ["ferritemcu-syntax/yaml"]
+toml = ["ferritemcu-syntax/toml"]
+python = ["ferritemcu-syntax/python"]
+html = ["ferritemcu-syntax/html"]
+go = ["ferritemcu-syntax/go"]
+java = ["ferritemcu-syntax/java"]
+r = ["ferritemcu-syntax/r"]
+latex = ["ferritemcu-syntax/latex"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1   # keep edit-rebuild snappy but not molasses
+
+# Our crates stay at opt-level 1 (fast incremental rebuilds), but optimize all *dependencies*
+# fully — gpui/alacritty/tree-sitter run far better in debug at no rebuild cost (deps rarely
+# recompile). Big win for debug-build interaction latency.
+[profile.dev.package."*"]
+opt-level = 3
+
+# A patched copy of a crates.io crate, used in its place everywhere in the tree. See
+# vendor/README.md for what changed and why, and how to drop it.
+[patch.crates-io]
+# Linux only in practice: gpui 0.2.2 draws text through cosmic-text on Linux alone, so macOS and
+# Windows never compile it.
+cosmic-text = { path = "vendor/cosmic-text" }
+espup = { path = "vendor/espup" }
+lzma-sys = { path = "vendor/lzma-sys" }

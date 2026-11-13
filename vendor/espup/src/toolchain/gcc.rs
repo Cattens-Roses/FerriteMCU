@@ -1,0 +1,264 @@
+//! GCC Toolchain source and installation tools.
+
+#[cfg(windows)]
+use crate::{
+    env::{get_windows_path_var, set_env_variable},
+    toolchain::version_marker::VersionMarker,
+};
+use crate::{
+    error::Error,
+    host_triple::HostTriple,
+    toolchain::{Installable, download_file},
+};
+use async_trait::async_trait;
+use log::{debug, info, warn};
+use miette::Result;
+#[cfg(windows)]
+use std::env;
+#[cfg(unix)]
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use tokio::fs::remove_dir_all;
+
+const DEFAULT_GCC_REPOSITORY: &str = "https://github.com/espressif/crosstool-NG/releases/download";
+const DEFAULT_GCC_RELEASE: &str = "16.1.0_20260609";
+pub const RISCV_GCC: &str = "riscv32-esp-elf";
+pub const XTENSA_GCC: &str = "xtensa-esp-elf";
+
+#[derive(Debug, Clone)]
+pub struct Gcc {
+    /// Host triple.
+    pub host_triple: HostTriple,
+    /// GCC Toolchain architecture.
+    pub arch: String,
+    /// GCC Toolchain path.
+    pub path: PathBuf,
+    /// GCC release version.
+    pub release_version: String,
+}
+
+impl Gcc {
+    #[cfg(unix)]
+    fn installation_marker(&self) -> PathBuf {
+        self.path.join(".espup-installed")
+    }
+
+    /// Gets the binary path.
+    pub fn get_bin_path(&self) -> String {
+        let bin_path = format!("{}/{}/bin", self.path.to_str().unwrap(), self.arch);
+        match std::cfg!(windows) {
+            true => bin_path.replace('/', "\\"),
+            false => bin_path,
+        }
+    }
+
+    /// Create a new instance with default values and proper toolchain name.
+    pub fn new(
+        arch: &str,
+        host_triple: &HostTriple,
+        toolchain_path: &Path,
+        release_version: Option<String>,
+    ) -> Self {
+        let release_version = release_version.unwrap_or_else(|| DEFAULT_GCC_RELEASE.to_string());
+
+        #[cfg(unix)]
+        let path = toolchain_path
+            .join(arch)
+            .join(format!("esp-{release_version}"));
+        #[cfg(windows)]
+        let path: PathBuf = toolchain_path.into();
+
+        Self {
+            host_triple: host_triple.clone(),
+            arch: arch.to_string(),
+            path,
+            release_version,
+        }
+    }
+}
+
+#[async_trait]
+impl Installable for Gcc {
+    async fn install(&self) -> Result<Vec<String>, Error> {
+        validate_release_version(&self.release_version)?;
+        let extension = get_artifact_extension(&self.host_triple);
+        info!("Installing GCC ({})", self.arch);
+        debug!("GCC path: {}", self.path.display());
+
+        #[cfg(unix)]
+        let is_installed = self.installation_marker().is_file();
+        #[cfg(windows)]
+        let marker = VersionMarker::new(self.path.join(&self.arch).join(".espup-installed"));
+        #[cfg(windows)]
+        let is_installed = marker.matches(&self.release_version);
+
+        if is_installed {
+            warn!(
+                "Previous installation of GCC exists in: '{}'. Reusing this installation",
+                self.path.display()
+            );
+        } else {
+            #[cfg(windows)]
+            marker.invalidate()?;
+            let gcc_file = format!(
+                "{}-{}-{}.{}",
+                self.arch,
+                self.release_version,
+                get_arch(&self.host_triple).unwrap(),
+                extension
+            );
+            let gcc_dist_url = format!(
+                "{}/esp-{}/{}",
+                DEFAULT_GCC_REPOSITORY, self.release_version, gcc_file
+            );
+            #[cfg(unix)]
+            let download_name = format!("{}.{}", self.arch, extension);
+            // Windows versions share a directory, so partial archives must be version-specific too.
+            #[cfg(windows)]
+            let download_name = gcc_file;
+            download_file(
+                gcc_dist_url,
+                &download_name,
+                &self.path.display().to_string(),
+                true,
+                false,
+            )
+            .await?;
+            #[cfg(unix)]
+            File::create(self.installation_marker())?;
+            #[cfg(windows)]
+            marker.complete(&self.release_version)?;
+        }
+        let mut exports: Vec<String> = Vec::new();
+
+        #[cfg(windows)]
+        if cfg!(windows) {
+            exports.push(format!(
+                "$Env:PATH = \"{};\" + $Env:PATH",
+                self.get_bin_path()
+            ));
+            if self.arch == RISCV_GCC {
+                unsafe {
+                    env::set_var("RISCV_GCC", self.get_bin_path());
+                }
+            } else {
+                unsafe {
+                    env::set_var("XTENSA_GCC", self.get_bin_path());
+                }
+            }
+        }
+        #[cfg(unix)]
+        exports.push(format!("export PATH=\"{}:$PATH\"", self.get_bin_path()));
+
+        Ok(exports)
+    }
+
+    fn name(&self) -> String {
+        format!("GCC ({})", self.arch)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_installation_has_no_completion_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let gcc = Gcc::new(XTENSA_GCC, &HostTriple::default(), dir.path(), None);
+        std::fs::create_dir_all(&gcc.path).unwrap();
+        std::fs::write(gcc.path.join("xtensa-esp-elf.tar.xz.part"), b"partial").unwrap();
+        assert!(!gcc.installation_marker().is_file());
+        File::create(gcc.installation_marker()).unwrap();
+        assert!(gcc.installation_marker().is_file());
+    }
+
+    #[tokio::test]
+    async fn release_version_cannot_escape_the_toolchain_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let toolchain = dir.path().join("toolchain");
+        let gcc = Gcc::new(
+            XTENSA_GCC,
+            &HostTriple::default(),
+            &toolchain,
+            Some("/../../../outside".into()),
+        );
+        assert!(matches!(
+            gcc.install().await,
+            Err(Error::InvalidGccVersion(version)) if version == "/../../../outside"
+        ));
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+    }
+}
+
+/// Validates a GCC release version, which becomes part of installation paths and URLs.
+pub fn validate_release_version(version: &str) -> Result<String, Error> {
+    if version.is_empty() || version.contains(['/', '\\', ':', '\0']) {
+        return Err(Error::InvalidGccVersion(version.to_string()));
+    }
+    Ok(version.to_string())
+}
+
+/// Gets the name of the GCC arch based on the host triple.
+fn get_arch(host_triple: &HostTriple) -> Result<&str> {
+    match host_triple {
+        HostTriple::X86_64AppleDarwin => Ok("x86_64-apple-darwin"),
+        HostTriple::Aarch64AppleDarwin => Ok("aarch64-apple-darwin"),
+        HostTriple::X86_64UnknownLinuxGnu => Ok("x86_64-linux-gnu"),
+        HostTriple::Aarch64UnknownLinuxGnu => Ok("aarch64-linux-gnu"),
+        HostTriple::X86_64PcWindowsMsvc | HostTriple::X86_64PcWindowsGnu => {
+            Ok("x86_64-w64-mingw32")
+        }
+        HostTriple::Aarch64PcWindowsMsvc => Ok("aarch64-w64-mingw32"),
+    }
+}
+
+/// Gets the artifact extension based on the host triple.
+fn get_artifact_extension(host_triple: &HostTriple) -> &str {
+    match host_triple {
+        HostTriple::X86_64PcWindowsMsvc
+        | HostTriple::X86_64PcWindowsGnu
+        | HostTriple::Aarch64PcWindowsMsvc => "zip",
+        _ => "tar.xz",
+    }
+}
+
+/// Checks if the toolchain is pressent, if present uninstalls it.
+pub async fn uninstall_gcc_toolchains(
+    toolchain_path: &Path,
+    release_version: Option<String>,
+) -> Result<(), Error> {
+    info!("Uninstalling GCC");
+
+    #[cfg_attr(not(windows), allow(unused_variables))]
+    // release_version is only used in the windows block, but is also being passed, and so clippy will complain if not marked unused across platforms
+    let release_version = release_version.unwrap_or_else(|| DEFAULT_GCC_RELEASE.to_string());
+
+    let gcc_toolchains = vec![XTENSA_GCC, RISCV_GCC];
+
+    for toolchain in gcc_toolchains {
+        let gcc_path = toolchain_path.join(toolchain);
+        if gcc_path.exists() {
+            #[cfg(windows)]
+            if cfg!(windows) {
+                let mut updated_path = get_windows_path_var()?;
+                let gcc_version_path = format!(
+                    "{}\\esp-{}\\{}\\bin",
+                    gcc_path.display(),
+                    release_version,
+                    toolchain
+                );
+                updated_path = updated_path.replace(&format!("{gcc_version_path};"), "");
+                let bin_path = format!("{}\\bin", gcc_path.display());
+                updated_path = updated_path.replace(&format!("{bin_path};"), "");
+
+                set_env_variable("PATH", &updated_path)?;
+            }
+            remove_dir_all(&gcc_path)
+                .await
+                .map_err(|_| Error::RemoveDirectory(gcc_path.display().to_string()))?;
+        }
+    }
+
+    Ok(())
+}

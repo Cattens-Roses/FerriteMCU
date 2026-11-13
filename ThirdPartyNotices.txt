@@ -1,0 +1,45 @@
+THIRD-PARTY SOFTWARE NOTICES AND INFORMATION
+
+FerriteMCU is licensed under the Apache License 2.0 (see LICENSE). It is an independent,
+original work — not affiliated with, endorsed by, or derived from JetBrains s.r.o.,
+the Zed Industries project, or any other vendor. "WebStorm", "IntelliJ", and
+"JetBrains" are trademarks of JetBrains s.r.o. and are used only nominatively (e.g.
+to name an optional keymap preset). No JetBrains source code, theme files, fonts, or
+other assets are included; the color theme is an original hand-authored palette.
+
+FerriteMCU incorporates or bundles the following third-party components. The original
+copyright notices and licenses are reproduced below.
+
+==============================================================================
+gpui and related crates — Zed Industries, Inc.
+License: Apache License 2.0
+https://github.com/zed-industries/zed
+
+FerriteMCU is built on the gpui crate. FerriteMCU is NOT a fork of the Zed editor (which is
+GPL-3.0); no GPL-licensed Zed code is included.
+
+==============================================================================
+Inter — The Inter Project Authors
+License: SIL Open Font License, Version 1.1
+Full text: assets/fonts/Inter-OFL.txt
+
+==============================================================================
+JetBrains Mono — The JetBrains Mono Project Authors
+License: SIL Open Font License, Version 1.1
+Full text: assets/fonts/JetBrainsMono-OFL.txt
+
+JetBrains Mono is an open-source typeface released under the OFL. Bundling it does
+not imply any affiliation with or endorsement by JetBrains.
+
+==============================================================================
+Lucide icons
+License: ISC (a fork of Feather icons, MIT)
+Full text: assets/icons/LICENSE
+
+==============================================================================
+Rust crate dependencies
+
+The full dependency tree is declared in Cargo.toml / Cargo.lock. Those crates are
+predominantly licensed under the MIT and Apache-2.0 licenses; per-crate license
+texts can be regenerated with `cargo about generate` or found in each crate's
+repository.

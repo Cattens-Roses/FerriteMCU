@@ -1,0 +1,13 @@
+[package]
+name = "ferritemcu-diff"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Line + word diff for FerriteMCU (built on `similar`). Pure, no GUI."
+
+[dependencies]
+similar = { version = "3", features = ["unicode", "inline"] }
+
+[lints]
+workspace = true

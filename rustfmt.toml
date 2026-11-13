@@ -1,0 +1,3 @@
+# Defaults are good; keep edition aligned with Cargo.toml so `cargo fmt` and
+# CI's `--check` never disagree about edition-specific formatting.
+edition = "2021"

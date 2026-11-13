@@ -1,0 +1,14 @@
+[package]
+name = "ferritemcu-git"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Git operations for FerriteMCU — shells out to the git binary. Pure, no GUI."
+
+[dependencies]
+# Typed errors for a library crate (rule: libs use thiserror, never anyhow).
+thiserror.workspace = true
+
+[lints]
+workspace = true

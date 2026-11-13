@@ -1,0 +1,1208 @@
+//! History view (git log) — the third rail mode. Commit list + changed-files tree + a
+//! read-only side-by-side diff, with branch picker, path scope, and compare modes. A
+//! crate-root child module; its `impl FerriteMCU` block reaches FerriteMCU's private fields directly.
+
+use crate::*;
+
+/// Width of one commit-graph lane (px).
+const LANE_W: f32 = 12.0;
+/// The graph column never grows past this many lanes; wider histories clip on the right.
+const MAX_LANES: usize = 10;
+
+/// Commit-graph lane colours — theme accents, so every palette (light, dark, CVD) holds.
+fn lane_color(i: usize) -> ferritemcu_color::Color {
+    let t = theme::get();
+    let palette = [
+        t.status_modified,
+        t.status_added,
+        t.syn_keyword,
+        t.syn_field,
+        t.syn_number,
+        t.status_conflict,
+    ];
+    palette[i % palette.len()]
+}
+
+/// One commit's slice of the graph: lines through the row (straight down, or an S-curve
+/// between lanes) and the commit's node. Fills the row's height, so the slices of
+/// consecutive rows join into continuous lines.
+fn graph_cell(row: git::graph::GraphRow, lanes: usize) -> impl IntoElement {
+    gpui::canvas(
+        |_, _, _| (),
+        move |bounds, (), window, _cx| {
+            // The log isn't virtualized — skip tessellating rows scrolled out of view.
+            if !window.content_mask().bounds.intersects(&bounds) {
+                return;
+            }
+            let x = |lane: usize| bounds.left() + px(LANE_W * lane as f32 + LANE_W / 2.0);
+            let (top, bottom) = (bounds.top(), bounds.bottom());
+            let mid = top + bounds.size.height / 2.0;
+            let mut line = |from: gpui::Point<Pixels>, to: gpui::Point<Pixels>, color| {
+                let mut path = gpui::PathBuilder::stroke(px(1.5));
+                path.move_to(from);
+                if from.x == to.x {
+                    path.line_to(to);
+                } else {
+                    // Leave and arrive vertically: two quadratic halves.
+                    let y = (from.y + to.y) / 2.0;
+                    let x_mid = (from.x + to.x) / 2.0;
+                    path.curve_to(gpui::point(x_mid, y), gpui::point(from.x, y));
+                    path.curve_to(to, gpui::point(to.x, y));
+                }
+                if let Ok(path) = path.build() {
+                    window.paint_path(path, lane_color(color));
+                }
+            };
+            for e in &row.up {
+                line(
+                    gpui::point(x(e.from), top),
+                    gpui::point(x(e.to), mid),
+                    e.color,
+                );
+            }
+            for e in &row.down {
+                line(
+                    gpui::point(x(e.from), mid),
+                    gpui::point(x(e.to), bottom),
+                    e.color,
+                );
+            }
+            let node = gpui::Bounds::centered_at(
+                gpui::point(x(row.lane), mid),
+                gpui::size(px(7.0), px(7.0)),
+            );
+            window.paint_quad(gpui::fill(node, lane_color(row.color)).corner_radii(px(3.5)));
+        },
+    )
+    .w(px(LANE_W * lanes as f32))
+    .flex_none()
+}
+
+impl FerriteMCU {
+    /// History (git log) view: a commit list (left), the selected commit's changed files
+    /// (middle), and a read-only side-by-side diff (right). A branch dropdown picks which
+    /// ref to log; a segmented control picks what the commit is diffed against.
+    pub(crate) fn render_history(
+        &mut self,
+        ui: &'static str,
+        fs: gpui::Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let t = theme::get();
+        // No git repository → no history. Reuse the Commit view's explanation (issue #66).
+        if !self.is_git {
+            return self.render_no_git(ui, cx);
+        }
+
+        // ── header: branch chip + commit search + compare-mode segmented control ──
+        let rev_label: SharedString = format!("⎇ {}", self.history.rev).into();
+        let branch_chip = div()
+            .id("hist-branch")
+            .flex()
+            .items_center()
+            .gap_1()
+            .h(px(28.0))
+            .px_2()
+            .rounded_md()
+            .border_1()
+            .border_color(t.divider)
+            .text_color(t.secondary_text)
+            .cursor_pointer()
+            .hover(|d| d.bg(t.bg_mid))
+            .child(rev_label)
+            // Chevron → reads as a select.
+            .child(
+                svg()
+                    .path("icons/chevron-down.svg")
+                    .size(px(14.0))
+                    .text_color(t.line_number),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _e, window, cx| {
+                    this.toggle_history_branches(cx);
+                    if this.history.branch_open {
+                        // Focus now and next frame: the dropdown isn't in the tree on first open.
+                        let handle = this.history.branch_query.read(cx).focus_handle.clone();
+                        window.focus(&handle);
+                        window.defer(cx, move |window, _cx| window.focus(&handle));
+                    }
+                }),
+            );
+
+        // Compare-mode dropdown trigger (replaces the old segmented control). The menu itself
+        // is rendered near the branch dropdown below (anchored above the panel).
+        let cmp_label: SharedString = self.history.compare.label().into();
+        let compare_chip = div()
+            .id("hist-compare")
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_1()
+            .h(px(28.0))
+            .px_2()
+            .rounded_md()
+            .border_1()
+            .border_color(t.divider)
+            .text_color(t.secondary_text)
+            .text_size(px(t.ui_font_size))
+            .cursor_pointer()
+            .hover(|d| d.bg(t.bg_mid))
+            .child(cmp_label)
+            .child(
+                svg()
+                    .path("icons/chevron-down.svg")
+                    .size(px(14.0))
+                    .text_color(t.line_number),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _e, window, cx| {
+                    this.history.compare_open = !this.history.compare_open;
+                    if this.history.compare_open {
+                        // The list takes the keyboard (↑↓ ⏎ ⎋); it lands next frame.
+                        this.history.compare_hl = None;
+                        let focus = this.history.compare_focus.clone();
+                        window.focus(&focus);
+                        window.defer(cx, move |window, _cx| window.focus(&focus));
+                    }
+                    cx.notify();
+                }),
+            );
+        // Scope chip: shown when the log is restricted to a folder/file; click clears it.
+        let scope_chip = self.history.path.as_ref().map(|p| {
+            let label: SharedString = format!("▸ {}", p.to_string_lossy()).into();
+            div()
+                .id("hist-scope")
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(t.bg_mid)
+                .text_color(t.secondary_text)
+                .cursor_pointer()
+                .hover(|d| d.bg(t.bg_light))
+                .tooltip(ui::tip("Clear path filter"))
+                .child(label)
+                .child(div().text_color(t.line_number).child("×"))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _e, _w, cx| this.enter_history(cx)),
+                )
+        });
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .flex_none()
+            .px_1()
+            // Equal top/bottom gap to the divider below.
+            .pt(px(theme::FRAME_GAP))
+            .pb(px(theme::FRAME_GAP))
+            .font_family(ui)
+            .child(branch_chip)
+            .children(scope_chip)
+            // Commit search box, immediately right of the branch dropdown. ↑↓ / ⏎ from it
+            // walk the (filtered) commit list (issue #81).
+            .child(
+                nav_keys(
+                    div().key_context(ui::nav::NAV_LIST),
+                    NavTarget::HistoryCommits,
+                    cx,
+                )
+                .flex_1()
+                .min_w_0()
+                // Right margin matches the branch chip's left inset (header px_1).
+                .mr_1()
+                .px_2()
+                // py_1 + 18px editor line + 2px border = 28px, matching the chip's h(28).
+                .py_1()
+                .rounded_md()
+                .border_1()
+                .border_color(t.divider)
+                .text_size(px(t.ui_font_size))
+                .child(self.history.commit_query.clone()),
+            )
+            .child(compare_chip)
+            // Minimise / expand the bottom panel (IDE tool-window style).
+            .child({
+                let collapsed = self.history.panel_collapsed;
+                ui::icon_btn("hist-panel-toggle", 28.0)
+                    .text_size(px(16.0))
+                    .tooltip(ui::tip(if collapsed {
+                        "Expand panel"
+                    } else {
+                        "Minimise panel"
+                    }))
+                    // `−` to minimise (same as the Browse tree's collapse button); to expand,
+                    // the tree's `»` double-chevron rotated to point up (this panel grows
+                    // upward) = Lucide `chevrons-up`.
+                    .child(if collapsed {
+                        // svg() does NOT inherit the parent div's text color — set it here, or
+                        // the icon draws with no stroke (invisible).
+                        svg()
+                            .path("icons/chevrons-up.svg")
+                            .size(px(16.0))
+                            .text_color(t.line_number)
+                            .into_any_element()
+                    } else {
+                        SharedString::from("−").into_any_element()
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _e, _w, cx| {
+                            this.history.panel_collapsed = !this.history.panel_collapsed;
+                            cx.notify();
+                        }),
+                    )
+            });
+
+        // ── commit list (filtered by the commit search box) ──
+        let shown = self.history_visible_commits(cx);
+        // The graph only means something over the full, unfiltered log.
+        let unfiltered = shown.len() == self.history.commits.len();
+        let commit_rows: Vec<gpui::AnyElement> = shown
+            .into_iter()
+            .filter_map(|i| self.history.commits.get(i).map(|c| (i, c)))
+            .map(|(i, c)| {
+                let selected = self.history.selected == Some(i);
+                let subject: SharedString = c.subject.clone().into();
+                let meta: SharedString = format!("{} · {} · {}", c.short, c.author, c.date).into();
+                let refs = c.refs.clone();
+                let graph = unfiltered
+                    .then(|| self.history.graph.get(i))
+                    .flatten()
+                    .map(|g| graph_cell(g.clone(), self.history.graph_lanes));
+                let text = div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.0))
+                    .px_2()
+                    .py_1()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(t.text)
+                                    .child(subject),
+                            )
+                            .when(!refs.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .flex_none()
+                                        .px_1()
+                                        .rounded_sm()
+                                        .bg(t.bg_mid)
+                                        .text_size(px(10.0))
+                                        .text_color(t.primary)
+                                        .child(SharedString::from(refs.clone())),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(t.line_number)
+                            .truncate()
+                            .child(meta),
+                    );
+                ui::picker::row(("hist-commit", i), selected, t.bg_mid)
+                    .flex()
+                    .flex_row()
+                    .mx_1()
+                    .pl_1()
+                    .children(graph)
+                    .child(text)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _e, window, cx| {
+                            window.focus(&this.history.list_focus);
+                            this.select_history_commit(i, cx);
+                        }),
+                    )
+                    // Right-click → the same compare options as the header dropdown.
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, e: &gpui::MouseDownEvent, _w, cx| {
+                            this.open_menu(e.position, MenuTarget::HistoryCompare(i), cx);
+                        }),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        // Scrollable commit list, wrapped in a flex-basis sizer (the basis must live on a
+        // plain wrapper, NOT on the scroll element itself — that's why it collapsed before;
+        // mirrors how render_diff sizes its two panes). Default 2/3 of the panel width.
+        let commit_pane = nav_keys(
+            div()
+                .id("hist-commits")
+                .track_focus(&self.history.list_focus)
+                .key_context("NavList NavTree"),
+            NavTarget::HistoryCommits,
+            cx,
+        )
+        .overflow_y_scroll()
+        .track_scroll(&self.history.scroll)
+        .size_full()
+        .flex()
+        .flex_col()
+        .py_1()
+        .font_family(ui)
+        .text_size(px(t.ui_font_size + 1.0))
+        .children(commit_rows);
+        // Commit list = a resizable share of the panel width on the LEFT (defaults to 2/3); the
+        // files pane fills the rest (flex_1). Sized in EXPLICIT pixels from the same formula the
+        // divider drag inverts (`Divider::HistCommit`), so the bar tracks the cursor exactly 1:1.
+        let commit_frac = self.history.commit_frac.clamp(0.15, 0.85);
+        let commit_w = commit_frac * hist_split_w(f32::from(window.viewport_size().width));
+        let commit_wrap = div()
+            .w(px(commit_w))
+            .flex_none()
+            .min_w_0()
+            .h_full()
+            .child(commit_pane);
+
+        // ── changed files of the selected commit, as a folder tree + a search box ──
+        let visible = self.history_visible_files(cx);
+        // Root row shows the project name (like the Browse tree), not a generic "Files".
+        let root_name: SharedString = self.project_name().into();
+        let file_ix = super::commit::file_index(&self.history.files);
+        let file_rows: Vec<gpui::AnyElement> = visible
+            .into_iter()
+            .map(|r| {
+                let is_root = r.path.as_os_str().is_empty();
+                let file_idx = (!r.is_dir)
+                    .then(|| file_ix.get(r.path.as_path()).copied())
+                    .flatten();
+                // The keyboard cursor: a folder when it's on one, else the selected file.
+                let selected = match &self.history.files_dir_cursor {
+                    Some(dir) => *dir == r.path,
+                    None => file_idx.is_some() && self.history.file_selected == file_idx,
+                };
+                let name_color = file_idx
+                    .and_then(|i| self.history.files.get(i))
+                    .map_or(t.text, |f| status_color(f.status));
+                let name: SharedString = if is_root {
+                    root_name.clone()
+                } else {
+                    r.path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                        .into()
+                };
+                let expanded = self.history.files_expanded.contains(&r.path);
+                let is_dir = r.is_dir;
+                let p_act = r.path.clone();
+                let p_ctx = r.path.clone();
+                ui::tree::item(
+                    cx,
+                    self.dragging(Divider::Tree),
+                    &r.path,
+                    is_dir,
+                    expanded,
+                    r.depth,
+                    selected,
+                    name,
+                    name_color,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    move |this, _e, window, cx| {
+                        window.focus(&this.history.files_focus);
+                        if is_dir {
+                            if !this.history.files_expanded.remove(&p_act) {
+                                this.history.files_expanded.insert(p_act.clone());
+                            }
+                            this.history.files_dir_cursor = Some(p_act.clone());
+                            cx.notify();
+                        } else if let Some(i) =
+                            this.history.files.iter().position(|f| f.path == p_act)
+                        {
+                            this.select_history_file(i, cx);
+                        }
+                    },
+                    |_this, _cx| {},
+                    // Right-click a file → the same compare options as the header dropdown.
+                    move |this, pos, cx| {
+                        if is_dir {
+                            return;
+                        }
+                        if let Some(i) = this.history.files.iter().position(|f| f.path == p_ctx) {
+                            this.open_menu(pos, MenuTarget::HistoryFile(i), cx);
+                        }
+                    },
+                )
+            })
+            .collect();
+        let files_search = nav_keys(
+            div().key_context(ui::nav::NAV_LIST),
+            NavTarget::HistoryFiles,
+            cx,
+        )
+        .flex_none()
+        .px_2()
+        .py_1p5()
+        .text_size(px(t.ui_font_size))
+        .child(self.history.files_query.clone());
+        let files_hr = ui::hr();
+        // No changed files (e.g. "Compare with Local" when the working tree matches the
+        // commit) → an explicit empty-state instead of a lone, childless root folder row.
+        let files_body = if self.history.files.is_empty() {
+            div()
+                .flex()
+                .flex_1()
+                .min_h_0()
+                .items_center()
+                .justify_center()
+                .text_color(t.line_number)
+                .child("No changes")
+                .into_any_element()
+        } else {
+            nav_keys(
+                div()
+                    .id("hist-files")
+                    .track_focus(&self.history.files_focus)
+                    .key_context("NavList NavTree"),
+                NavTarget::HistoryFiles,
+                cx,
+            )
+            .overflow_y_scroll()
+            .track_scroll(&self.history.files_scroll)
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .px_1()
+            .py_1()
+            .children(file_rows)
+            .into_any_element()
+        };
+        let files_wrap = div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .font_family(ui)
+            .text_size(px(t.ui_font_size + 1.0))
+            .child(files_search)
+            .child(files_hr)
+            .child(files_body);
+
+        // Flat 1px dividers between sections (IntelliJ-style), not frame-gap islands.
+        let hdiv = || div().h(px(3.0)).flex_none().bg(t.bg_light);
+        // Draggable commit/files divider. A touch wider than 1px so it's easy to grab.
+        let split_divider = div()
+            .id("hist-split")
+            .w(px(5.0))
+            .flex_none()
+            .h_full()
+            .cursor_col_resize()
+            .child(div().w(px(1.0)).h_full().mx(px(2.0)).bg(t.divider))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, e: &gpui::MouseDownEvent, window, cx| {
+                    this.start_divider_drag(Divider::HistCommit, e.position, window);
+                    cx.notify();
+                }),
+            );
+
+        // Bottom panel (one island): toolbar, then commit list | files, divider-split.
+        // Height is drag-resizable via the strip above it (`history.panel_h`). The header
+        // chevron minimises it to just the toolbar (`history.panel_collapsed`).
+        let panel_h = self.history.panel_h;
+        let collapsed = self.history.panel_collapsed;
+        // Toolbar height: pt + 28px chip row + pb. Used to anchor the dropdowns + as the
+        // panel height when minimised.
+        let header_h = theme::FRAME_GAP * 2.0 + 28.0;
+        let panel_visible_h = if collapsed { header_h } else { panel_h };
+        let mut bottom = div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .bg(t.main_bg)
+            .rounded(px(theme::ISLAND_RADIUS))
+            .overflow_hidden()
+            .child(header);
+        if !collapsed {
+            bottom = bottom.h(px(panel_h)).child(hdiv()).child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .w_full()
+                    .min_h_0()
+                    .child(self.render_history_branches(ui, cx))
+                    .child(div().w(px(1.0)).flex_none().h_full().bg(t.divider))
+                    .child(commit_wrap)
+                    .child(split_divider)
+                    .child(files_wrap),
+            );
+        }
+
+        // Drag strip between the diff (top) and the log panel (bottom) — resizes the panel.
+        let v_divider = div()
+            .id("hist-vsplit")
+            .h(px(theme::FRAME_GAP))
+            .flex_none()
+            .w_full()
+            .cursor_row_resize()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, e: &gpui::MouseDownEvent, window, cx| {
+                    this.start_divider_drag(Divider::HistPanel, e.position, window);
+                    cx.notify();
+                }),
+            );
+
+        // Top = diff (main), divider, bottom = the log panel. The resize strip is dropped
+        // when the panel is minimised (nothing to resize).
+        let mut root = div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .child(self.render_diff_with_find(ui, fs, window, cx));
+        if !collapsed {
+            root = root.child(v_divider);
+        }
+        root = root.child(bottom);
+
+        // Branch dropdown: a search box over Local / Remote sections, anchored ABOVE the
+        // bottom-panel toolbar (it grows up over the diff so it isn't clipped by the panel).
+        // A transparent backdrop closes it.
+        if self.history.branch_open {
+            let cur = self.history.rev.clone();
+            let (locals, remotes) = self.history_rev_choices(cx);
+            let head = self.history_rev_matches("HEAD", cx);
+            // Keyboard highlight runs over HEAD, the locals, then the remotes (render order).
+            let hl = self.history.rev_hl;
+            let mut row_ix = 0usize;
+            // One clickable branch row → re-log that ref.
+            let mut mk = |b: String, cx: &mut Context<Self>| {
+                let selected = hl.map_or(b == cur, |h| h == row_ix);
+                row_ix += 1;
+                let label: SharedString = b.clone().into();
+                ui::picker::row(
+                    SharedString::from(format!("hist-rev-{b}")),
+                    selected,
+                    t.bg_mid,
+                )
+                .px_2()
+                .py_1()
+                .text_color(t.text)
+                .child(label)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _e, _w, cx| this.set_history_rev(b.clone(), cx)),
+                )
+                .into_any_element()
+            };
+            let section = |label: &'static str| {
+                div()
+                    .px_2()
+                    .pt_1()
+                    .text_size(px(10.0))
+                    .text_color(t.line_number)
+                    .child(label)
+            };
+            // The search box keeps focus: ↑↓ / ⏎ bubble from it, ⎋ closes (issue #81).
+            let mut menu = nav_keys(
+                div().id("hist-rev-list").key_context("NavList NavPopup"),
+                NavTarget::HistoryRevs,
+                cx,
+            )
+            .absolute()
+            // Anchor just above the bottom panel's toolbar; grows upward over the diff.
+            .bottom(px(panel_visible_h + 2.0))
+            .left(px(2.0))
+            .flex()
+            .flex_col()
+            .max_h(px(380.0))
+            .overflow_y_scroll()
+            .min_w(px(260.0))
+            .p_1()
+            .bg(t.panel_bg)
+            .border_1()
+            .border_color(t.divider)
+            .rounded_md()
+            .font_family(ui)
+            .text_size(px(t.ui_font_size))
+            // Clicks inside the menu must not fall through to the backdrop (which closes).
+            .on_mouse_down(MouseButton::Left, |_e, _w, cx: &mut App| {
+                cx.stop_propagation();
+            })
+            .child(div().px_1().pb_1().child(self.history.branch_query.clone()));
+            if head {
+                menu = menu.child(mk("HEAD".to_string(), cx));
+            }
+            if !locals.is_empty() {
+                menu = menu.child(section("LOCAL"));
+                for b in locals {
+                    menu = menu.child(mk(b, cx));
+                }
+            }
+            if !remotes.is_empty() {
+                menu = menu.child(section("REMOTE"));
+                for b in remotes {
+                    menu = menu.child(mk(b, cx));
+                }
+            }
+            root = root.child(
+                div()
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .size_full()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _e, _w, cx| {
+                            this.history.branch_open = false;
+                            cx.notify();
+                        }),
+                    )
+                    .child(menu),
+            );
+        }
+
+        // Compare-mode dropdown: anchored above the panel toolbar on the RIGHT (the chip is
+        // top-right). Each row = label + one-line description so the taxonomy is self-explaining.
+        if self.history.compare_open {
+            let cur = self.history.compare;
+            let hl = self.history.compare_hl;
+            let mut menu = nav_keys(
+                div()
+                    .id("hist-compare-list")
+                    .track_focus(&self.history.compare_focus)
+                    .key_context("NavList NavTree NavPopup"),
+                NavTarget::HistoryCompareModes,
+                cx,
+            )
+            .absolute()
+            .bottom(px(panel_visible_h + 2.0))
+            .right(px(2.0))
+            .flex()
+            .flex_col()
+            .min_w(px(300.0))
+            .p_1()
+            .bg(t.panel_bg)
+            .border_1()
+            .border_color(t.divider)
+            .rounded_md()
+            .font_family(ui)
+            .text_size(px(t.ui_font_size))
+            .on_mouse_down(MouseButton::Left, |_e, _w, cx: &mut App| {
+                cx.stop_propagation();
+            });
+            for (i, mode) in CompareMode::ALL.into_iter().enumerate() {
+                let selected = hl.map_or(mode == cur, |h| h == i);
+                menu = menu.child(
+                    ui::picker::row(mode.key(), selected, t.bg_mid)
+                        .flex()
+                        .flex_col()
+                        .gap(px(1.0))
+                        .px_2()
+                        .py_1()
+                        .child(div().text_color(t.text).child(mode.label()))
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(t.line_number)
+                                .child(mode.desc()),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _e, _w, cx| this.set_history_compare(mode, cx)),
+                        ),
+                );
+            }
+            root = root.child(
+                div()
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .size_full()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _e, _w, cx| {
+                            this.history.compare_open = false;
+                            cx.notify();
+                        }),
+                    )
+                    .child(menu),
+            );
+        }
+
+        root.into_any_element()
+    }
+
+    // ── History (git log) view ────────────────────────────────────────────
+    /// Enter the history view for the whole repo, logging the current branch.
+    pub(crate) fn enter_history(&mut self, cx: &mut Context<Self>) {
+        self.history.path = None;
+        self.enter_history_inner(cx);
+    }
+
+    /// Enter the history view scoped to `path` (a folder/file) — commits that touched that
+    /// subtree, recursively. Opened from a Browse-tree folder's right-click → "Git History".
+    pub(crate) fn enter_history_for(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        // Root path (empty) = whole repo.
+        self.history.path = if path.as_os_str().is_empty() {
+            None
+        } else {
+            Some(path)
+        };
+        self.enter_history_inner(cx);
+    }
+
+    fn enter_history_inner(&mut self, cx: &mut Context<Self>) {
+        self.mode = Mode::History;
+        self.diff_view_open = false;
+        self.history.rev = self
+            .current_branch
+            .clone()
+            .unwrap_or_else(|| "HEAD".to_string());
+        self.reload_history(cx);
+        self.load_history_branches(cx);
+    }
+
+    /// Reload the commit list for `history.rev` (scoped to `history.path`), select newest.
+    pub(crate) fn reload_history(&mut self, cx: &mut Context<Self>) {
+        let path = self.history.path.clone();
+        self.history.commits = self
+            .repo()
+            .and_then(|r| r.log(&self.history.rev, 300, path.as_deref()).ok())
+            .unwrap_or_default();
+        // Lay the graph out once per load — never on the render path.
+        let links: Vec<(&str, Vec<&str>)> = self
+            .history
+            .commits
+            .iter()
+            .map(|c| {
+                (
+                    c.hash.as_str(),
+                    c.parents.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        self.history.graph = git::graph::layout(&links);
+        self.history.graph_lanes = self
+            .history
+            .graph
+            .iter()
+            .map(git::graph::GraphRow::width)
+            .max()
+            .unwrap_or(0)
+            .min(MAX_LANES);
+        self.history.selected = None;
+        self.history.files.clear();
+        self.history.file_selected = None;
+        if self.history.commits.is_empty() {
+            cx.notify();
+        } else {
+            self.select_history_commit(0, cx);
+        }
+    }
+
+    /// Whether `name` passes the branch dropdown's search.
+    fn history_rev_matches(&self, name: &str, cx: &App) -> bool {
+        let q = self
+            .history
+            .branch_query
+            .read(cx)
+            .text()
+            .trim()
+            .to_lowercase();
+        q.is_empty() || name.to_lowercase().contains(&q)
+    }
+
+    /// The branch dropdown's `(locals, remotes)` matching its search.
+    fn history_rev_choices(&self, cx: &App) -> (Vec<String>, Vec<String>) {
+        let pick = |list: &[String]| -> Vec<String> {
+            list.iter()
+                .filter(|n| self.history_rev_matches(n, cx))
+                .cloned()
+                .collect()
+        };
+        (pick(&self.history.locals), pick(&self.history.remotes))
+    }
+
+    /// Every row of the branch dropdown, in render order (HEAD, locals, remotes) — what
+    /// the keyboard highlight indexes.
+    pub(crate) fn history_rev_items(&self, cx: &App) -> Vec<String> {
+        let (locals, remotes) = self.history_rev_choices(cx);
+        let mut items = Vec::new();
+        if self.history_rev_matches("HEAD", cx) {
+            items.push("HEAD".to_string());
+        }
+        items.extend(locals);
+        items.extend(remotes);
+        items
+    }
+
+    /// Toggle the history branch dropdown, loading local + remote branches when opening it
+    /// and resetting the search box.
+    pub(crate) fn toggle_history_branches(&mut self, cx: &mut Context<Self>) {
+        if !self.history.branch_open {
+            if let Some(r) = self.repo() {
+                let locals = r.branches().unwrap_or_default();
+                let remotes = r.remote_branches().unwrap_or_default();
+                self.set_history_branches(locals, remotes);
+            }
+            self.history.branch_query.update(cx, |e, cx| {
+                e.set_content(String::new(), Lang::PlainText, cx);
+            });
+        }
+        self.history.branch_open = !self.history.branch_open;
+        cx.notify();
+    }
+
+    /// Point the log at a different branch/rev (from the branch dropdown).
+    pub(crate) fn set_history_rev(&mut self, rev: String, cx: &mut Context<Self>) {
+        self.history.rev = rev;
+        self.history.branch_open = false;
+        self.reload_history(cx);
+    }
+
+    /// Load local + remote branches for the sidebar off the UI thread.
+    fn load_history_branches(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.repo_root.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let (locals, remotes) = cx
+                .background_executor()
+                .spawn(async move {
+                    Repo::discover(&root)
+                        .map(|r| {
+                            (
+                                r.branches().unwrap_or_default(),
+                                r.remote_branches().unwrap_or_default(),
+                            )
+                        })
+                        .unwrap_or_default()
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.set_history_branches(locals, remotes);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Store the branch lists and open every sidebar folder the user hasn't collapsed (computed
+    /// here, once per load — never per frame).
+    fn set_history_branches(&mut self, locals: Vec<String>, remotes: Vec<String>) {
+        let none = std::collections::HashSet::new();
+        let h = &mut self.history;
+        h.branches_expanded = branch_rows(&[], &locals, &remotes, &none, true)
+            .into_iter()
+            .filter_map(|r| match r.node {
+                BranchNode::Folder { key, .. } if !h.branches_collapsed.contains(&key) => Some(key),
+                _ => None,
+            })
+            .collect();
+        h.locals = locals;
+        h.remotes = remotes;
+    }
+
+    pub(crate) fn toggle_history_branch_folder(&mut self, key: String, cx: &mut Context<Self>) {
+        let h = &mut self.history;
+        if h.branches_expanded.remove(&key) {
+            h.branches_collapsed.insert(key);
+        } else {
+            h.branches_collapsed.remove(&key);
+            h.branches_expanded.insert(key);
+        }
+        cx.notify();
+    }
+
+    /// The branches sidebar left of the commit list (`IntelliJ`'s Log pane): `HEAD`, then the
+    /// Local and Remote branches with `/` segments as folders. Clicking a branch logs it.
+    fn render_history_branches(
+        &self,
+        ui: &'static str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let t = theme::get();
+        let rev = self.history.rev.as_str();
+        let current = self.current_branch.as_deref();
+        let row = |id: (&'static str, usize), selected: bool, depth: usize| {
+            ui::picker::row(id, selected, t.bg_mid)
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .h(px(24.0))
+                .mx(px(6.0))
+                .pl(px(8.0 + depth as f32 * 14.0))
+                .pr_2()
+                .flex_none()
+        };
+        let icon = |path: &'static str, color: ferritemcu_color::Color| {
+            svg()
+                .path(path)
+                .size(px(14.0))
+                .flex_none()
+                .text_color(color)
+        };
+        // Same caret column as the file trees (`ui::tree::item`): a triangle for folders, an
+        // empty spacer for branches so their icons line up under the folder icons.
+        let caret = |expanded: Option<bool>| {
+            div()
+                .w(px(16.0))
+                .flex_none()
+                .text_color(t.line_number)
+                .text_size(px(t.ui_font_size + 5.0))
+                .when_some(expanded, |d, open| {
+                    d.child(if open { "▾" } else { "▸" })
+                })
+        };
+        let head = row(("hist-br-head", 0), rev == "HEAD", 0)
+            .child(caret(None))
+            .child(icon("icons/git-commit.svg", t.line_number))
+            .child(div().truncate().child("HEAD (Current Branch)"))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _e, _w, cx| this.set_history_rev("HEAD".to_string(), cx)),
+            );
+        let rows = branch_rows(
+            &[],
+            &self.history.locals,
+            &self.history.remotes,
+            &self.history.branches_expanded,
+            false,
+        );
+        let items = rows.into_iter().enumerate().map(|(i, r)| match r.node {
+            BranchNode::Folder {
+                key,
+                expanded,
+                section,
+            } => row(("hist-br", i), false, r.depth)
+                .text_color(if section { t.secondary_text } else { t.text })
+                .child(caret(Some(expanded)))
+                .when(!section, |d| {
+                    d.child(icon("icons/folder.svg", t.line_number))
+                })
+                .child(div().truncate().child(SharedString::from(r.label)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _e, _w, cx| {
+                        this.toggle_history_branch_folder(key.clone(), cx);
+                    }),
+                )
+                .into_any_element(),
+            BranchNode::Leaf { full } => {
+                // The checked-out branch gets an accent icon (IntelliJ's current-branch tag).
+                let is_current = current == Some(full.as_str());
+                row(("hist-br", i), rev == full, r.depth)
+                    .child(caret(None))
+                    .child(icon(
+                        "icons/git-branch.svg",
+                        if is_current { t.primary } else { t.line_number },
+                    ))
+                    .child(div().truncate().child(SharedString::from(r.label)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _e, _w, cx| {
+                            this.set_history_rev(full.clone(), cx);
+                        }),
+                    )
+                    .into_any_element()
+            }
+        });
+        div()
+            .id("hist-branches")
+            .w(px(HIST_BRANCHES_W))
+            .flex_none()
+            .h_full()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .py_1()
+            .font_family(ui)
+            .text_size(px(t.ui_font_size + 1.0))
+            .text_color(t.text)
+            .child(head)
+            .children(items)
+            .into_any_element()
+    }
+
+    /// `(from, to)` revisions for the current compare mode against `hash`; `to == None`
+    /// means the working tree.
+    fn history_revs(&self, hash: &str) -> (String, Option<String>) {
+        match self.history.compare {
+            CompareMode::Before => (format!("{hash}^"), Some(hash.to_string())),
+            CompareMode::Local => (hash.to_string(), None),
+            CompareMode::BeforeLocal => (format!("{hash}^"), None),
+        }
+    }
+
+    fn recompute_history_files(&mut self) {
+        self.history.files.clear();
+        let (Some(idx), Some(repo)) = (self.history.selected, self.repo()) else {
+            return;
+        };
+        let Some(commit) = self.history.commits.get(idx) else {
+            return;
+        };
+        let (from, to) = self.history_revs(&commit.hash);
+        let path = self.history.path.clone();
+        self.history.files = repo.diff_files(&from, to.as_deref(), path.as_deref());
+        // Folder tree of the changed files, fully expanded so every change is visible.
+        let paths: Vec<PathBuf> = self.history.files.iter().map(|f| f.path.clone()).collect();
+        self.history.files_tree = tree::Tree::build(&paths);
+        self.history.files_expanded.clear();
+        self.history.files_expanded.insert(PathBuf::new());
+        for p in &paths {
+            for anc in p.ancestors().skip(1) {
+                self.history.files_expanded.insert(anc.to_path_buf());
+            }
+        }
+    }
+
+    /// Indices into `history.commits` shown by the commit list — filtered by the search box
+    /// on subject / author / hash.
+    pub(crate) fn history_visible_commits(&self, cx: &App) -> Vec<usize> {
+        let cq = self
+            .history
+            .commit_query
+            .read(cx)
+            .text()
+            .trim()
+            .to_lowercase();
+        self.history
+            .commits
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                cq.is_empty()
+                    || c.subject.to_lowercase().contains(&cq)
+                    || c.author.to_lowercase().contains(&cq)
+                    || c.short.to_lowercase().contains(&cq)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The history files tree's visible rows: root + expanded descendants, filtered by the
+    /// files search box (keeping the root, matching files, and dirs containing a match).
+    pub(crate) fn history_visible_files(&self, cx: &App) -> Vec<tree::Row> {
+        let mut visible = self
+            .history
+            .files_tree
+            .visible_with_root(&self.history.files_expanded);
+        tree::retain_matching(
+            &mut visible,
+            self.history.files.iter().map(|f| f.path.as_path()),
+            self.history.files_query.read(cx).text(),
+        );
+        visible
+    }
+
+    /// Select a commit → recompute its changed files (per compare mode) + open the first.
+    pub(crate) fn select_history_commit(&mut self, idx: usize, cx: &mut Context<Self>) {
+        self.history.selected = Some(idx);
+        self.history.files_dir_cursor = None;
+        self.recompute_history_files();
+        self.history.file_selected = None;
+        if self.history.files.is_empty() {
+            self.diff.path = None;
+            cx.notify();
+        } else {
+            self.select_history_file(0, cx);
+        }
+    }
+
+    /// Right-click a commit → pick a compare mode for it: select that commit, then apply the
+    /// mode (mirrors the header dropdown, which acts on the selected commit).
+    pub(crate) fn history_compare_commit(
+        &mut self,
+        idx: usize,
+        mode: CompareMode,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_menu = None;
+        self.history.selected = Some(idx);
+        self.set_history_compare(mode, cx);
+    }
+
+    /// Right-click a changed file → pick a compare mode: apply the mode, then re-select that
+    /// file under it (the recompute reorders — or drops — files, e.g. one that matches the
+    /// working tree under "Compare with Local"; dropped → the default first file stays).
+    pub(crate) fn history_compare_file(
+        &mut self,
+        idx: usize,
+        mode: CompareMode,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_menu = None;
+        let path = self.history.files.get(idx).map(|f| f.path.clone());
+        self.set_history_compare(mode, cx);
+        if let Some(i) = path.and_then(|p| self.history.files.iter().position(|f| f.path == p)) {
+            if self.history.file_selected != Some(i) {
+                self.select_history_file(i, cx);
+            }
+        }
+    }
+
+    /// Change the compare mode (vs parent / latest / local) → refresh files + diff.
+    pub(crate) fn set_history_compare(&mut self, mode: CompareMode, cx: &mut Context<Self>) {
+        self.history.compare = mode;
+        self.history.compare_open = false;
+        match self.history.selected {
+            Some(idx) => self.select_history_commit(idx, cx),
+            None => cx.notify(),
+        }
+    }
+
+    /// Load a file's diff for the selected commit + compare mode (read-only).
+    pub(crate) fn select_history_file(&mut self, idx: usize, cx: &mut Context<Self>) {
+        self.history.file_selected = Some(idx);
+        self.history.files_dir_cursor = None;
+        let (Some(cidx), Some(repo)) = (self.history.selected, self.repo()) else {
+            return;
+        };
+        let Some(commit) = self.history.commits.get(cidx).cloned() else {
+            return;
+        };
+        let Some(file) = self.history.files.get(idx).cloned() else {
+            return;
+        };
+        let (from, to) = self.history_revs(&commit.hash);
+        // Right side is the live working tree (`to == None`) → editable + the `»` chevrons
+        // replace the working hunk with the left (committed) version. Comparing two committed
+        // revisions has nothing to edit, so it stays read-only.
+        let editable = to.is_none();
+        let before = repo
+            .committed_content(&from, &file.path)
+            .unwrap_or_default();
+        let after = match to {
+            Some(rev) => repo.committed_content(&rev, &file.path).unwrap_or_default(),
+            None => repo.working_content(&file.path).unwrap_or_default(),
+        };
+        let lang = self.effective_lang(&file.path);
+        self.load_diff_panes(file.path.clone(), before, after, lang, !editable, cx);
+        cx.notify();
+    }
+}

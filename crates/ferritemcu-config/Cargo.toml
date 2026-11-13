@@ -1,0 +1,16 @@
+[package]
+name = "ferritemcu-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "FerriteMCU config + persistence: keymap, language-pack list, recent projects. Pure, no GUI."
+
+[dependencies]
+serde.workspace = true
+# Key order kept when FerriteMCU edits an existing JSON settings file.
+serde_json = { workspace = true, features = ["preserve_order"] }
+thiserror.workspace = true
+
+[lints]
+workspace = true

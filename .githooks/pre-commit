@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Auto-format staged Rust files (project rustfmt.toml) and re-stage them, so a commit can
+# never carry unformatted code into CI's `cargo fmt --all -- --check` gate. Fast — formats
+# only the staged files, not the whole tree.
+#
+# Git runs hooks with a bare environment, so make cargo/rustfmt reachable explicitly.
+set -euo pipefail
+export PATH="$HOME/.cargo/bin:$PATH"
+
+command -v rustfmt >/dev/null 2>&1 || {
+    echo "pre-commit: rustfmt not on PATH — skipping format check" >&2
+    exit 0
+}
+
+files="$(git diff --cached --name-only --diff-filter=ACM -- '*.rs')"
+[ -z "$files" ] && exit 0
+
+# shellcheck disable=SC2086  # filenames are repo paths (no spaces); intentional word-split.
+rustfmt --edition 2021 $files
+# shellcheck disable=SC2086
+git add -- $files

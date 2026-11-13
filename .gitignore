@@ -1,0 +1,19 @@
+/target
+/dist
+*.log
+
+# macOS
+.DS_Store
+
+# IDEs / editors
+/.idea
+/.vscode
+*.swp
+*.iml
+
+# Secrets — signing/notarization credentials (never commit)
+.env
+.env.*
+!.env.example
+*.p12
+*.p8

@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Mirror CI's `check` gate before anything leaves the machine, so a push can't go red on
+# fmt/clippy/test. Runs only on push (not every commit), so day-to-day commits stay fast.
+#
+# Git runs hooks with a bare environment, so make cargo reachable explicitly.
+set -euo pipefail
+export PATH="$HOME/.cargo/bin:$PATH"
+
+echo "pre-push: cargo fmt --all -- --check"
+cargo fmt --all -- --check
+
+echo "pre-push: cargo clippy --all-targets -- -D warnings"
+cargo clippy --all-targets -- -D warnings
+
+echo "pre-push: cargo test --all"
+cargo test --all

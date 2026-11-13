@@ -1,0 +1,207 @@
+name: release
+
+# release-please owns the whole release: it watches Conventional Commits on main,
+# maintains a "release PR" that bumps Cargo.toml + Cargo.lock + CHANGELOG.md, and
+# on merge cuts the vX.Y.Z tag + GitHub Release. The build job then signs + notarizes the
+# macOS .app, Linux AppImage, and Windows zip, then attaches them to that release.
+#
+# Why build runs HERE and not via a tag trigger: tags/releases created with the
+# default GITHUB_TOKEN do NOT trigger other workflows. Keeping build in the same
+# run (gated on release_created) is triggered by the human merge push, so it fires.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.rp.outputs.release_created }}
+      tag_name: ${{ steps.rp.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v5
+        id: rp
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # Picks up release-please-config.json + .release-please-manifest.json.
+
+  build:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      # Serialize so the arm64 asset is uploaded FIRST for compatibility with older macOS
+      # updaters that pick the first zip. Windows is uploaded last and has an OS-specific name.
+      max-parallel: 1
+      matrix:
+        include:
+          # Two macOS slices shipped as separate assets; the in-app updater downloads the one
+          # matching the user's CPU. Both build on the Apple-Silicon runner (x86_64 via the
+          # cross target) so we don't depend on the deprecating Intel runners.
+          #
+          # arm64 keeps the original `ferritemcu-macos.zip` name for backwards compatibility with the
+          # already-shipped (name-agnostic, first-zip) updater; the new updater treats a name
+          # with no arch token as the arm64/generic build.
+          - name: macos-arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+            asset: ferritemcu-macos.zip
+          - name: macos-x86_64
+            os: macos-15
+            target: x86_64-apple-darwin
+            asset: ferritemcu-macos-x86_64.zip
+          # Linux ships an AppImage. Pinned to an Ubuntu release (not ubuntu-latest): the glibc
+          # it builds against is the oldest one the AppImage runs on, so it must not jump when
+          # -latest moves. 22.04 sets that floor at glibc 2.35 (Ubuntu 22.04, Debian 12, Linux
+          # Mint 21); a 24.04 build needs 2.39 for Rust std's pidfd_spawnp/pidfd_getpid, and a
+          # 26.04 one needs 2.43, so neither starts on 22.04.
+          # The name ends in .AppImage, not .zip, so no macOS updater — the old first-zip one
+          # or the arch-aware one — can ever pick it.
+          - name: linux
+            os: ubuntu-22.04
+            asset: ferritemcu-linux-x86_64.AppImage
+          - name: windows
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: ferritemcu-windows-x86_64.zip
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # gpui's Linux backend (blade/Vulkan + wayland/x11/xkb + fontconfig) — same list as build.yml.
+      - name: Install Linux deps
+        if: matrix.name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libssl-dev libzstd-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libfontconfig-dev libfreetype-dev \
+            libx11-dev libxcb1-dev libvulkan-dev \
+            clang cmake
+
+      # Build the matrix arch and wrap it in FerriteMCU.app. bundle-macos.sh ad-hoc-signs it as a
+      # baseline so an unsigned bundle never ships; the next step upgrades that to Developer
+      # ID + notarize.
+      - name: Build + bundle .app
+        if: startsWith(matrix.name, 'macos')
+        run: TARGET=${{ matrix.target }} ./scripts/bundle-macos.sh
+
+      # Developer ID sign + notarize. No-ops (keeps the ad-hoc app) until the signing secrets
+      # are configured, so releases never break waiting on the Apple setup. Secrets:
+      # APPLE_CERT_P12_BASE64 (base64 .p12), APPLE_CERT_P12_PASSWORD, APPLE_SIGN_IDENTITY,
+      # APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD + APPLE_TEAM_ID (notarize auth) — see .env / README.
+      - name: Sign + notarize (Developer ID)
+        if: startsWith(matrix.name, 'macos')
+        env:
+          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          APPLE_CERT_P12_PASSWORD: ${{ secrets.APPLE_CERT_P12_PASSWORD }}
+          APPLE_SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPLE_CERT_P12_BASE64:-}" ]; then
+            echo "Signing secrets not set — shipping the ad-hoc-signed app (right-click -> Open)."
+            exit 0
+          fi
+          # Import the Developer ID cert into a throwaway keychain.
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PW="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          echo "$APPLE_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$APPLE_CERT_P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" \
+            $(security list-keychains -d user | sed -e 's/"//g')
+
+          # Re-sign with the Developer ID identity + hardened runtime (required to notarize).
+          codesign --force --timestamp --options runtime \
+            --sign "$APPLE_SIGN_IDENTITY" dist/FerriteMCU.app
+          codesign --verify --strict --verbose=2 dist/FerriteMCU.app
+
+          # Notarize via Apple ID + app-specific password, wait for the verdict, then staple.
+          ditto -c -k --keepParent dist/FerriteMCU.app "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" --wait
+          xcrun stapler staple dist/FerriteMCU.app
+
+          # Scrub secrets from the runner.
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/notarize.zip"
+          security delete-keychain "$KEYCHAIN"
+
+      - name: Package .app (macos)
+        if: startsWith(matrix.name, 'macos')
+        run: ditto -c -k --keepParent dist/FerriteMCU.app "${{ matrix.asset }}"
+
+      # The in-app updater verifies the download against this digest before swapping the
+      # bundle in (ferritemcu-update REFUSES an https install with no checksum asset) — every
+      # zip must ship with its `.sha256` sibling.
+      - name: Checksum (macos)
+        if: startsWith(matrix.name, 'macos')
+        run: shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+
+      # Build + wrap the binary in an AppImage (icon + .desktop); see scripts/bundle-linux.sh.
+      - name: Package AppImage (linux)
+        if: matrix.name == 'linux'
+        run: |
+          ./scripts/bundle-linux.sh
+          mv dist/FerriteMCU-x86_64.AppImage "${{ matrix.asset }}"
+
+      # Same `.sha256` sibling as the macOS zips, so a download can be checked by hand
+      # (`sha256sum -c`). The in-app updater never installs a Linux build (it only swaps .app
+      # bundles), so this one is for people.
+      - name: Checksum (linux)
+        if: matrix.name == 'linux'
+        run: sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+
+      - name: Build (windows)
+        if: matrix.name == 'windows'
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      # Windows ships the executable with its embedded icon/version metadata.
+      - name: Package zip (windows)
+        if: matrix.name == 'windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/x86_64-pc-windows-msvc/release/ferritemcu.exe `
+            -DestinationPath "${{ matrix.asset }}"
+
+      - name: Checksum (windows)
+        if: matrix.name == 'windows'
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 "${{ matrix.asset }}").Hash.ToLowerInvariant()
+          "$hash  ${{ matrix.asset }}" | Set-Content -Encoding ascii "${{ matrix.asset }}.sha256"
+
+      - name: Attach to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ needs.release-please.outputs.tag_name }}" \
+            "${{ matrix.asset }}" "${{ matrix.asset }}.sha256" --clobber

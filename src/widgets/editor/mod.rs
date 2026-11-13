@@ -1,0 +1,3253 @@
+//! A real multi-line code editor, modeled on gpui's `examples/input.rs` but
+//! extended to multiple lines with tree-sitter syntax highlighting.
+//!
+//! Architecture (same as gpui's text input):
+//!   - `CodeEditor` is an Entity holding the text + selection + layout caches.
+//!   - `EditorElement` is a custom `Element` that shapes each line, paints the
+//!     caret/selection, and wires the OS input handler via `window.handle_input`.
+//!   - Typed text arrives through `EntityInputHandler::replace_text_in_range`
+//!     (so IME / dead keys / emoji all work); control keys come through `actions!`.
+//!
+//! Offsets everywhere are UTF-8 byte offsets into `content` (newlines included).
+use crate::highlight::{self, Lang};
+use crate::theme;
+use gpui::{
+    actions, div, fill, point, prelude::*, px, relative, App, Bounds, Context, CursorStyle,
+    ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
+    Focusable, GlobalElementId, Hsla, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, ScrollHandle, ShapedLine, SharedString, Style, TextRun,
+    UTF16Selection, UnderlineStyle, Window,
+};
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+
+mod element;
+use element::EditorElement;
+
+/// Width of the fold gutter (chevron column) drawn left of the text, when the
+/// buffer has any foldable regions. Zero otherwise (single-line inputs, plain
+/// text with no grammar) so those editors look exactly as before.
+const GUTTER_W: Pixels = px(20.0);
+
+actions!(
+    ferritemcu_editor,
+    [
+        Backspace,
+        Delete,
+        Left,
+        Right,
+        Up,
+        Down,
+        Home,
+        End,
+        Enter,
+        SelectLeft,
+        SelectRight,
+        SelectUp,
+        SelectDown,
+        SelectAll,
+        Paste,
+        Copy,
+        Cut,
+        Undo,
+        Redo,
+        Indent,
+        Outdent,
+        DeleteToHome,
+        WordLeft,
+        WordRight,
+        SelectWordLeft,
+        SelectWordRight,
+        DeleteWordLeft,
+        DeleteWordRight,
+        LspCompletion,
+        LspDefinition,
+        LspFormat,
+    ]
+);
+
+/// Key context names. Multi-line editors use `CONTEXT`; single-line inputs use
+/// `CONTEXT_SINGLE` (no enter/up/down bindings, so those bubble to a surrounding
+/// context such as the file finder).
+pub const CONTEXT: &str = "CodeEditor";
+pub const CONTEXT_SINGLE: &str = "CodeInput";
+
+/// Editor line height in px (font size × multiplier, plus 2px breathing room). Shared by
+/// the editor render and the diff center gutter so their rows stay in lockstep.
+///
+/// Rounded to a whole pixel on purpose: the editor positions text via the
+/// device-pixel-snapped `window.line_height()`, while the diff center gutter places its
+/// `»` chevrons at `row * this`. A fractional value diverges by sub-pixels per line and
+/// accumulates into a visible ~1-row drift far down a large diff; an integral, snap-free
+/// height keeps the two in exact lockstep at any scroll depth.
+pub fn line_height_px() -> f32 {
+    (theme::get().editor_font_size * theme::font::LINE_HEIGHT + 2.0).round()
+}
+
+/// Key bindings for the editor. Call once at startup (and after a keymap change).
+pub fn bind_keys(cx: &mut App) {
+    use gpui::KeyBinding;
+    for ctx in [CONTEXT, CONTEXT_SINGLE] {
+        cx.bind_keys([
+            KeyBinding::new("backspace", Backspace, Some(ctx)),
+            // Holding shift while pressing backspace must still delete.
+            KeyBinding::new("shift-backspace", Backspace, Some(ctx)),
+            KeyBinding::new("delete", Delete, Some(ctx)),
+            KeyBinding::new("left", Left, Some(ctx)),
+            KeyBinding::new("right", Right, Some(ctx)),
+            KeyBinding::new("home", Home, Some(ctx)),
+            KeyBinding::new("end", End, Some(ctx)),
+            KeyBinding::new("shift-left", SelectLeft, Some(ctx)),
+            KeyBinding::new("shift-right", SelectRight, Some(ctx)),
+            // `secondary` is ⌘ on macOS and Ctrl elsewhere.
+            KeyBinding::new("secondary-a", SelectAll, Some(ctx)),
+            KeyBinding::new("secondary-v", Paste, Some(ctx)),
+            KeyBinding::new("secondary-c", Copy, Some(ctx)),
+            KeyBinding::new("secondary-x", Cut, Some(ctx)),
+            KeyBinding::new("secondary-z", Undo, Some(ctx)),
+            KeyBinding::new("secondary-shift-z", Redo, Some(ctx)),
+            KeyBinding::new("tab", Indent, Some(ctx)),
+            KeyBinding::new("shift-tab", Outdent, Some(ctx)),
+        ]);
+        if cfg!(target_os = "macos") {
+            cx.bind_keys([
+                // macOS: cmd-backspace deletes from the caret to the start of the line.
+                KeyBinding::new("cmd-backspace", DeleteToHome, Some(ctx)),
+                // macOS line nav: Cmd+←/→ jump to line start/end.
+                KeyBinding::new("cmd-left", Home, Some(ctx)),
+                KeyBinding::new("cmd-right", End, Some(ctx)),
+            ]);
+        } else {
+            // Linux / Windows: Ctrl moves, selects and deletes by word (Home / End are the
+            // line ends).
+            cx.bind_keys([
+                KeyBinding::new("ctrl-left", WordLeft, Some(ctx)),
+                KeyBinding::new("ctrl-right", WordRight, Some(ctx)),
+                KeyBinding::new("ctrl-shift-left", SelectWordLeft, Some(ctx)),
+                KeyBinding::new("ctrl-shift-right", SelectWordRight, Some(ctx)),
+                KeyBinding::new("ctrl-backspace", DeleteWordLeft, Some(ctx)),
+                KeyBinding::new("ctrl-delete", DeleteWordRight, Some(ctx)),
+            ]);
+        }
+    }
+    // Multi-line only.
+    cx.bind_keys([
+        KeyBinding::new("up", Up, Some(CONTEXT)),
+        KeyBinding::new("down", Down, Some(CONTEXT)),
+        KeyBinding::new("shift-up", SelectUp, Some(CONTEXT)),
+        KeyBinding::new("shift-down", SelectDown, Some(CONTEXT)),
+        KeyBinding::new("enter", Enter, Some(CONTEXT)),
+        KeyBinding::new("ctrl-space", LspCompletion, Some(CONTEXT)),
+        KeyBinding::new("f12", LspDefinition, Some(CONTEXT)),
+        KeyBinding::new("alt-shift-f", LspFormat, Some(CONTEXT)),
+    ]);
+}
+
+/// Emitted whenever the text changes (used by the file finder to re-query live).
+pub enum EditorEvent {
+    Changed,
+    /// ⌘-click landed on an import link — the app resolves the target against
+    /// the project's file list and opens it (issue #26).
+    OpenImport(highlight::ImportLink),
+    /// ⌘-click landed on a USE of an imported symbol — the app opens the
+    /// import's file and jumps to `name`'s definition inside it.
+    OpenSymbol {
+        /// The import that binds the symbol (resolves to the target file).
+        link: highlight::ImportLink,
+        /// The symbol to land on in that file.
+        name: String,
+    },
+    /// ⌘-click landed on a symbol pre-resolved to a definition in another file
+    /// (the external-defs index — e.g. a method on an imported class): the app
+    /// opens `path` and selects `range`.
+    OpenDefinition {
+        /// Target file (repo-relative / absolute-scratch, like open paths).
+        path: std::path::PathBuf,
+        /// The definition name's byte range in that file.
+        range: Range<usize>,
+    },
+    CompletionRequested(usize),
+    DefinitionRequested(usize),
+    FormatRequested,
+    HoverRequested(Option<usize>),
+}
+
+/// What a ⌘-click at some offset targets (see `CodeEditor::symbol_at`).
+enum SymbolTarget {
+    /// The import specifier itself → open the referenced file.
+    Link(highlight::ImportLink),
+    /// A symbol defined in THIS buffer → jump to its definition range.
+    LocalDef(Range<usize>),
+    /// A use of an imported symbol → open its file, land on the definition.
+    ImportedSymbol(highlight::ImportLink, String),
+    /// A symbol defined in a file this buffer imports (method on an imported
+    /// class, helper next to it, …) → open that file at the definition.
+    ExternalDef(std::path::PathBuf, Range<usize>),
+}
+
+/// The ⌘-click navigation caches, computed together on one parse-adjacent pass:
+/// the import links (sorted), the imported-name → link map, and the
+/// definition-site index (name → sorted name-ranges).
+type NavCaches = (
+    Vec<highlight::ImportLink>,
+    std::collections::HashMap<String, highlight::ImportLink>,
+    std::collections::HashMap<String, Vec<Range<usize>>>,
+);
+
+/// Build the navigation caches for `source` (see [`NavCaches`]).
+fn compute_nav(source: &str, lang: Lang) -> NavCaches {
+    let links = highlight::import_links(source, lang);
+    let bound = highlight::import_bindings(source, lang)
+        .into_iter()
+        .collect();
+    let mut defs: std::collections::HashMap<String, Vec<Range<usize>>> =
+        std::collections::HashMap::new();
+    for (name, r) in highlight::definition_sites(source, lang) {
+        defs.entry(name).or_default().push(r);
+    }
+    (links, bound, defs)
+}
+
+/// A point-in-time editor state for the undo/redo stacks.
+#[derive(Clone)]
+struct Snapshot {
+    content: String,
+    selected_range: Range<usize>,
+    selection_reversed: bool,
+}
+
+/// Classifies an edit so consecutive single-character typing coalesces into one
+/// undo step (IntelliJ-style) instead of one step per keystroke.
+#[derive(Clone, Copy, PartialEq)]
+enum EditKind {
+    Type,
+    Other,
+}
+
+/// The grapheme boundary before `off` (0 at the start). A `GraphemeCursor` only looks at
+/// the text around `off` — O(1) per arrow press, where walking `grapheme_indices` from the
+/// end of the buffer was O(file).
+fn prev_grapheme(s: &str, off: usize) -> usize {
+    let off = s.floor_char_boundary(off.min(s.len()));
+    unicode_segmentation::GraphemeCursor::new(off, s.len(), true)
+        .prev_boundary(s, 0)
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+}
+
+/// The grapheme boundary after `off` (the end at the end) — see [`prev_grapheme`].
+fn next_grapheme(s: &str, off: usize) -> usize {
+    let off = s.floor_char_boundary(off.min(s.len()));
+    unicode_segmentation::GraphemeCursor::new(off, s.len(), true)
+        .next_boundary(s, 0)
+        .ok()
+        .flatten()
+        .unwrap_or(s.len())
+}
+
+/// What a word-motion stop separates: whitespace, word characters (letters, digits, `_`) and
+/// the other symbols.
+fn char_kind(c: char) -> u8 {
+    if c.is_whitespace() {
+        0
+    } else if c.is_alphanumeric() || c == '_' {
+        1
+    } else {
+        2
+    }
+}
+
+/// Where Ctrl+← lands from `off`: back over whitespace, then to the start of the run of word
+/// characters (or of symbols) before it. Walks only the text it crosses.
+fn prev_word(s: &str, off: usize) -> usize {
+    let off = s.floor_char_boundary(off.min(s.len()));
+    let mut chars = s[..off]
+        .char_indices()
+        .rev()
+        .skip_while(|&(_, c)| c.is_whitespace());
+    let Some((mut at, c)) = chars.next() else {
+        return 0;
+    };
+    let kind = char_kind(c);
+    for (i, c) in chars {
+        if char_kind(c) != kind {
+            break;
+        }
+        at = i;
+    }
+    at
+}
+
+/// Where Ctrl+→ lands from `off`: over whitespace, then to the end of the run of word
+/// characters (or of symbols) after it — see [`prev_word`].
+fn next_word(s: &str, off: usize) -> usize {
+    let off = s.floor_char_boundary(off.min(s.len()));
+    let mut chars = s[off..]
+        .char_indices()
+        .skip_while(|&(_, c)| c.is_whitespace());
+    let Some((i, c)) = chars.next() else {
+        return s.len();
+    };
+    let kind = char_kind(c);
+    let mut end = off + i + c.len_utf8();
+    for (i, c) in chars {
+        if char_kind(c) != kind {
+            break;
+        }
+        end = off + i + c.len_utf8();
+    }
+    end
+}
+
+pub struct CodeEditor {
+    pub focus_handle: FocusHandle,
+    pub content: String,
+    pub lang: Lang,
+    pub placeholder: SharedString,
+    pub dirty: bool,
+    /// Single-line inputs (e.g. the file-finder query) don't bind enter/up/down,
+    /// letting those keys bubble to the surrounding key context.
+    pub single_line: bool,
+    /// Optional key-context override (e.g. the find bar's inputs use "`FindBar`" so its
+    /// enter/escape bindings fire). `None` → the default single/multi-line context.
+    pub ctx_override: Option<&'static str>,
+    /// Fill the parent's height (clickable across the whole box, e.g. the commit message)
+    /// instead of sizing to content. Content-sized editors (file editor, diff panes) scroll;
+    /// this one fills.
+    pub fill_height: bool,
+    /// Soft-wrap long lines to the element width instead of overflowing horizontally.
+    /// Implemented by emitting one *display row* per wrapped visual segment (each a normal
+    /// uniform-height `ShapedLine`), so the existing caret/click/selection math — which keys
+    /// off `line_starts[dr]` + a uniform `line_height` — works unchanged. Used by the commit
+    /// message box; the file editor stays unwrapped (horizontal scroll).
+    pub soft_wrap: bool,
+    /// Read-only panes (e.g. the diff "before" side) render + select + scroll but
+    /// reject all mutations.
+    pub read_only: bool,
+    selected_range: Range<usize>,
+    selection_reversed: bool,
+    marked_range: Option<Range<usize>>,
+
+    // Undo/redo. Snapshot-based (whole-buffer); fine until the rope buffer lands.
+    /// Oldest first; capped at 1000 by dropping from the front (a deque — `Vec::remove(0)`
+    /// shifted every snapshot on each edit past the cap).
+    undo_stack: std::collections::VecDeque<Snapshot>,
+    redo_stack: Vec<Snapshot>,
+    /// Kind of the most recent edit, for coalescing runs of typing.
+    last_edit: EditKind,
+
+    // ── code folding ──────────────────────────────────────────────
+    /// Buffer line indices currently collapsed (each a foldable region start).
+    folded: HashSet<usize>,
+    /// Foldable regions `(start_line, end_line)`, recomputed on every content
+    /// change; folding `start_line` hides `start_line+1 ..= end_line`.
+    foldable: Vec<(usize, usize)>,
+    /// Set of fold-start lines (= `foldable[*].0`), for O(1) `is_foldable_start`.
+    foldable_starts: HashSet<usize>,
+    /// Bumped each time content changes; an async highlight/fold job only applies if its
+    /// captured generation still matches (so stale big-file results are dropped).
+    compute_gen: u64,
+    /// Cached syntax spans for the whole buffer, recomputed only on content/lang
+    /// change (in `recompute_folds`) — NOT per paint. This is the big-file win:
+    /// scrolling/caret-moving no longer re-highlights the entire file each frame.
+    spans: Vec<highlight::Span>,
+    /// Cached parse-error byte ranges (sorted, non-overlapping), recomputed with
+    /// `spans` — but ONLY when `errors_on`; empty otherwise, so editors with the
+    /// flag off never pay the extra parse.
+    error_ranges: Vec<Range<usize>>,
+    /// LSP diagnostics are maintained separately from parser diagnostics and mapped once
+    /// when a version-matched publishDiagnostics notification arrives.
+    lsp_error_ranges: Vec<Range<usize>>,
+    lsp_messages: Vec<(Range<usize>, String)>,
+    diagnostic_hover: Option<String>,
+    lsp_hover: Option<String>,
+    lsp_hover_offset: Option<usize>,
+    lsp_completions: Vec<(String, String, String, Range<usize>)>,
+    /// Error highlighting for this editor's language — the app pushes it from the
+    /// pack's plugins.json toggle (on by default for installed packs, per-pack
+    /// opt-out). Editors nothing ever pushes to (commit box, single-line inputs,
+    /// diff/merge panes) stay false.
+    errors_on: bool,
+    /// Cached import links (sorted by position), recomputed with `spans` — but
+    /// ONLY when `links_on`, so editors without the toggle never pay the parse.
+    import_links: Vec<highlight::ImportLink>,
+    /// Names bound by imports → their link, for jump-through-the-import on a
+    /// USE of an imported symbol. Recomputed with `import_links`.
+    import_bound: std::collections::HashMap<String, highlight::ImportLink>,
+    /// Definition sites (name → sorted name-ranges), for same-file
+    /// go-to-definition. Recomputed with `import_links`.
+    defs: std::collections::HashMap<String, Vec<Range<usize>>>,
+    /// Definitions found in the files THIS buffer imports (name → target file +
+    /// the name's byte range there) — resolves `obj.method()` when the method
+    /// lives with an imported class. Pushed by the app (`set_external_defs`,
+    /// computed in the background); lowest lookup priority, so local
+    /// definitions and direct import bindings always win.
+    external_defs: std::collections::HashMap<String, (std::path::PathBuf, Range<usize>)>,
+    /// ⌘-click navigation (imports + definitions) for this editor's language
+    /// (same push model as `errors_on`: per-pack toggle, default on).
+    links_on: bool,
+    /// Live ⌘-held state (tracked via `ModifiersChanged`) — gates the hover
+    /// affordance and the click intercept.
+    cmd_held: bool,
+    /// Byte range under the pointer that ⌘-click would act on (an import link
+    /// or a symbol with a known target) — drives the underline + pointer cursor.
+    hover_range: Option<Range<usize>>,
+    /// Longest line length in bytes (recomputed on content change) — drives the element's
+    /// content width so long lines scroll horizontally instead of clipping.
+    max_line_len: usize,
+
+    // Layout caches (populated each paint; used for mouse + vertical movement).
+    // `line_layouts` is sparse — only on-screen display rows are shaped (virtualization),
+    // keyed by display row. `line_starts`/`visible_lines` stay dense (cheap `usize`s) so the
+    // display-row ↔ buffer-line mapping and click→offset math cover the whole file.
+    line_layouts: HashMap<usize, ShapedLine>,
+    /// Total display rows (folds/filler included) — the dense length, since `line_layouts`
+    /// is now sparse and its `.len()` is just the on-screen count.
+    display_rows: usize,
+    line_starts: Vec<usize>,
+    /// Display row → buffer line index (folds skip hidden buffer lines).
+    visible_lines: Vec<usize>,
+    gutter_w: Pixels,
+    /// Width of the line-number sub-column (left part of `gutter_w`); the fold chevron
+    /// column sits to its right, so a click in `[num_w, gutter_w)` toggles a fold.
+    num_w: Pixels,
+    /// Render the gutter (line numbers + fold column) on the RIGHT of the text instead of
+    /// the left. Used by the diff's left/base pane so its line numbers sit toward the center
+    /// gutter (IntelliJ/GitHub side-by-side style); the right pane keeps numbers on the left.
+    pub gutter_right: bool,
+    bounds: Option<Bounds<Pixels>>,
+    line_height: Pixels,
+    /// The parent scroll container's handle (set by the embedding view via
+    /// `set_scroll_handle` whenever it changes, e.g. `editor_scroll` in Browse vs
+    /// `md_editor_scroll` in the Markdown split). Lets the editor scroll itself to keep the
+    /// caret visible on keyboard selection and to auto-scroll while drag-selecting past an
+    /// edge. `None` → the editor never scrolls its parent (e.g. single-line inputs).
+    pub scroll: Option<ScrollHandle>,
+    /// A caret move (keyboard/selection) asked to be revealed; honored on the next paint,
+    /// once pixel layout + viewport are known.
+    reveal_pending: bool,
+    /// Last painted viewport (the parent scroll clip) in window coords — drives drag
+    /// auto-scroll edge detection (`on_mouse_move` has no access to the clip otherwise).
+    viewport: Option<Bounds<Pixels>>,
+    /// Current pointer position during a drag-select, so the auto-scroll loop can keep
+    /// extending the selection while the pointer is held past an edge (no mouse-move events).
+    drag_pos: Option<Point<Pixels>>,
+    /// Last pointer position over the editor (any state) — pressing ⌘ while the
+    /// mouse is stationary still lights up the import link under it.
+    last_mouse: Option<Point<Pixels>>,
+    /// True while the drag auto-scroll loop is running, so we never spawn a second one.
+    autoscroll_active: bool,
+    /// Held vertical-nav key as `(direction, extend-selection)` — `Some` while ↑/↓ (or
+    /// Shift+↑/↓) is held, driving the accelerating auto-repeat loop. `None` = released.
+    nav: Option<(i32, bool)>,
+    /// True while the vertical-nav auto-repeat loop is running (one at a time).
+    nav_active: bool,
+    /// Ticks elapsed in the current hold, for the acceleration curve.
+    nav_ticks: u32,
+    /// Fractional carry of lines-to-move, so a sub-1-line-per-tick speed still advances.
+    nav_accum: f32,
+    /// True only while THIS editor owns an in-progress drag-select, so a drag that began
+    /// elsewhere (e.g. the diff divider) sweeping over it doesn't select text.
+    is_selecting: bool,
+    /// Caret blink: visible this half-cycle. `blink_epoch` cancels a stale blink loop after
+    /// activity restarts it (so the caret is solid right after typing/moving, then blinks).
+    blink_on: bool,
+    blink_epoch: usize,
+    /// Last rendered focus state. Blink timers run only while this editor owns keyboard focus.
+    was_focused: bool,
+    /// Show a line-number gutter (diff panes + future editor option).
+    pub line_numbers: bool,
+    /// Per buffer-line background tint (diff hunk colors). Empty = none.
+    pub line_bg: std::collections::HashMap<usize, ferritemcu_color::Color>,
+    /// Per buffer-line word-level highlight: byte ranges within the line that actually
+    /// changed (inline word diff), painted in `word_bg_color` over the line tint.
+    pub word_bg: std::collections::HashMap<usize, Vec<std::ops::Range<usize>>>,
+    pub word_bg_color: ferritemcu_color::Color,
+    /// Find-bar matches (⌘F), same shape as `word_bg` but its own layer — painted OVER the
+    /// word tint in the theme's `find_match_bg`, so matches show in diff panes too.
+    pub find_bg: std::collections::HashMap<usize, Vec<std::ops::Range<usize>>>,
+    /// The find bar's CURRENT match as `(buffer line, byte range within it)` — painted above
+    /// the selection (which it also is) with a `caret`-coloured outline, so it stays visible
+    /// on a diff-tinted line instead of turning selection-blue.
+    pub find_current: Option<(usize, std::ops::Range<usize>)>,
+    /// Diff alignment: insert N blank display rows BEFORE buffer line `b` (`filler[b]=N`),
+    /// so this pane lines up row-for-row with the other side. `filler_end` = trailing blanks.
+    pub filler: std::collections::HashMap<usize, usize>,
+    pub filler_end: usize,
+}
+
+impl CodeEditor {
+    pub fn new(cx: &mut Context<Self>, content: String, lang: Lang, placeholder: &str) -> Self {
+        Self::with_options(cx, content, lang, placeholder, false)
+    }
+
+    pub fn single_line(cx: &mut Context<Self>, placeholder: &str) -> Self {
+        Self::with_options(cx, String::new(), Lang::PlainText, placeholder, true)
+    }
+
+    /// A read-only editor (selectable, scrollable, highlighted — but not editable).
+    pub fn read_only(cx: &mut Context<Self>, content: String, lang: Lang) -> Self {
+        let mut e = Self::with_options(cx, content, lang, "", false);
+        e.read_only = true;
+        e
+    }
+
+    pub fn with_options(
+        cx: &mut Context<Self>,
+        content: String,
+        lang: Lang,
+        placeholder: &str,
+        single_line: bool,
+    ) -> Self {
+        Self {
+            focus_handle: cx.focus_handle(),
+            content,
+            lang,
+            placeholder: placeholder.to_string().into(),
+            dirty: false,
+            single_line,
+            ctx_override: None,
+            fill_height: false,
+            soft_wrap: false,
+            read_only: false,
+            selected_range: 0..0,
+            selection_reversed: false,
+            marked_range: None,
+            undo_stack: std::collections::VecDeque::new(),
+            redo_stack: Vec::new(),
+            last_edit: EditKind::Other,
+            folded: HashSet::new(),
+            foldable: Vec::new(),
+            foldable_starts: HashSet::new(),
+            compute_gen: 0,
+            spans: Vec::new(),
+            error_ranges: Vec::new(),
+            lsp_error_ranges: Vec::new(),
+            lsp_messages: Vec::new(),
+            diagnostic_hover: None,
+            lsp_hover: None,
+            lsp_hover_offset: None,
+            lsp_completions: Vec::new(),
+            errors_on: false,
+            import_links: Vec::new(),
+            import_bound: std::collections::HashMap::new(),
+            external_defs: std::collections::HashMap::new(),
+            defs: std::collections::HashMap::new(),
+            links_on: false,
+            cmd_held: false,
+            hover_range: None,
+            max_line_len: 0,
+            line_layouts: HashMap::new(),
+            display_rows: 0,
+            line_starts: Vec::new(),
+            visible_lines: Vec::new(),
+            gutter_w: px(0.0),
+            num_w: px(0.0),
+            gutter_right: false,
+            bounds: None,
+            line_height: px(16.0),
+            scroll: None,
+            reveal_pending: false,
+            viewport: None,
+            drag_pos: None,
+            last_mouse: None,
+            autoscroll_active: false,
+            nav: None,
+            nav_active: false,
+            nav_ticks: 0,
+            nav_accum: 0.0,
+            is_selecting: false,
+            blink_on: true,
+            blink_epoch: 0,
+            was_focused: false,
+            line_numbers: false,
+            line_bg: std::collections::HashMap::new(),
+            word_bg: std::collections::HashMap::new(),
+            word_bg_color: ferritemcu_color::Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            },
+            find_bg: std::collections::HashMap::new(),
+            find_current: None,
+            filler: std::collections::HashMap::new(),
+            filler_end: 0,
+        }
+    }
+
+    /// Number of display rows the last frame *shaped* (the sparse `line_layouts` size).
+    /// With virtualization this stays ≈ the on-screen window even for huge files; a
+    /// regression to shaping every line would blow it up to the file's row count. Used by
+    /// the big-file virtualization perf guard.
+    #[cfg(test)]
+    pub fn shaped_row_count(&self) -> usize {
+        self.line_layouts.len()
+    }
+    /// Total display rows of the last frame (dense) — the file's row count (± folds/filler).
+    #[cfg(test)]
+    pub fn display_row_count(&self) -> usize {
+        self.display_rows
+    }
+
+    pub fn set_content(&mut self, content: String, lang: Lang, cx: &mut Context<Self>) {
+        self.content = content;
+        self.lang = lang;
+        self.selected_range = 0..0;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        self.lsp_hover = None;
+        self.lsp_completions.clear();
+        self.dirty = false;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.last_edit = EditKind::Other;
+        self.folded.clear();
+        // A different buffer's imported-files index would resolve names to the
+        // WRONG files — drop it; the app pushes a fresh one after opening.
+        self.external_defs.clear();
+        self.recompute_folds(cx);
+        cx.notify();
+        cx.emit(EditorEvent::Changed);
+    }
+
+    pub(crate) fn set_lsp_diagnostics(
+        &mut self,
+        ranges: Vec<Range<usize>>,
+        messages: Vec<(Range<usize>, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.lsp_error_ranges = ranges;
+        self.lsp_messages = messages;
+        self.diagnostic_hover = None;
+        self.lsp_completions.clear();
+        cx.notify();
+    }
+
+    pub(crate) fn set_lsp_hover(&mut self, hover: Option<String>, cx: &mut Context<Self>) {
+        self.lsp_hover = hover;
+        cx.notify();
+    }
+    pub(crate) fn set_lsp_completions(
+        &mut self,
+        items: Vec<(String, String, String, Range<usize>)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.lsp_completions = items;
+        cx.notify();
+    }
+    fn lsp_completion(&mut self, _: &LspCompletion, _: &mut Window, cx: &mut Context<Self>) {
+        self.lsp_completions.clear();
+        cx.emit(EditorEvent::CompletionRequested(self.selected_range.end));
+    }
+    fn lsp_definition(&mut self, _: &LspDefinition, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(EditorEvent::DefinitionRequested(self.selected_range.end));
+    }
+    fn lsp_format(&mut self, _: &LspFormat, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(EditorEvent::FormatRequested);
+    }
+
+    pub fn text(&self) -> &str {
+        &self.content
+    }
+
+    /// Bumped on every content change — lets a watcher (the find bar) skip a re-scan
+    /// when a burst of change events all describe text it has already seen.
+    pub fn content_gen(&self) -> u64 {
+        self.compute_gen
+    }
+
+    /// The current import specifiers (targets), for the app's cheap "did the
+    /// import set change?" check that gates recomputing the external-defs index.
+    pub fn import_targets(&self) -> Vec<String> {
+        self.import_links.iter().map(|l| l.target.clone()).collect()
+    }
+
+    /// Tell the editor which scroll container currently holds it, so caret-follow and
+    /// drag auto-scroll can move it. Idempotent; call whenever the active container may
+    /// change (e.g. a file opens in Browse vs the Markdown split). Cheap — `ScrollHandle`
+    /// is a shared handle, so this just stores a clone.
+    pub fn set_scroll_handle(&mut self, scroll: ScrollHandle) {
+        self.scroll = Some(scroll);
+    }
+
+    /// Pixel width of the widest line (monospace estimate) plus the gutter — the width an
+    /// explicit-width wrapper must give this editor so long lines overflow the scroll viewport
+    /// and the horizontal scrollbar appears. Mirrors the `content_w` used in `request_layout`.
+    pub fn content_width(&self) -> f32 {
+        let char_w = theme::get().editor_font_size * 0.6;
+        64.0 + self.max_line_len as f32 * char_w + 24.0
+    }
+
+    /// Switch the language and re-highlight the buffer in place, keeping the caret,
+    /// selection, and scroll. Used when a syntax pack is installed for the open file so
+    /// its colors apply immediately instead of only after reopening it.
+    pub fn set_lang(&mut self, lang: Lang, cx: &mut Context<Self>) {
+        self.lang = lang;
+        self.recompute_folds(cx); // rebuilds `spans` from the new grammar
+        cx.notify();
+    }
+
+    /// The current selection as a byte range (collapsed = caret). Read by the
+    /// sort ops (Sort Lines / Sort Keys) and tests.
+    pub fn selection(&self) -> std::ops::Range<usize> {
+        self.selected_range.clone()
+    }
+
+    /// Right-click caret placement: clicking OUTSIDE the current selection moves
+    /// the caret there (so "Sort Keys" acts on the object under the pointer);
+    /// clicking inside keeps the selection (so "Sort Lines" acts on it) — the
+    /// IDE convention.
+    pub fn caret_to(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        let off = self.offset_for_position(pos);
+        if off < self.selected_range.start || off > self.selected_range.end {
+            self.selected_range = off..off;
+            self.selection_reversed = false;
+            cx.notify();
+        }
+    }
+
+    /// Select a byte range (used by find/replace to highlight the current match).
+    pub fn select_range(&mut self, range: std::ops::Range<usize>, cx: &mut Context<Self>) {
+        let len = self.content.len();
+        self.selected_range = range.start.min(len)..range.end.min(len);
+        self.selection_reversed = false;
+        // Scroll the match into view (Find jump-to-match relies on this).
+        self.reveal_pending = true;
+        cx.notify();
+    }
+
+    /// Replace a byte range with `text` (find/replace), recording one undo step.
+    pub fn replace_range_text(
+        &mut self,
+        range: std::ops::Range<usize>,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.read_only {
+            return;
+        }
+        let len = self.content.len();
+        let r = range.start.min(len)..range.end.min(len);
+        self.record_undo(EditKind::Other);
+        self.content.replace_range(r.clone(), text);
+        let caret = r.start + text.len();
+        self.selected_range = caret..caret;
+        self.dirty = true;
+        self.recompute_folds(cx);
+        cx.notify();
+        cx.emit(EditorEvent::Changed);
+    }
+
+    /// Apply a set of non-overlapping LSP edits against one original document snapshot.
+    /// Descending ranges keep byte offsets stable; a single undo entry and change event avoid
+    /// a burst of autosaves and didChange notifications for a formatting response.
+    pub(crate) fn apply_text_edits(
+        &mut self,
+        mut edits: Vec<(Range<usize>, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.read_only || edits.is_empty() {
+            return;
+        }
+        let original_len = self.content.len();
+        if edits.iter().any(|(range, _)| {
+            range.start > range.end
+                || range.end > original_len
+                || !self.content.is_char_boundary(range.start)
+                || !self.content.is_char_boundary(range.end)
+        }) {
+            return;
+        }
+        edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+        let mut prior_start = original_len;
+        for (range, _) in &edits {
+            if range.end > prior_start {
+                return;
+            }
+            prior_start = range.start;
+        }
+        let old_cursor = self.selected_range.end;
+        let mut new_cursor = None;
+        let mut preceding_delta: isize = 0;
+        for (range, replacement) in edits.iter().rev() {
+            if new_cursor.is_none() {
+                if range.start <= old_cursor && old_cursor <= range.end {
+                    new_cursor = Some(
+                        (range.start as isize + preceding_delta + replacement.len() as isize).max(0)
+                            as usize,
+                    );
+                } else if range.end <= old_cursor {
+                    preceding_delta +=
+                        replacement.len() as isize - (range.end - range.start) as isize;
+                }
+            }
+        }
+        let caret =
+            new_cursor.unwrap_or_else(|| (old_cursor as isize + preceding_delta).max(0) as usize);
+        self.record_undo(EditKind::Other);
+        for (range, replacement) in edits {
+            self.content.replace_range(range, &replacement);
+        }
+        let caret = caret.min(self.content.len());
+        let mut caret = caret;
+        while caret > 0 && !self.content.is_char_boundary(caret) {
+            caret -= 1;
+        }
+        self.selected_range = caret..caret;
+        self.selection_reversed = false;
+        self.dirty = true;
+        self.recompute_folds(cx);
+        cx.notify();
+        cx.emit(EditorEvent::Changed);
+    }
+
+    // ── code folding ──────────────────────────────────────────────
+    /// Re-derive foldable regions from the current text + language, dropping any
+    /// folded entry whose start line is no longer a foldable region (after edits).
+    fn recompute_folds(&mut self, cx: &mut Context<Self>) {
+        // Bump the generation on EVERY recompute (not just async ones) so a pending
+        // big-file background job can never land its stale spans on content that was
+        // since replaced — via the inline path (big file → small file open) or emptied.
+        self.compute_gen = self.compute_gen.wrapping_add(1);
+        if self.single_line || self.content.is_empty() {
+            self.spans = Vec::new();
+            self.error_ranges = Vec::new();
+            self.import_links = Vec::new();
+            self.import_bound.clear();
+            self.defs.clear();
+            self.hover_range = None;
+            self.foldable = Vec::new();
+            self.foldable_starts.clear();
+            self.max_line_len = 0;
+            return;
+        }
+        self.hover_range = None; // ranges may have shifted under the pointer
+                                 // Longest line (bytes) → element content width for horizontal scroll. Cheap byte
+                                 // scan, only on content change (not per frame).
+        self.max_line_len = self.content.split('\n').map(str::len).max().unwrap_or(0);
+        // Small files: highlight + find folds inline (correct on the very first frame, no
+        // flicker). Big files: clear now so the file opens instantly as plain text, then
+        // compute spans + folds on a background thread and swap them in when ready — the
+        // whole-file tree-sitter parse never blocks the UI (Zed-style async highlighting).
+        let lines = self.content.bytes().filter(|&b| b == b'\n').count();
+        const ASYNC_THRESHOLD: usize = 4000;
+        if lines < ASYNC_THRESHOLD {
+            self.spans = highlight::highlight(&self.content, self.lang);
+            self.error_ranges = if self.errors_on {
+                highlight::error_ranges(&self.content, self.lang)
+            } else {
+                Vec::new()
+            };
+            let (links, bound, defs) = if self.links_on {
+                compute_nav(&self.content, self.lang)
+            } else {
+                Default::default()
+            };
+            self.import_links = links;
+            self.import_bound = bound;
+            self.defs = defs;
+            self.foldable = highlight::fold_regions(&self.content, self.lang);
+            self.foldable_starts = self.foldable.iter().map(|r| r.0).collect();
+            self.folded.retain(|l| self.foldable_starts.contains(l));
+            return;
+        }
+        self.spans = Vec::new();
+        self.error_ranges = Vec::new();
+        self.import_links = Vec::new();
+        self.import_bound.clear();
+        self.defs.clear();
+        self.foldable = Vec::new();
+        self.foldable_starts.clear();
+        let gen = self.compute_gen;
+        let content = self.content.clone();
+        let lang = self.lang;
+        let errors_on = self.errors_on;
+        let links_on = self.links_on;
+        cx.spawn(async move |this, cx| {
+            let (spans, foldable, errors, nav) = cx
+                .background_executor()
+                .spawn(async move {
+                    (
+                        highlight::highlight(&content, lang),
+                        highlight::fold_regions(&content, lang),
+                        if errors_on {
+                            highlight::error_ranges(&content, lang)
+                        } else {
+                            Vec::new()
+                        },
+                        if links_on {
+                            compute_nav(&content, lang)
+                        } else {
+                            Default::default()
+                        },
+                    )
+                })
+                .await;
+            this.update(cx, |ed, cx| {
+                if ed.compute_gen == gen {
+                    // Still the current content → apply the highlight + folds.
+                    ed.spans = spans;
+                    ed.error_ranges = errors;
+                    (ed.import_links, ed.import_bound, ed.defs) = nav;
+                    ed.foldable_starts = foldable.iter().map(|r| r.0).collect();
+                    ed.foldable = foldable;
+                    ed.folded.retain(|l| ed.foldable_starts.contains(l));
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Toggle error highlighting (wavy squiggles under parse errors) for this
+    /// editor. The app derives `on` from the language pack's plugins.json opt-in;
+    /// idempotent, recomputes the cached ranges only when the flag flips.
+    pub fn set_error_highlight(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.errors_on == on {
+            return;
+        }
+        self.errors_on = on;
+        self.recompute_folds(cx);
+        cx.notify();
+    }
+
+    /// Toggle ⌘-click import navigation for this editor (same push model as
+    /// [`set_error_highlight`](Self::set_error_highlight): the app derives `on`
+    /// from the pack's plugins.json toggle, on by default when installed).
+    pub fn set_link_navigation(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.links_on == on {
+            return;
+        }
+        self.links_on = on;
+        self.recompute_folds(cx);
+        cx.notify();
+    }
+
+    /// Index of the import link containing byte offset `off`, if any.
+    fn link_at(&self, off: usize) -> Option<usize> {
+        // `import_links` is sorted by range start — binary-search the candidate.
+        let i = self
+            .import_links
+            .partition_point(|l| l.range.start <= off)
+            .checked_sub(1)?;
+        (off < self.import_links[i].range.end).then_some(i)
+    }
+
+    /// The word (identifier: alphanumeric/`_` run) containing byte offset `off`.
+    fn word_range_at(&self, off: usize) -> Option<Range<usize>> {
+        let bytes = self.content.as_bytes();
+        let off = off.min(self.content.len());
+        let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        if off >= bytes.len() || !is_word(bytes[off]) {
+            return None;
+        }
+        let mut start = off;
+        while start > 0 && is_word(bytes[start - 1]) {
+            start -= 1;
+        }
+        let mut end = off;
+        while end < bytes.len() && is_word(bytes[end]) {
+            end += 1;
+        }
+        Some(start..end)
+    }
+
+    /// What ⌘-click at `off` would act on: an import link's specifier, a USE of
+    /// an imported symbol (jump through to its file), or a symbol defined in
+    /// this buffer (jump to the definition). Returns the range to underline plus
+    /// the action. A definition site itself doesn't self-target.
+    fn symbol_at(&self, off: usize) -> Option<(Range<usize>, SymbolTarget)> {
+        if let Some(i) = self.link_at(off) {
+            let l = &self.import_links[i];
+            return Some((l.range.clone(), SymbolTarget::Link(l.clone())));
+        }
+        let word = self.word_range_at(off)?;
+        let name = &self.content[word.clone()];
+        // Definitions win over import bindings: shadowing (a local `let x` over
+        // an imported `x`) resolves locally, like the compiler would.
+        if let Some(sites) = self.defs.get(name) {
+            if let Some(def) = sites.iter().find(|r| **r != word) {
+                return Some((word.clone(), SymbolTarget::LocalDef(def.clone())));
+            }
+        }
+        if let Some(link) = self.import_bound.get(name) {
+            // The imported name itself (in the import statement) rides the
+            // link range already; a USE elsewhere jumps through the import.
+            return Some((
+                word.clone(),
+                SymbolTarget::ImportedSymbol(link.clone(), name.to_string()),
+            ));
+        }
+        // Lowest priority: a definition in one of the files this buffer
+        // imports (methods on imported classes land here).
+        if let Some((path, r)) = self.external_defs.get(name) {
+            return Some((word, SymbolTarget::ExternalDef(path.clone(), r.clone())));
+        }
+        None
+    }
+
+    /// Test-only read view of the external index (the app never reads it back;
+    /// clicks resolve inside the editor).
+    #[cfg(test)]
+    pub fn external_def_for(&self, name: &str) -> Option<(std::path::PathBuf, Range<usize>)> {
+        self.external_defs.get(name).cloned()
+    }
+
+    /// Replace the imported-files definition index (see `external_defs`).
+    /// Pushed by the app whenever the buffer's import set resolves to a new
+    /// set of files; cleared automatically when a different file loads.
+    pub fn set_external_defs(
+        &mut self,
+        map: std::collections::HashMap<String, (std::path::PathBuf, Range<usize>)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.external_defs = map;
+        cx.notify();
+    }
+
+    /// Recompute what the pointer sits on (from `last_mouse`), honoring the ⌘ +
+    /// toggle gates; notifies only on change. Called from mouse-move AND
+    /// `ModifiersChanged`, so pressing ⌘ over a symbol lights it up without
+    /// needing the mouse to move first.
+    fn refresh_link_hover(&mut self, cx: &mut Context<Self>) {
+        let hit = match self.last_mouse {
+            Some(pos) if self.cmd_held && self.links_on && !self.is_selecting => self
+                .symbol_at(self.offset_for_position(pos))
+                .map(|(r, _)| r),
+            _ => None,
+        };
+        if hit != self.hover_range {
+            self.hover_range = hit;
+            cx.notify();
+        }
+    }
+
+    /// Screenshot/debug helper: force the ⌘-hover affordance on import link `i`,
+    /// as if ⌘ were held with the pointer over it (`FERRITEMCU_SHOT=imports`). Returns
+    /// whether such a link exists (false = nothing will underline).
+    pub fn force_link_hover(&mut self, i: usize) -> bool {
+        self.cmd_held = true;
+        self.hover_range = self.import_links.get(i).map(|l| l.range.clone());
+        self.hover_range.is_some()
+    }
+
+    /// (Re)start the caret blink: show it now and bump the epoch so any prior blink loop exits,
+    /// then drive a 530ms toggle. Called on focus-start and after activity so the caret is solid
+    /// immediately after typing/moving, then resumes blinking.
+    fn restart_blink(&mut self, cx: &mut Context<Self>) {
+        self.blink_on = true;
+        self.blink_epoch = self.blink_epoch.wrapping_add(1);
+        let epoch = self.blink_epoch;
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(530))
+                .await;
+            let alive = this
+                .update(cx, |ed, cx| {
+                    if ed.blink_epoch != epoch {
+                        return false;
+                    }
+                    ed.blink_on = !ed.blink_on;
+                    cx.notify();
+                    true
+                })
+                .unwrap_or(false);
+            if !alive {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    // The fold *mapping* (which lines are hidden / visible) lives in pure
+    // module-level functions below (`is_hidden`, `visible_line_indices`,
+    // `caret_after_fold`, …) so it's unit-testable without a gpui Context. These
+    // methods are thin delegators over the editor's `content`/`folded`/`foldable`.
+    fn is_foldable_start(&self, line: usize) -> bool {
+        self.foldable_starts.contains(&line)
+    }
+
+    /// Buffer line indices that are visible, in order (display row → buffer line).
+    fn visible_line_indices(&self) -> Vec<usize> {
+        visible_line_indices(&self.content, &self.folded, &self.foldable)
+    }
+
+    /// If the caret sits on a now-hidden line (after a fold toggle or an undo that
+    /// re-collapsed a region), pull it to the end of the enclosing fold's start
+    /// line so it stays visible. No-op otherwise.
+    fn ensure_caret_visible(&mut self) {
+        if let Some(at) =
+            caret_after_fold(&self.content, &self.folded, &self.foldable, self.cursor())
+        {
+            self.selected_range = at..at;
+            self.selection_reversed = false;
+        }
+    }
+
+    /// Toggle the fold at buffer `line` (a foldable region start), keeping the
+    /// caret visible.
+    fn toggle_fold(&mut self, line: usize, cx: &mut Context<Self>) {
+        if !self.is_foldable_start(line) {
+            return;
+        }
+        if !self.folded.remove(&line) {
+            self.folded.insert(line);
+        }
+        self.ensure_caret_visible();
+        cx.notify();
+    }
+
+    fn cursor(&self) -> usize {
+        if self.selection_reversed {
+            self.selected_range.start
+        } else {
+            self.selected_range.end
+        }
+    }
+
+    fn move_to(&mut self, off: usize, cx: &mut Context<Self>) {
+        self.selected_range = off..off;
+        // Navigating ends the current typing run, so the next character starts a
+        // fresh undo step rather than coalescing across the cursor jump.
+        self.last_edit = EditKind::Other;
+        self.reveal_pending = true; // keep the caret in view (scrolls on next paint)
+        cx.notify();
+    }
+
+    // ── undo / redo ───────────────────────────────────────────────
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            content: self.content.clone(),
+            selected_range: self.selected_range.clone(),
+            selection_reversed: self.selection_reversed,
+        }
+    }
+
+    /// Record the pre-edit state on the undo stack before a mutation. Consecutive
+    /// single-character typing (`EditKind::Type`) coalesces into the existing step.
+    fn record_undo(&mut self, kind: EditKind) {
+        self.redo_stack.clear();
+        if kind == EditKind::Type && self.last_edit == EditKind::Type {
+            self.last_edit = kind;
+            return; // merge into the run already on the stack
+        }
+        self.undo_stack.push_back(self.snapshot());
+        if self.undo_stack.len() > 1000 {
+            self.undo_stack.pop_front();
+        }
+        self.last_edit = kind;
+    }
+
+    fn restore(&mut self, s: Snapshot, cx: &mut Context<Self>) {
+        self.content = s.content;
+        self.selected_range = s.selected_range;
+        self.selection_reversed = s.selection_reversed;
+        self.marked_range = None;
+        self.last_edit = EditKind::Other;
+        self.dirty = true;
+        self.recompute_folds(cx);
+        // The restored caret may land inside a region that's still folded — don't
+        // strand it on a hidden line (next Up/Down would otherwise jump to line 0).
+        self.ensure_caret_visible();
+        cx.notify();
+        cx.emit(EditorEvent::Changed);
+    }
+
+    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
+        if let Some(prev) = self.undo_stack.pop_back() {
+            let now = self.snapshot();
+            self.restore(prev, cx);
+            self.redo_stack.push(now);
+        }
+    }
+
+    fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
+        if let Some(next) = self.redo_stack.pop() {
+            let now = self.snapshot();
+            self.restore(next, cx);
+            self.undo_stack.push_back(now);
+        }
+    }
+
+    fn select_to(&mut self, off: usize, cx: &mut Context<Self>) {
+        if self.selection_reversed {
+            self.selected_range.start = off;
+        } else {
+            self.selected_range.end = off;
+        }
+        if self.selected_range.end < self.selected_range.start {
+            self.selection_reversed = !self.selection_reversed;
+            self.selected_range = self.selected_range.end..self.selected_range.start;
+        }
+        // Shift+arrows etc. move the active selection end — reveal it so extending the
+        // selection past the viewport scrolls to follow the caret.
+        self.reveal_pending = true;
+        cx.notify();
+    }
+
+    // ── grapheme-aware horizontal boundaries ──────────────────────
+    fn prev_boundary(&self, off: usize) -> usize {
+        prev_grapheme(&self.content, off)
+    }
+    fn next_boundary(&self, off: usize) -> usize {
+        next_grapheme(&self.content, off)
+    }
+
+    // ── line geometry ─────────────────────────────────────────────
+    /// (`line_index`, byte offset of line start) for a content offset.
+    fn locate(&self, off: usize) -> (usize, usize) {
+        let mut start = 0usize;
+        for (i, line) in self.content.split('\n').enumerate() {
+            let end = start + line.len();
+            if off <= end {
+                return (i, start);
+            }
+            start = end + 1; // skip '\n'
+        }
+        let lines = self.content.split('\n').count().saturating_sub(1);
+        (lines, start)
+    }
+
+    // ── actions ───────────────────────────────────────────────────
+    fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            self.move_to(self.prev_boundary(self.cursor()), cx);
+        } else {
+            self.move_to(self.selected_range.start, cx);
+        }
+    }
+    fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            self.move_to(self.next_boundary(self.cursor()), cx);
+        } else {
+            self.move_to(self.selected_range.end, cx);
+        }
+    }
+    fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.prev_boundary(self.cursor()), cx);
+    }
+    fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.next_boundary(self.cursor()), cx);
+    }
+    fn word_left(&mut self, _: &WordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(prev_word(&self.content, self.cursor()), cx);
+    }
+    fn word_right(&mut self, _: &WordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(next_word(&self.content, self.cursor()), cx);
+    }
+    fn select_word_left(&mut self, _: &SelectWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(prev_word(&self.content, self.cursor()), cx);
+    }
+    fn select_word_right(&mut self, _: &SelectWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(next_word(&self.content, self.cursor()), cx);
+    }
+    fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(0, cx);
+        self.select_to(self.content.len(), cx);
+    }
+    fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
+        let (_, start) = self.locate(self.cursor());
+        self.move_to(start, cx);
+    }
+    fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
+        let (li, start) = self.locate(self.cursor());
+        let line_len = self.content.split('\n').nth(li).map_or(0, str::len);
+        self.move_to(start + line_len, cx);
+    }
+    fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        self.vertical(-1, false, cx);
+    }
+    fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        self.vertical(1, false, cx);
+    }
+    fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.vertical(-1, true, cx);
+    }
+    fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.vertical(1, true, cx);
+    }
+    /// Move the caret one display row in `dir` (skipping folds). `extend` keeps
+    /// the selection anchor (Shift+↑/↓) instead of collapsing it.
+    fn vertical(&mut self, dir: i32, extend: bool, cx: &mut Context<Self>) {
+        if self.line_starts.is_empty() {
+            return;
+        }
+        let (li, start) = self.locate(self.cursor());
+        // Move by *display* rows so folds are skipped (line_starts/line_layouts
+        // are display-indexed; visible_lines maps display row → buffer line).
+        let dr = self
+            .visible_lines
+            .iter()
+            .position(|&b| b == li)
+            .unwrap_or(0);
+        let target = dr as i32 + dir;
+        if target < 0 || target as usize >= self.display_rows {
+            return;
+        }
+        let target = target as usize;
+        let col = self.cursor() - start;
+        // `line_layouts` is sparse (visible rows only); the current + adjacent rows are within
+        // the overscan band, so they're shaped. Fall back to x=0 if somehow off-screen.
+        let x = self
+            .line_layouts
+            .get(&dr)
+            .map_or(px(0.0), |l| l.x_for_index(col));
+        let Some(&new_start) = self.line_starts.get(target) else {
+            return;
+        };
+        let new_col = self
+            .line_layouts
+            .get(&target)
+            .map_or(0, |l| l.closest_index_for_x(x));
+        let off = new_start + new_col;
+        if extend {
+            self.select_to(off, cx);
+        } else {
+            self.move_to(off, cx);
+        }
+    }
+    fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            self.select_to(self.prev_boundary(self.cursor()), cx);
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+    fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            self.select_to(self.next_boundary(self.cursor()), cx);
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+    /// Ctrl+Backspace: delete back to the previous word stop (or just the selection).
+    fn delete_word_left(
+        &mut self,
+        _: &DeleteWordLeft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_range.is_empty() {
+            self.select_to(prev_word(&self.content, self.cursor()), cx);
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+    /// Ctrl+Delete: delete forward to the next word stop (or just the selection).
+    fn delete_word_right(
+        &mut self,
+        _: &DeleteWordRight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_range.is_empty() {
+            self.select_to(next_word(&self.content, self.cursor()), cx);
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+    fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((_, _, insert, range)) = self.lsp_completions.first().cloned() {
+            self.replace_range_text(range, &insert, cx);
+            self.lsp_completions.clear();
+            return;
+        }
+        self.replace_text_in_range(None, "\n", window, cx);
+    }
+    /// cmd-backspace: delete from the caret back to the start of the current line
+    /// (or just delete the selection if there is one).
+    fn delete_to_home(&mut self, _: &DeleteToHome, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            let caret = self.cursor();
+            let line_start = self.content[..caret].rfind('\n').map_or(0, |i| i + 1);
+            self.select_to(line_start, cx);
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+
+    fn indent(&mut self, _: &Indent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
+        if self.selected_range.start == self.selected_range.end {
+            // No selection: insert one indent unit at the caret.
+            let c = self.cursor();
+            self.record_undo(EditKind::Other);
+            self.content.insert_str(c, "  ");
+            self.selected_range = (c + 2)..(c + 2);
+            self.finish_indent(cx);
+        } else {
+            self.shift_lines(true, cx);
+        }
+    }
+    fn outdent(&mut self, _: &Outdent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.read_only {
+            self.shift_lines(false, cx);
+        }
+    }
+    /// Indent/outdent every line the selection touches by one unit (2 spaces).
+    fn shift_lines(&mut self, indent: bool, cx: &mut Context<Self>) {
+        let unit = "  ";
+        let (s, e) = (self.selected_range.start, self.selected_range.end);
+        let region_start = self.content[..s].rfind('\n').map_or(0, |i| i + 1);
+        let region_end = self.content[e..]
+            .find('\n')
+            .map_or(self.content.len(), |i| e + i);
+        let region = self.content[region_start..region_end].to_string();
+        let mut out = String::new();
+        for (i, line) in region.split('\n').enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            if indent {
+                out.push_str(unit);
+                out.push_str(line);
+            } else {
+                let strip = if line.starts_with(unit) {
+                    2
+                } else {
+                    usize::from(line.starts_with(' ') || line.starts_with('\t'))
+                };
+                out.push_str(&line[strip..]);
+            }
+        }
+        self.record_undo(EditKind::Other);
+        self.content = format!(
+            "{}{}{}",
+            &self.content[..region_start],
+            out,
+            &self.content[region_end..]
+        );
+        self.selected_range = region_start..(region_start + out.len());
+        self.selection_reversed = false;
+        self.finish_indent(cx);
+    }
+    fn finish_indent(&mut self, cx: &mut Context<Self>) {
+        self.marked_range = None;
+        self.last_edit = EditKind::Other;
+        self.dirty = true;
+        cx.notify();
+        cx.emit(EditorEvent::Changed);
+    }
+    fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.selected_range.is_empty() {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                self.content[self.selected_range.clone()].to_string(),
+            ));
+        }
+    }
+    fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.selected_range.is_empty() {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                self.content[self.selected_range.clone()].to_string(),
+            ));
+            self.replace_text_in_range(None, "", window, cx);
+        }
+    }
+    fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+            self.replace_text_in_range(None, &text, window, cx);
+        }
+    }
+
+    // ── mouse ─────────────────────────────────────────────────────
+    fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Take keyboard focus on click so this editor is the action target — without it,
+        // IME text can route here incidentally while actions (cmd-z, etc.) don't dispatch.
+        self.focus_handle.focus(window);
+        self.restart_blink(cx);
+        // ⌘-click navigation (issue #26): an import specifier opens its file, a
+        // locally-defined symbol jumps to its definition here, and a use of an
+        // imported symbol jumps through the import to the definition over there.
+        // `secondary` = ⌘ on macOS, Ctrl elsewhere (Ctrl+click is go-to-definition there).
+        if ev.modifiers.secondary() && self.links_on {
+            let off = self.offset_for_position(ev.position);
+            match self.symbol_at(off) {
+                Some((_, SymbolTarget::Link(link))) => {
+                    cx.emit(EditorEvent::OpenImport(link));
+                    cx.stop_propagation();
+                    return;
+                }
+                Some((_, SymbolTarget::LocalDef(def))) => {
+                    self.select_range(def, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                Some((_, SymbolTarget::ImportedSymbol(link, name))) => {
+                    cx.emit(EditorEvent::OpenSymbol { link, name });
+                    cx.stop_propagation();
+                    return;
+                }
+                Some((_, SymbolTarget::ExternalDef(path, range))) => {
+                    cx.emit(EditorEvent::OpenDefinition { path, range });
+                    cx.stop_propagation();
+                    return;
+                }
+                None => {}
+            }
+        }
+        // A click in the fold gutter toggles the fold on that display row instead
+        // of moving the caret.
+        if self.gutter_w > px(0.0) {
+            if let Some(bounds) = self.bounds {
+                // The chevron column is the part of the gutter just past the line numbers.
+                // With the gutter on the right (diff base pane) it sits at the far right.
+                let gutter_left = if self.gutter_right {
+                    bounds.size.width - self.gutter_w
+                } else {
+                    px(0.0)
+                };
+                let rel_x = ev.position.x - bounds.left() - gutter_left;
+                if rel_x >= self.num_w && rel_x < self.gutter_w && !self.line_layouts.is_empty() {
+                    let rel_y = (ev.position.y - bounds.top()).max(px(0.0));
+                    let dr = ((f32::from(rel_y) / f32::from(self.line_height)).floor() as usize)
+                        .min(self.visible_lines.len().saturating_sub(1));
+                    if let Some(&line) = self.visible_lines.get(dr) {
+                        if self.is_foldable_start(line) {
+                            self.toggle_fold(line, cx);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        // Double-click selects the word; triple-click (+) selects the whole line. Keep
+        // `is_selecting` on so a drag started from the same press still extends the selection.
+        if ev.click_count >= 2 {
+            self.focus_handle.focus(window);
+            let off = self.offset_for_position(ev.position);
+            if ev.click_count == 2 {
+                self.select_word_at(off, cx);
+            } else {
+                self.select_line_at(off, cx);
+            }
+            self.is_selecting = true;
+            cx.stop_propagation();
+            return;
+        }
+        self.click_at(ev.position, ev.modifiers.shift, window, cx);
+        // Consume so a click on the editor doesn't ALSO bubble to a surrounding scroll
+        // container that forwards clicks (see `click_at`) — that would double-handle.
+        cx.stop_propagation();
+    }
+
+    /// Select the word (run of alphanumeric/`_`) containing byte offset `off`. If `off` isn't
+    /// on a word character, leaves a collapsed caret there.
+    fn select_word_at(&mut self, off: usize, cx: &mut Context<Self>) {
+        let bytes = self.content.as_bytes();
+        let off = off.min(bytes.len());
+        let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let mut start = off;
+        while start > 0 && is_word(bytes[start - 1]) {
+            start -= 1;
+        }
+        let mut end = off;
+        while end < bytes.len() && is_word(bytes[end]) {
+            end += 1;
+        }
+        self.selected_range = start..end;
+        self.selection_reversed = false;
+        cx.notify();
+    }
+
+    /// Select the whole line (its text, excluding the trailing newline) containing `off`.
+    fn select_line_at(&mut self, off: usize, cx: &mut Context<Self>) {
+        let off = off.min(self.content.len());
+        let start = self.content[..off].rfind('\n').map_or(0, |i| i + 1);
+        let end = self.content[off..]
+            .find('\n')
+            .map_or(self.content.len(), |i| off + i);
+        self.selected_range = start..end;
+        self.selection_reversed = false;
+        cx.notify();
+    }
+    /// Place the caret at window position `pos` (extending the selection if `extend`). Public
+    /// so a surrounding scroll container can forward clicks: when a file is shorter than the
+    /// viewport, a click in the empty area below the text still lands here, and
+    /// `offset_for_position` snaps it to the end of the last line.
+    pub fn click_at(
+        &mut self,
+        pos: Point<Pixels>,
+        extend: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_handle.focus(window);
+        let off = self.offset_for_position(pos);
+        self.is_selecting = true;
+        if extend {
+            self.select_to(off, cx);
+        } else {
+            self.move_to(off, cx);
+        }
+    }
+    fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // ⌘-hover over an import link → underline + pointer cursor. The ⌘ state
+        // rides the move event itself (`ev.modifiers`) — a ModifiersChanged
+        // event only reaches us via the focus path, which is unreliable when the
+        // pointer roams unfocused panes; the move event always knows.
+        self.last_mouse = Some(ev.position);
+        let offset = self.offset_for_position(ev.position);
+        let diagnostic = self
+            .lsp_messages
+            .iter()
+            .find(|(range, _)| range.contains(&offset))
+            .map(|(_, message)| message.clone());
+        if diagnostic != self.diagnostic_hover {
+            self.diagnostic_hover = diagnostic;
+            cx.notify();
+        }
+        let hover_offset = self.word_range_at(offset).map(|range| range.start);
+        if hover_offset != self.lsp_hover_offset {
+            self.lsp_hover_offset = hover_offset;
+            self.lsp_hover = None;
+            cx.emit(EditorEvent::HoverRequested(hover_offset));
+        }
+        if self.cmd_held != ev.modifiers.secondary() {
+            self.cmd_held = ev.modifiers.secondary();
+            cx.notify();
+        }
+        self.refresh_link_hover(cx);
+        // Only extend the selection for a drag this editor itself started.
+        if self.is_selecting && ev.dragging() {
+            // `select_to` sets `reveal_pending`, which would yank the view back to the
+            // caret and fight the edge auto-scroll — drop it; the drag drives scrolling.
+            let off = self.offset_for_position(ev.position);
+            self.select_to(off, cx);
+            self.reveal_pending = false;
+            self.drag_pos = Some(ev.position);
+            // Pointer past an edge → start the auto-scroll loop (it self-stops when the
+            // pointer comes back inside or the drag ends).
+            if self.autoscroll_step(ev.position) != Point::default() {
+                self.start_autoscroll(cx);
+            }
+        }
+    }
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_selecting {
+            self.selection_to_primary(cx);
+        }
+        self.is_selecting = false;
+        self.drag_pos = None; // ends the auto-scroll loop on its next tick
+    }
+
+    /// Linux: a selection made with the mouse also becomes the PRIMARY selection, which a
+    /// middle click pastes — here or in any other app.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn selection_to_primary(&self, cx: &mut Context<Self>) {
+        if !self.selected_range.is_empty() {
+            cx.write_to_primary(gpui::ClipboardItem::new_string(
+                self.content[self.selected_range.clone()].to_string(),
+            ));
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    fn selection_to_primary(&self, _: &mut Context<Self>) {}
+
+    /// Linux: a middle click pastes the PRIMARY selection where it lands.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn on_middle_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
+        let Some(text) = cx.read_from_primary().and_then(|i| i.text()) else {
+            return;
+        };
+        self.focus_handle.focus(window);
+        let off = self.offset_for_position(ev.position);
+        self.move_to(off, cx);
+        self.replace_text_in_range(None, &text, window, cx);
+        cx.stop_propagation();
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    fn on_middle_down(&mut self, _: &MouseDownEvent, _: &mut Window, _: &mut Context<Self>) {}
+
+    /// How far (px) the view should scroll this tick given the pointer position during a
+    /// drag-select: nonzero on each axis only when the pointer is within `MARGIN` of (or
+    /// past) the corresponding viewport edge. Speed ramps with how far past the edge it is.
+    fn autoscroll_step(&self, pos: Point<Pixels>) -> Point<Pixels> {
+        let Some(vp) = self.viewport else {
+            return Point::default();
+        };
+        const MARGIN: f32 = 24.0;
+        const MAX: f32 = 48.0;
+        let axis = |p: f32, lo: f32, hi: f32| -> f32 {
+            if p > hi - MARGIN {
+                -((p - (hi - MARGIN)).min(MAX)) // past bottom/right → scroll content up/left
+            } else if p < lo + MARGIN {
+                ((lo + MARGIN) - p).min(MAX) // past top/left → scroll content down/right
+            } else {
+                0.0
+            }
+        };
+        point(
+            px(axis(
+                f32::from(pos.x),
+                f32::from(vp.left()),
+                f32::from(vp.right()),
+            )),
+            px(axis(
+                f32::from(pos.y),
+                f32::from(vp.top()),
+                f32::from(vp.bottom()),
+            )),
+        )
+    }
+
+    /// Apply one auto-scroll step to the parent handle (clamped to the scroll range) and
+    /// return whether it actually moved.
+    fn apply_autoscroll(&self, step: Point<Pixels>) -> bool {
+        let Some(scroll) = self.scroll.as_ref() else {
+            return false;
+        };
+        let max = scroll.max_offset();
+        let cur = scroll.offset();
+        let nx = (cur.x + step.x).clamp(-max.width, px(0.0));
+        let ny = (cur.y + step.y).clamp(-max.height, px(0.0));
+        if nx == cur.x && ny == cur.y {
+            return false;
+        }
+        scroll.set_offset(point(nx, ny));
+        true
+    }
+
+    /// Drive continuous auto-scroll while the pointer is held past a viewport edge mid-drag.
+    /// Mouse-move events stop firing when the pointer is still, so a timer loop keeps the
+    /// view scrolling (and the selection extending) until the pointer returns inside or the
+    /// drag ends. Guarded by `autoscroll_active` so only one loop runs.
+    fn start_autoscroll(&mut self, cx: &mut Context<Self>) {
+        if self.autoscroll_active {
+            return;
+        }
+        self.autoscroll_active = true;
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(16))
+                .await;
+            let keep = this
+                .update(cx, |ed, cx| {
+                    let Some(pos) = ed.drag_pos.filter(|_| ed.is_selecting) else {
+                        ed.autoscroll_active = false;
+                        return false;
+                    };
+                    let step = ed.autoscroll_step(pos);
+                    if step == Point::default() || !ed.apply_autoscroll(step) {
+                        ed.autoscroll_active = false;
+                        return false;
+                    }
+                    // Re-extend the selection to the (now differently-mapped) pointer.
+                    let off = ed.offset_for_position(pos);
+                    ed.select_to(off, cx);
+                    ed.reveal_pending = false;
+                    cx.notify();
+                    true
+                })
+                .unwrap_or(false);
+            if !keep {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// Held ↑/↓ (and Shift+↑/↓) start an accelerating auto-repeat. The bound action
+    /// (`Up`/`Down`/`SelectUp`/`SelectDown`) still does the first line on the initial press;
+    /// this just notes the held key and kicks off the repeat loop. OS key-repeat is
+    /// unreliable here (it wasn't moving while held at all), so we self-pace with a timer.
+    fn on_key_down_nav(&mut self, ev: &gpui::KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.single_line {
+            return;
+        }
+        let dir = match ev.keystroke.key.as_str() {
+            "down" => 1,
+            "up" => -1,
+            _ => return,
+        };
+        // OS repeats (is_held) are ignored — our own loop drives the repetition.
+        if ev.is_held {
+            return;
+        }
+        self.nav = Some((dir, ev.keystroke.modifiers.shift));
+        self.nav_ticks = 0;
+        self.nav_accum = 0.0;
+        self.start_nav_repeat(cx);
+    }
+
+    fn on_key_up_nav(&mut self, ev: &gpui::KeyUpEvent, _: &mut Window, _: &mut Context<Self>) {
+        let released = match ev.keystroke.key.as_str() {
+            "down" => 1,
+            "up" => -1,
+            _ => return,
+        };
+        // Stop only if the released arrow matches the held direction (ignore Shift release).
+        if matches!(self.nav, Some((dir, _)) if dir == released) {
+            self.nav = None;
+        }
+    }
+
+    /// Auto-repeat the held vertical move, accelerating so a long file is reachable without
+    /// frantic tapping — but capped so it never feels runaway. A short initial delay lets a
+    /// quick tap stay a single line (the bound action already moved it).
+    fn start_nav_repeat(&mut self, cx: &mut Context<Self>) {
+        if self.nav_active {
+            return;
+        }
+        self.nav_active = true;
+        cx.spawn(async move |this, cx| {
+            // Initial delay (typematic-style): a tap releases before this and never repeats.
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(260))
+                .await;
+            loop {
+                let keep = this
+                    .update(cx, |ed, cx| {
+                        let Some((dir, extend)) = ed.nav else {
+                            ed.nav_active = false;
+                            return false;
+                        };
+                        ed.nav_ticks += 1;
+                        // Lines/sec ramps from a gentle start up to a firm cap (~1.5s to peak).
+                        let held_ms = ed.nav_ticks as f32 * 16.0;
+                        let lps = (24.0 + held_ms * 0.16).min(170.0);
+                        ed.nav_accum += lps * 0.016;
+                        let n = ed.nav_accum.floor() as i32;
+                        if n >= 1 {
+                            ed.nav_accum -= n as f32;
+                            for _ in 0..n {
+                                let before = ed.cursor();
+                                ed.vertical(dir, extend, cx);
+                                if ed.cursor() == before {
+                                    break; // reached the top/bottom of the file
+                                }
+                            }
+                            cx.notify();
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(16))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    fn offset_for_position(&self, pos: Point<Pixels>) -> usize {
+        let Some(bounds) = self.bounds else { return 0 };
+        // When empty, the shaped line is the (non-selectable) placeholder — clicking it
+        // must not produce an offset into placeholder text.
+        if self.line_starts.is_empty() || self.content.is_empty() {
+            return 0;
+        }
+        let rel_y = (pos.y - bounds.top()).max(px(0.0));
+        let raw_dr = (f32::from(rel_y) / f32::from(self.line_height)).floor() as usize;
+        let last = self.display_rows.saturating_sub(1);
+        // Click below the last line → caret at the END of the last line (standard editor
+        // behaviour), regardless of the x position.
+        if raw_dr > last {
+            let line_len = self.content[self.line_starts[last]..]
+                .split('\n')
+                .next()
+                .map_or(0, str::len);
+            return (self.line_starts[last] + line_len).min(self.content.len());
+        }
+        let dr = raw_dr.min(last);
+        // Map the click x into text-local space. Left gutter shifts text right by `gutter_w`;
+        // a right gutter leaves text flush at the left edge. `line_layouts` is sparse but the
+        // clicked row is on-screen, so it's present; fall back to col 0.
+        let text_left = if self.gutter_right {
+            px(0.0)
+        } else {
+            self.gutter_w
+        };
+        let x = pos.x - bounds.left() - text_left;
+        let col = self
+            .line_layouts
+            .get(&dr)
+            .map_or(0, |l| l.closest_index_for_x(x));
+        // Clamp to real content length so a click past the last char (or into a
+        // placeholder/filler) never lands beyond the buffer.
+        (self.line_starts[dr] + col).min(self.content.len())
+    }
+
+    // ── utf16 helpers (for the OS input handler) ──────────────────
+    fn off_from_utf16(&self, o: usize) -> usize {
+        let (mut u8o, mut u16o) = (0, 0);
+        for ch in self.content.chars() {
+            if u16o >= o {
+                break;
+            }
+            u16o += ch.len_utf16();
+            u8o += ch.len_utf8();
+        }
+        u8o
+    }
+    fn off_to_utf16(&self, o: usize) -> usize {
+        let (mut u16o, mut u8o) = (0, 0);
+        for ch in self.content.chars() {
+            if u8o >= o {
+                break;
+            }
+            u8o += ch.len_utf8();
+            u16o += ch.len_utf16();
+        }
+        u16o
+    }
+    fn range_to_utf16(&self, r: &Range<usize>) -> Range<usize> {
+        self.off_to_utf16(r.start)..self.off_to_utf16(r.end)
+    }
+    fn range_from_utf16(&self, r: &Range<usize>) -> Range<usize> {
+        self.off_from_utf16(r.start)..self.off_from_utf16(r.end)
+    }
+}
+
+impl Focusable for CodeEditor {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<EditorEvent> for CodeEditor {}
+
+impl EntityInputHandler for CodeEditor {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        actual: &mut Option<Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        let r = self.range_from_utf16(&range_utf16);
+        actual.replace(self.range_to_utf16(&r));
+        Some(self.content[r].to_string())
+    }
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: self.range_to_utf16(&self.selected_range),
+            reversed: self.selection_reversed,
+        })
+    }
+    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
+        self.marked_range.as_ref().map(|r| self.range_to_utf16(r))
+    }
+    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
+        self.marked_range = None;
+    }
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.read_only {
+            return;
+        }
+        let range = range_utf16
+            .as_ref()
+            .map(|r| self.range_from_utf16(r))
+            .or(self.marked_range.clone())
+            .unwrap_or(self.selected_range.clone());
+        // A single character typed over a collapsed caret = a "Type" run (coalesces);
+        // everything else (paste, delete, newline, replacing a selection) is its own step.
+        let kind = if range.start == range.end && new_text != "\n" && new_text.chars().count() == 1
+        {
+            EditKind::Type
+        } else {
+            EditKind::Other
+        };
+        self.record_undo(kind);
+        self.content =
+            self.content[..range.start].to_owned() + new_text + &self.content[range.end..];
+        let caret = range.start + new_text.len();
+        self.selected_range = caret..caret;
+        self.marked_range = None;
+        self.dirty = true;
+        self.recompute_folds(cx);
+        self.restart_blink(cx);
+        cx.notify();
+        cx.emit(EditorEvent::Changed);
+    }
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_sel_utf16: Option<Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.read_only {
+            return;
+        }
+        let range = range_utf16
+            .as_ref()
+            .map(|r| self.range_from_utf16(r))
+            .or(self.marked_range.clone())
+            .unwrap_or(self.selected_range.clone());
+        // Snapshot once at the start of an IME composition, not on every marked update.
+        if self.marked_range.is_none() {
+            self.record_undo(EditKind::Other);
+        }
+        self.content =
+            self.content[..range.start].to_owned() + new_text + &self.content[range.end..];
+        self.marked_range =
+            (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
+        self.selected_range = new_sel_utf16
+            .as_ref()
+            .map(|r| self.range_from_utf16(r))
+            .map_or_else(
+                || {
+                    let c = range.start + new_text.len();
+                    c..c
+                },
+                // The IME's selection is relative to the replaced (marked) region — anchor
+                // BOTH ends at `range.start`. (Anchoring the end at `range.end` overshot by
+                // the old marked text's length on every composition update, walking the
+                // selection past the composed text — and potentially past the buffer.)
+                |r| {
+                    let s = (range.start + r.start).min(self.content.len());
+                    let e = (range.start + r.end).min(self.content.len());
+                    s..e
+                },
+            );
+        self.dirty = true;
+        self.recompute_folds(cx);
+        cx.notify();
+        cx.emit(EditorEvent::Changed);
+    }
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        bounds: Bounds<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let r = self.range_from_utf16(&range_utf16);
+        let (li, start) = self.locate(r.start);
+        let dr = self
+            .visible_lines
+            .iter()
+            .position(|&b| b == li)
+            .unwrap_or(0);
+        let line = self.line_layouts.get(&dr)?;
+        let x = line.x_for_index(r.start - start);
+        let y = bounds.top() + self.line_height * (dr as f32);
+        Some(Bounds::from_corners(
+            point(bounds.left() + x, y),
+            point(bounds.left() + x, y + self.line_height),
+        ))
+    }
+    fn character_index_for_point(
+        &mut self,
+        point: Point<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(self.off_to_utf16(self.offset_for_position(point)))
+    }
+}
+
+impl Render for CodeEditor {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Focus can be assigned programmatically (for example when Commit opens), without a
+        // mouse/key event reaching this editor. Start blinking on focus gain and invalidate the
+        // timer on blur so hidden editors do not keep waking the UI every half second.
+        let focused = self.focus_handle.is_focused(window);
+        if focused != self.was_focused {
+            self.was_focused = focused;
+            if focused {
+                self.restart_blink(cx);
+            } else {
+                self.blink_epoch = self.blink_epoch.wrapping_add(1);
+                self.blink_on = true;
+            }
+        }
+        // The base editor context (so cmd-a / cmd-backspace / arrows / cmd-c etc. always
+        // work), PLUS any override as an ADDITIONAL context — not a replacement. gpui matches
+        // a binding if its context appears anywhere in the stack, so "CodeInput FindBar" keeps
+        // the editing keys while also firing the find bar's enter/escape. (Replacing the
+        // context with just "FindBar" silently dropped every editor key — the cmd-a/
+        // cmd-backspace-in-the-find-bar bug.)
+        let base = if self.single_line {
+            CONTEXT_SINGLE
+        } else {
+            CONTEXT
+        };
+        let ctx: String = match self.ctx_override {
+            Some(o) => format!("{base} {o}"),
+            None => base.to_string(),
+        };
+        // Fill the parent (clickable full-box) for single-line inputs and the commit box;
+        // content-size (so a tall file overflows + scrolls) for the file editor + diff panes.
+        let fill = self.single_line || self.fill_height;
+        let completion_popup = (!self.lsp_completions.is_empty()).then(|| {
+            div()
+                .absolute()
+                .top_8()
+                .left_16()
+                .max_h(px(280.0))
+                .rounded_md()
+                .border_1()
+                .border_color(theme::get().divider)
+                .bg(theme::get().bg_light)
+                .children(self.lsp_completions.iter().take(12).map(
+                    |(label, detail, insert, range)| {
+                        let label = label.clone();
+                        let detail = detail.clone();
+                        let insert = insert.clone();
+                        let range = range.clone();
+                        div()
+                            .flex()
+                            .justify_between()
+                            .gap_3()
+                            .px_2()
+                            .py_1()
+                            .text_color(theme::get().text)
+                            .cursor(CursorStyle::PointingHand)
+                            .child(label)
+                            .child(div().child(detail))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                    this.replace_range_text(range.clone(), &insert, cx);
+                                    this.lsp_completions.clear();
+                                    cx.notify();
+                                }),
+                            )
+                    },
+                ))
+        });
+        div()
+            .key_context(ctx.as_str())
+            .track_focus(&self.focus_handle)
+            // Pointer over a ⌘-hovered import link (it's clickable); I-beam otherwise.
+            .cursor(if self.cmd_held && self.hover_range.is_some() {
+                CursorStyle::PointingHand
+            } else {
+                CursorStyle::IBeam
+            })
+            .when(!fill, |d| d.w_full().min_h(relative(1.0)))
+            .when(fill, gpui::Styled::size_full)
+            // A single line sits centred in its box, not at the top of it — the input boxes
+            // are taller than one line.
+            .when(self.single_line, |d| d.flex().items_center())
+            // Transparent: the editor adopts its container's background (the rounded editor
+            // island, the commit box, the finder) so it never paints square corners over a
+            // rounded parent (gpui clips to a rectangle, not the rounded shape).
+            .text_color(theme::get().text)
+            .font_family(theme::font::family())
+            .text_size(px(theme::get().editor_font_size))
+            .when_some(self.diagnostic_hover.clone(), |d, message| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .max_w(px(520.0))
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .bg(theme::get().bg_light)
+                        .border_1()
+                        .border_color(theme::get().divider)
+                        .text_color(theme::get().text)
+                        .child(message),
+                )
+            })
+            .when_some(self.lsp_hover.clone(), |d, message| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top_6()
+                        .right_0()
+                        .max_w(px(520.0))
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .bg(theme::get().bg_light)
+                        .border_1()
+                        .border_color(theme::get().divider)
+                        .text_color(theme::get().text)
+                        .child(message),
+                )
+            })
+            .when_some(completion_popup, |d, popup| d.child(popup))
+            .line_height(px(line_height_px()))
+            .on_action(cx.listener(Self::left))
+            .on_action(cx.listener(Self::right))
+            .on_action(cx.listener(Self::home))
+            .on_action(cx.listener(Self::end))
+            .on_action(cx.listener(Self::select_left))
+            .on_action(cx.listener(Self::select_right))
+            .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::backspace))
+            .on_action(cx.listener(Self::delete))
+            .on_action(cx.listener(Self::delete_to_home))
+            .on_action(cx.listener(Self::word_left))
+            .on_action(cx.listener(Self::word_right))
+            .on_action(cx.listener(Self::select_word_left))
+            .on_action(cx.listener(Self::select_word_right))
+            .on_action(cx.listener(Self::delete_word_left))
+            .on_action(cx.listener(Self::delete_word_right))
+            .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::cut))
+            .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
+            .on_action(cx.listener(Self::lsp_completion))
+            .on_action(cx.listener(Self::lsp_definition))
+            .on_action(cx.listener(Self::lsp_format))
+            // Enter / Up / Down only for multi-line editors; single-line inputs let
+            // these bubble to the surrounding context (e.g. the file finder).
+            .when(!self.single_line, |d| {
+                d.on_action(cx.listener(Self::up))
+                    .on_action(cx.listener(Self::down))
+                    .on_action(cx.listener(Self::select_up))
+                    .on_action(cx.listener(Self::select_down))
+                    .on_action(cx.listener(Self::enter))
+                    .on_action(cx.listener(Self::indent))
+                    .on_action(cx.listener(Self::outdent))
+                    // Held ↑/↓ → accelerating auto-repeat (OS key-repeat wasn't moving).
+                    .on_key_down(cx.listener(Self::on_key_down_nav))
+                    .on_key_up(cx.listener(Self::on_key_up_nav))
+            })
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_down))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            // Track ⌘ so the import-link affordance appears/disappears live.
+            .on_modifiers_changed(
+                cx.listener(|this, e: &gpui::ModifiersChangedEvent, _w, cx| {
+                    let held = e.modifiers.secondary();
+                    if this.cmd_held != held {
+                        this.cmd_held = held;
+                        // Pressing ⌘ over a link (pointer stationary) lights it
+                        // up immediately; releasing clears it.
+                        this.refresh_link_hover(cx);
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(EditorElement {
+                editor: cx.entity(),
+            })
+    }
+}
+
+/// (`line_index`, `line_start_offset`) for an offset, given precomputed line starts.
+fn locate_in(line_starts: &[usize], content: &str, off: usize) -> (usize, usize) {
+    let mut idx = 0;
+    for (i, &s) in line_starts.iter().enumerate() {
+        if s <= off {
+            idx = i;
+        } else {
+            break;
+        }
+    }
+    let _ = content;
+    // Guard: never index an empty slice (e.g. a frame where no rows were laid out).
+    (idx, line_starts.get(idx).copied().unwrap_or(0))
+}
+
+/// Build `TextRuns` covering one line, colored by the highlight spans that fall in it.
+pub(super) fn line_runs(
+    line: &str,
+    line_start: usize,
+    spans: &[highlight::Span],
+    font: &gpui::Font,
+    default: Hsla,
+) -> Vec<TextRun> {
+    let line_end = line_start + line.len();
+    let mut runs = Vec::new();
+    let mut cursor = line_start;
+    let mk = |len: usize, color: Hsla| TextRun {
+        len,
+        font: font.clone(),
+        color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    // `spans` is sorted by position and non-overlapping, so binary-search the first one
+    // that reaches this line and stop once we pass its end — O(log n + spans-in-line)
+    // instead of scanning every span in the file for each visible line (the big-file killer).
+    let first = spans.partition_point(|s| s.end <= line_start);
+    for s in &spans[first..] {
+        if s.start >= line_end {
+            break;
+        }
+        let a = s.start.max(line_start);
+        let b = s.end.min(line_end);
+        if a > cursor {
+            runs.push(mk(a - cursor, default));
+        }
+        if b > a {
+            runs.push(mk(b - a, s.color.into()));
+            cursor = b;
+        }
+    }
+    if cursor < line_end {
+        runs.push(mk(line_end - cursor, default));
+    }
+    if runs.is_empty() {
+        runs.push(mk(0, default));
+    }
+    runs
+}
+
+/// Split `runs` (built by [`line_runs`] for the line at `line_start..line_start+line_len`)
+/// at error-range boundaries and give the error pieces a wavy underline — the
+/// squiggle then rides the normal `ShapedLine` paint, so virtualization is free
+/// (only visible rows are ever shaped). `errors` are whole-buffer byte ranges,
+/// sorted + non-overlapping (`highlight::error_ranges` guarantees both). Total
+/// run length is preserved, so shaping/metrics are unaffected.
+fn apply_error_squiggles(
+    runs: Vec<TextRun>,
+    line_start: usize,
+    line_len: usize,
+    errors: &[Range<usize>],
+    color: Hsla,
+) -> Vec<TextRun> {
+    let squiggle = UnderlineStyle {
+        thickness: px(1.0),
+        color: Some(color),
+        wavy: true,
+    };
+    apply_underline_ranges(runs, line_start, line_len, errors, squiggle)
+}
+
+/// The generic run-splitter behind [`apply_error_squiggles`] (wavy, per error)
+/// and the ⌘-hover import-link underline (straight, one range): split `runs`
+/// wherever a range boundary falls in this line and set `style` on the covered
+/// pieces. `ranges` are whole-buffer byte ranges, sorted + non-overlapping.
+fn apply_underline_ranges(
+    runs: Vec<TextRun>,
+    line_start: usize,
+    line_len: usize,
+    ranges: &[Range<usize>],
+    style: UnderlineStyle,
+) -> Vec<TextRun> {
+    let line_end = line_start + line_len;
+    // Binary-search the first range reaching this line (same trick as `line_runs`),
+    // then clamp the overlapping ones to line-local offsets.
+    let first = ranges.partition_point(|r| r.end <= line_start);
+    let mut local: Vec<(usize, usize)> = Vec::new();
+    for r in &ranges[first..] {
+        if r.start >= line_end {
+            break;
+        }
+        local.push((
+            r.start.max(line_start) - line_start,
+            r.end.min(line_end) - line_start,
+        ));
+    }
+    if local.is_empty() {
+        return runs;
+    }
+    let mut out: Vec<TextRun> = Vec::with_capacity(runs.len() + local.len() * 2);
+    let mut pos = 0usize; // line-local byte cursor
+    let mut li = 0usize; // index into `local` (monotonic — both walks are in order)
+    for run in runs {
+        let end = pos + run.len;
+        if run.len == 0 {
+            out.push(run); // preserve the empty-line sentinel run
+            continue;
+        }
+        let mut cur = pos;
+        while cur < end {
+            while li < local.len() && local[li].1 <= cur {
+                li += 1;
+            }
+            let (boundary, in_range) = match local.get(li) {
+                Some(&(es, ee)) if cur >= es => (ee.min(end), true),
+                Some(&(es, _)) => (es.min(end), false),
+                None => (end, false),
+            };
+            let mut piece = run.clone();
+            piece.len = boundary - cur;
+            if in_range {
+                piece.underline = Some(style);
+            }
+            out.push(piece);
+            cur = boundary;
+        }
+        pos = end;
+    }
+    out
+}
+
+/// Sort the lines touched by `sel` alphabetically (case-insensitive, raw text
+/// breaks ties — stable). Returns the whole-lines byte range plus its sorted
+/// replacement, or `None` when fewer than two lines are selected (nothing to
+/// sort). A selection ending exactly at a line start excludes that line (the
+/// usual "sort selected lines" convention); the trailing newline layout is
+/// untouched because the range never includes the final line's `\n`.
+pub fn sort_lines_in(content: &str, sel: Range<usize>) -> Option<(Range<usize>, String)> {
+    let len = content.len();
+    let (a, b) = (sel.start.min(len), sel.end.min(len));
+    let start = content[..a].rfind('\n').map_or(0, |i| i + 1);
+    // Selection ending at a line start: drop that line (unless collapsed).
+    let b = if b > a && content[..b].ends_with('\n') {
+        b - 1
+    } else {
+        b
+    };
+    let end = content[b..].find('\n').map_or(len, |i| b + i);
+    let mut lines: Vec<&str> = content[start..end].split('\n').collect();
+    if lines.len() < 2 {
+        return None;
+    }
+    lines.sort_by(|x, y| {
+        x.to_lowercase()
+            .cmp(&y.to_lowercase())
+            .then_with(|| x.cmp(y))
+    });
+    Some((start..end, lines.join("\n")))
+}
+
+// ── fold mapping (pure, unit-testable — no gpui) ───────────────────
+// These operate only on the editor's data (`content` + `folded` set + `foldable`
+// regions), so the index arithmetic that drives the fold display can be tested
+// directly. `CodeEditor`'s methods are thin wrappers over these.
+
+/// End line of the foldable region starting at `line`, if any.
+fn fold_end(foldable: &[(usize, usize)], line: usize) -> Option<usize> {
+    foldable.iter().find(|r| r.0 == line).map(|r| r.1)
+}
+
+/// Is `line` collapsed inside some currently-folded region?
+fn is_hidden(folded: &HashSet<usize>, foldable: &[(usize, usize)], line: usize) -> bool {
+    folded.iter().any(|&s| match fold_end(foldable, s) {
+        Some(e) => line > s && line <= e,
+        None => false,
+    })
+}
+
+/// Buffer line indices that are visible, in order (display row → buffer line).
+fn visible_line_indices(
+    content: &str,
+    folded: &HashSet<usize>,
+    foldable: &[(usize, usize)],
+) -> Vec<usize> {
+    let total = content.split('\n').count().max(1);
+    (0..total)
+        .filter(|&l| !is_hidden(folded, foldable, l))
+        .collect()
+}
+
+/// Byte offset of the start of buffer `line`.
+fn line_byte_start(content: &str, line: usize) -> usize {
+    content.split('\n').take(line).map(|l| l.len() + 1).sum()
+}
+
+/// 0-based buffer line containing byte offset `off` (mirrors `CodeEditor::locate`).
+fn line_of_offset(content: &str, off: usize) -> usize {
+    let mut start = 0usize;
+    for (i, line) in content.split('\n').enumerate() {
+        let end = start + line.len();
+        if off <= end {
+            return i;
+        }
+        start = end + 1;
+    }
+    content.split('\n').count().saturating_sub(1)
+}
+
+/// If a caret at byte offset `caret` lands on a hidden (folded-away) line, return
+/// the offset it should move to — the end of the enclosing fold's start line —
+/// so it stays visible. `None` when the caret is already visible.
+fn caret_after_fold(
+    content: &str,
+    folded: &HashSet<usize>,
+    foldable: &[(usize, usize)],
+    caret: usize,
+) -> Option<usize> {
+    let cli = line_of_offset(content, caret);
+    if !is_hidden(folded, foldable, cli) {
+        return None;
+    }
+    let start = folded
+        .iter()
+        .copied()
+        .find(|&s| fold_end(foldable, s).is_some_and(|e| cli > s && cli <= e))?;
+    let line_len = content.split('\n').nth(start).map_or(0, str::len);
+    Some(line_byte_start(content, start) + line_len)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Perf guard (see DEVELOPMENT.md "Performance regression tests"): ←/→ step one grapheme
+    /// per press — that must not rescan the buffer (it walked every grapheme from an end of
+    /// the file, so holding an arrow key in a big file lagged). Also: a multi-codepoint
+    /// grapheme (é as e + combining accent) is one step.
+    #[test]
+    fn perf_grapheme_steps_stay_local() {
+        let s = format!("{}cafe\u{301}!", "x".repeat(2_000_000));
+        let accent_end = s.len() - 1; // just before the '!'
+        assert_eq!(
+            prev_grapheme(&s, accent_end),
+            accent_end - 3,
+            "e + U+0301 is one step"
+        );
+        assert_eq!(next_grapheme(&s, accent_end - 3), accent_end);
+        let t = std::time::Instant::now();
+        let mut off = s.len() / 2;
+        for _ in 0..2_000 {
+            off = next_grapheme(&s, prev_grapheme(&s, off));
+        }
+        let dt = t.elapsed();
+        assert_eq!(off, s.len() / 2);
+        assert!(dt.as_secs_f32() < 2.0, "2k grapheme steps took {dt:?}");
+    }
+
+    fn set(items: &[usize]) -> HashSet<usize> {
+        items.iter().copied().collect()
+    }
+
+    /// Drag auto-scroll: a step is produced only when the pointer is within the edge margin
+    /// (or past it), in the direction that brings more content into view, speed-clamped.
+    #[gpui::test]
+    fn drag_autoscroll_step_only_past_an_edge(cx: &mut gpui::TestAppContext) {
+        let editor = cx.new(|cx| CodeEditor::new(cx, "x".into(), Lang::PlainText, ""));
+        editor.update(cx, |ed, _| {
+            // Viewport x∈[100,500], y∈[100,400]; MARGIN=24, MAX=48.
+            ed.viewport = Some(Bounds {
+                origin: point(px(100.0), px(100.0)),
+                size: gpui::size(px(400.0), px(300.0)),
+            });
+            // Comfortably inside → no scroll on either axis.
+            assert_eq!(
+                ed.autoscroll_step(point(px(250.0), px(250.0))),
+                Point::default()
+            );
+            // Past the bottom → content scrolls up (negative y); past the top → positive y.
+            assert!(ed.autoscroll_step(point(px(250.0), px(399.0))).y < px(0.0));
+            assert!(ed.autoscroll_step(point(px(250.0), px(101.0))).y > px(0.0));
+            // Past the right → negative x; past the left → positive x.
+            assert!(ed.autoscroll_step(point(px(499.0), px(250.0))).x < px(0.0));
+            assert!(ed.autoscroll_step(point(px(101.0), px(250.0))).x > px(0.0));
+            // Speed is clamped to MAX even far past the edge.
+            assert!(ed.autoscroll_step(point(px(250.0), px(9999.0))).y >= px(-48.0));
+        });
+    }
+
+    /// Regression for the markdown side-by-side: a content-wide editor (its element is as wide
+    /// as the longest line, for horizontal scroll) must NOT squeeze a sibling flex pane to
+    /// zero. Mirrors the fixed layout: `flex_1 min_w_0 overflow_hidden` outer wrapping an inner
+    /// `overflow_scroll` with very wide content, beside a plain `flex_1` pane.
+    #[gpui::test]
+    fn side_by_side_panes_both_get_width(cx: &mut gpui::TestAppContext) {
+        use gpui::ScrollHandle;
+        struct Split {
+            left: ScrollHandle,
+            right: ScrollHandle,
+        }
+        impl gpui::Render for Split {
+            fn render(&mut self, _w: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_row()
+                    .child(
+                        // Editor side: outer flex item + inner wide scroll (the fixed pattern).
+                        div().flex_1().min_w_0().overflow_hidden().child(
+                            div()
+                                .id("L")
+                                .overflow_scroll()
+                                .size_full()
+                                .track_scroll(&self.left)
+                                .child(div().w(px(3000.0)).h(px(30.0))),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .id("R")
+                            .overflow_y_scroll()
+                            .flex_1()
+                            .min_w_0()
+                            .track_scroll(&self.right)
+                            .child(div().w(px(200.0)).h(px(30.0))),
+                    )
+            }
+        }
+        let left = ScrollHandle::new();
+        let right = ScrollHandle::new();
+        let (l2, r2) = (left.clone(), right.clone());
+        let _win = cx.add_window(move |_w, _cx| Split {
+            left: l2.clone(),
+            right: r2.clone(),
+        });
+        cx.run_until_parked();
+        let lw = f32::from(left.bounds().size.width);
+        let rw = f32::from(right.bounds().size.width);
+        assert!(
+            rw > 100.0 && lw > 100.0,
+            "side-by-side panes squeezed: left={lw} right={rw}"
+        );
+    }
+
+    /// Double-click selects the whole word under the cursor (run of alphanumeric/`_`).
+    #[gpui::test]
+    fn double_click_selects_word(cx: &mut gpui::TestAppContext) {
+        let editor = cx.update(|cx| {
+            cx.new(|cx| CodeEditor::new(cx, "foo bar_baz qux".into(), Lang::PlainText, ""))
+        });
+        editor.update(cx, |ed, cx| {
+            // Offset 6 is inside "bar_baz" (chars 4..11).
+            ed.select_word_at(6, cx);
+            assert_eq!(&ed.content[ed.selected_range.clone()], "bar_baz");
+        });
+    }
+
+    /// Clicking in the empty area below a short file must drop the caret at the END of the
+    /// last line (standard editor behaviour), not leave it where it was. Exercises
+    /// `offset_for_position`'s "click below last line" branch directly with a simulated
+    /// painted frame (short 3-line file inside a tall viewport).
+    #[gpui::test]
+    fn click_below_last_line_snaps_to_end_of_content(cx: &mut gpui::TestAppContext) {
+        let editor = cx.update(|cx| {
+            cx.new(|cx| CodeEditor::new(cx, "a\nbb\nccc".into(), Lang::PlainText, ""))
+        });
+        editor.update(cx, |ed, _cx| {
+            // Simulate the state paint would have left after a frame.
+            ed.line_height = px(18.0);
+            ed.display_rows = 3;
+            ed.gutter_w = px(0.0);
+            ed.line_starts = vec![0, 2, 5];
+            ed.bounds = Some(gpui::Bounds {
+                origin: gpui::point(px(0.0), px(0.0)),
+                size: gpui::size(px(500.0), px(600.0)),
+            });
+            // Click far below the 3 lines of text (~54px tall) in the 600px viewport.
+            let off = ed.offset_for_position(gpui::point(px(50.0), px(400.0)));
+            assert_eq!(
+                off,
+                ed.content.len(),
+                "caret should land at end of last line"
+            );
+        });
+    }
+
+    /// Perf guard (see DEVELOPMENT.md "Performance regression tests"). `line_runs` runs for every
+    /// visible line each frame; it MUST stay sub-linear in the file's total span count, or a
+    /// big file (e.g. a 37k-line package-lock with ~200k spans) drops to single-digit FPS —
+    /// the exact regression this replaced (`spans.iter().filter(..)` scanned every span).
+    /// Simulates a viewport (~60 lines) near the END of a huge file, many frames over.
+    #[test]
+    fn perf_line_runs_sublinear_in_total_spans() {
+        // ~200k spans, 3 per "line", lines ~30 bytes apart.
+        let spans: Vec<highlight::Span> = (0..200_000)
+            .map(|i| highlight::Span {
+                start: i * 10,
+                end: i * 10 + 6,
+                color: ferritemcu_color::Color::rgb(0xffffff),
+            })
+            .collect();
+        let total = spans.last().map_or(0, |s| s.end);
+        let font = gpui::Font {
+            family: "monospace".into(),
+            features: Default::default(),
+            fallbacks: None,
+            weight: Default::default(),
+            style: Default::default(),
+        };
+        let line = "x".repeat(30);
+        let start = std::time::Instant::now();
+        // 60 visible lines near the end, 200 frames.
+        for _ in 0..200 {
+            for row in 0..60 {
+                let ls = total.saturating_sub((60 - row) * 30);
+                let _ = line_runs(&line, ls, &spans, &font, gpui::rgb(0).into());
+            }
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "line_runs scanned linearly? {elapsed:?} for 200 frames × 60 rows over 200k spans"
+        );
+    }
+
+    fn tfont() -> gpui::Font {
+        gpui::Font {
+            family: "monospace".into(),
+            features: Default::default(),
+            fallbacks: None,
+            weight: Default::default(),
+            style: Default::default(),
+        }
+    }
+
+    #[test]
+    fn error_squiggles_underline_exactly_the_error_bytes() {
+        let font = tfont();
+        let red: Hsla = gpui::rgb(0xff0000).into();
+        // One colored span (local 0..3) so the error range 2..5 crosses a run boundary.
+        let spans = vec![highlight::Span {
+            start: 100,
+            end: 103,
+            color: ferritemcu_color::Color::rgb(0x00ff00),
+        }];
+        let line = "abcdefgh"; // line_start 100, len 8
+        let runs = line_runs(line, 100, &spans, &font, gpui::rgb(0xffffff).into());
+        let out = apply_error_squiggles(
+            runs,
+            100,
+            line.len(),
+            std::slice::from_ref(&(102..105)),
+            red,
+        );
+        // Total length preserved (shaping depends on it).
+        assert_eq!(out.iter().map(|r| r.len).sum::<usize>(), line.len());
+        // Underlined pieces cover exactly local bytes 2..5.
+        let mut pos = 0usize;
+        let mut underlined: Vec<(usize, usize)> = Vec::new();
+        for r in &out {
+            if let Some(u) = &r.underline {
+                assert!(u.wavy, "squiggle must be wavy");
+                assert_eq!(u.color, Some(red));
+                underlined.push((pos, pos + r.len));
+            }
+            pos += r.len;
+        }
+        assert_eq!(
+            underlined,
+            vec![(2, 3), (3, 5)],
+            "split at the span boundary"
+        );
+        // The colored piece keeps its syntax color under the squiggle.
+        assert_eq!(out.iter().filter(|r| r.underline.is_some()).count(), 2);
+    }
+
+    #[test]
+    fn error_squiggles_none_in_line_leaves_runs_untouched() {
+        let font = tfont();
+        let runs = line_runs("hello", 0, &[], &font, gpui::rgb(0xffffff).into());
+        let n = runs.len();
+        // Error entirely on a later line → unchanged (and no split allocations).
+        let out = apply_error_squiggles(
+            runs,
+            0,
+            5,
+            std::slice::from_ref(&(40..44)),
+            gpui::rgb(0xff0000).into(),
+        );
+        assert_eq!(out.len(), n);
+        assert!(out.iter().all(|r| r.underline.is_none()));
+    }
+
+    #[test]
+    fn error_squiggles_keep_empty_line_sentinel() {
+        let font = tfont();
+        // Empty line → line_runs emits the single zero-len sentinel run.
+        let runs = line_runs("", 10, &[], &font, gpui::rgb(0xffffff).into());
+        // A multi-line error range crossing the empty line clamps to zero width here.
+        let out = apply_error_squiggles(
+            runs,
+            10,
+            0,
+            std::slice::from_ref(&(9..12)),
+            gpui::rgb(0xff0000).into(),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].len, 0);
+        assert!(out[0].underline.is_none());
+    }
+
+    #[test]
+    fn error_squiggles_cover_a_whole_line_of_a_multiline_error() {
+        let font = tfont();
+        let line = "broken";
+        let runs = line_runs(line, 20, &[], &font, gpui::rgb(0xffffff).into());
+        // Error spans lines 18..40 — every byte of this line squiggles.
+        let out = apply_error_squiggles(
+            runs,
+            20,
+            line.len(),
+            std::slice::from_ref(&(18..40)),
+            gpui::rgb(0xff0000).into(),
+        );
+        assert_eq!(out.iter().map(|r| r.len).sum::<usize>(), line.len());
+        assert!(out.iter().all(|r| r.underline.is_some()));
+    }
+
+    #[test]
+    fn sort_lines_expands_selection_to_whole_lines() {
+        //          0123456 789012 34567890
+        let src = "import z\nimport a\nimport M\nlast";
+        // Selection from inside line 0 to inside line 2 → all three sort.
+        let (r, out) = sort_lines_in(src, 3..21).unwrap();
+        assert_eq!(r, 0..26);
+        assert_eq!(out, "import a\nimport M\nimport z");
+        // Case-insensitive: ties broken by raw text; selection spanning all
+        // three lines (0..6 ends past line 2's start, so it's included).
+        let (_, out) = sort_lines_in("b\nB\na\n", 0..6).unwrap();
+        assert_eq!(out, "a\nB\nb");
+    }
+
+    #[test]
+    fn sort_lines_needs_two_lines_and_respects_line_start_end() {
+        assert!(sort_lines_in("only one line", 0..13).is_none());
+        assert!(
+            sort_lines_in("a\nb\n", 1..1).is_none(),
+            "collapsed caret = one line"
+        );
+        // Selection ending exactly at line 1's start excludes line 1.
+        assert!(
+            sort_lines_in("b\na\n", 0..2).is_none(),
+            "only line 0 selected"
+        );
+        let (r, out) = sort_lines_in("b\na\nc", 0..4).unwrap();
+        assert_eq!((r, out.as_str()), (0..3, "a\nb"), "line 2 untouched");
+    }
+
+    #[test]
+    fn hidden_lines_inside_a_fold() {
+        // 6 lines; fold region 0..=4 collapsed. Lines 1-4 hide; 0 and 5 stay.
+        let foldable = [(0usize, 4usize)];
+        let folded = set(&[0]);
+        assert!(!is_hidden(&folded, &foldable, 0)); // the start line is visible
+        for l in 1..=4 {
+            assert!(is_hidden(&folded, &foldable, l), "line {l} should hide");
+        }
+        assert!(!is_hidden(&folded, &foldable, 5));
+        // Not folded → nothing hidden.
+        assert!(!is_hidden(&HashSet::new(), &foldable, 3));
+    }
+
+    #[test]
+    fn visible_indices_skip_folded_body() {
+        let content = "a\nb\nc\nd\ne\nf"; // 6 lines (0..5)
+        let foldable = [(0usize, 4usize)];
+        assert_eq!(
+            visible_line_indices(content, &set(&[0]), &foldable),
+            vec![0, 5]
+        );
+        // Unfolded → all lines.
+        assert_eq!(
+            visible_line_indices(content, &HashSet::new(), &foldable),
+            vec![0, 1, 2, 3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn nested_folds_both_collapse() {
+        // outer 0..=5, inner 2..=4. Both folded → 1,2,3,4,5 hidden (outer wins),
+        // line 0 and 6 visible.
+        let foldable = [(0usize, 5usize), (2usize, 4usize)];
+        let folded = set(&[0, 2]);
+        assert_eq!(
+            visible_line_indices("0\n1\n2\n3\n4\n5\n6", &folded, &foldable),
+            vec![0, 6]
+        );
+    }
+
+    #[test]
+    fn caret_pulled_out_of_a_collapsed_region() {
+        // content: line starts at 0,2,4,6,8,10 (each "x\n"); fold 0..=4 folded.
+        let content = "a\nb\nc\nd\ne\nf";
+        let foldable = [(0usize, 4usize)];
+        let folded = set(&[0]);
+        // caret on line 3 (byte 6) is hidden → should move to end of line 0 (byte 1).
+        assert_eq!(caret_after_fold(content, &folded, &foldable, 6), Some(1));
+        // caret already on the visible start line → no move.
+        assert_eq!(caret_after_fold(content, &folded, &foldable, 0), None);
+        // caret on visible line 5 → no move.
+        assert_eq!(caret_after_fold(content, &folded, &foldable, 10), None);
+        // nothing folded → never moves.
+        assert_eq!(
+            caret_after_fold(content, &HashSet::new(), &foldable, 6),
+            None
+        );
+    }
+
+    #[test]
+    fn line_offset_round_trips() {
+        let content = "alpha\nbeta\ngamma";
+        assert_eq!(line_of_offset(content, 0), 0);
+        assert_eq!(line_of_offset(content, 5), 0); // end of "alpha"
+        assert_eq!(line_of_offset(content, 6), 1); // start of "beta"
+        assert_eq!(line_of_offset(content, 11), 2);
+        assert_eq!(line_byte_start(content, 1), 6);
+        assert_eq!(line_byte_start(content, 2), 11);
+    }
+
+    // ── text-mutation path ────────────────────────────────────────────
+    // The OS input handler, undo/redo, and find/replace all funnel through a small set of
+    // mutation primitives. These guard their contracts: correct byte/UTF-16 mapping, caret
+    // placement, panic-free clamping, the read-only gate, and undo coalescing.
+
+    /// UTF-16 ⇆ UTF-8 offset conversion must round-trip across multi-byte content. The OS
+    /// hands the input handler UTF-16 offsets (IME, emoji, accents); a mismatch here would
+    /// corrupt every non-ASCII edit. "é" = 2 bytes / 1 UTF-16 unit; "😀" = 4 bytes / 2
+    /// UTF-16 units (a surrogate pair).
+    #[gpui::test]
+    fn utf16_offsets_round_trip_through_multibyte(cx: &mut gpui::TestAppContext) {
+        let editor =
+            cx.update(|cx| cx.new(|cx| CodeEditor::new(cx, "aé😀b".into(), Lang::PlainText, "")));
+        editor.update(cx, |ed, _| {
+            // (byte offset, UTF-16 offset) at each char boundary, including end.
+            for (u8o, u16o) in [(0, 0), (1, 1), (3, 2), (7, 4), (8, 5)] {
+                assert_eq!(ed.off_to_utf16(u8o), u16o, "byte {u8o} → utf16");
+                assert_eq!(ed.off_from_utf16(u16o), u8o, "utf16 {u16o} → byte");
+            }
+        });
+    }
+
+    /// `replace_range_text` (find/replace + the `»` revert) replaces a byte range, drops the
+    /// caret after the inserted text, and marks the buffer dirty.
+    #[gpui::test]
+    fn replace_range_text_replaces_and_positions_caret(cx: &mut gpui::TestAppContext) {
+        let editor = cx.update(|cx| {
+            cx.new(|cx| CodeEditor::new(cx, "hello world".into(), Lang::PlainText, ""))
+        });
+        editor.update(cx, |ed, cx| {
+            ed.replace_range_text(6..11, "there", cx); // "world" → "there"
+            assert_eq!(ed.text(), "hello there");
+            assert_eq!(ed.selected_range, 11..11);
+            assert!(ed.dirty);
+        });
+    }
+
+    /// Out-of-bounds ranges must clamp, not panic — `replace_range_text` slices `content`,
+    /// so an unclamped end past `len()` would be a byte-index panic.
+    #[gpui::test]
+    fn replace_range_text_clamps_out_of_bounds(cx: &mut gpui::TestAppContext) {
+        let editor =
+            cx.update(|cx| cx.new(|cx| CodeEditor::new(cx, "abc".into(), Lang::PlainText, "")));
+        editor.update(cx, |ed, cx| {
+            ed.replace_range_text(2..999, "X", cx); // end past len → clamps to 3
+            assert_eq!(ed.text(), "abX");
+        });
+    }
+
+    #[gpui::test]
+    fn lsp_edits_apply_as_one_undoable_document_change(cx: &mut gpui::TestAppContext) {
+        let editor =
+            cx.update(|cx| cx.new(|cx| CodeEditor::new(cx, "abc def".into(), Lang::Rust, "")));
+        editor.update(cx, |ed, cx| {
+            ed.select_range(7..7, cx);
+            ed.apply_text_edits(vec![(0..3, "ABC".into()), (4..7, "XYZ".into())], cx);
+            assert_eq!(ed.text(), "ABC XYZ");
+            assert_eq!(ed.selected_range, 7..7);
+            assert_eq!(ed.undo_stack.len(), 1);
+            assert!(ed.dirty);
+        });
+    }
+
+    /// Linux: a mouse selection becomes the PRIMARY selection, and a middle click pastes it
+    /// where it lands — driven through real mouse events on a painted editor. A read-only
+    /// editor (the diff base pane) takes no middle-click paste.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[gpui::test]
+    fn mouse_selection_is_primary_and_middle_click_pastes_it(cx: &mut gpui::TestAppContext) {
+        use gpui::Modifiers;
+        let (editor, cx) =
+            cx.add_window_view(|_w, cx| CodeEditor::new(cx, "hello".into(), Lang::PlainText, ""));
+        cx.run_until_parked();
+        let bounds = editor.read_with(cx, |ed, _| ed.bounds).unwrap();
+        // On the first line, right of its text.
+        let at = point(
+            bounds.left() + bounds.size.width / 2.0,
+            bounds.top() + px(4.0),
+        );
+        // Double-click selects the word; releasing the button makes it PRIMARY.
+        cx.simulate_event(MouseDownEvent {
+            position: at,
+            modifiers: Modifiers::default(),
+            button: MouseButton::Left,
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_mouse_up(at, MouseButton::Left, Modifiers::default());
+        let primary = cx.update(|_, cx| cx.read_from_primary().and_then(|i| i.text()));
+        assert_eq!(primary.as_deref(), Some("hello"));
+        // A middle click pastes it there: the end of the line.
+        cx.simulate_mouse_down(at, MouseButton::Middle, Modifiers::default());
+        editor.read_with(cx, |ed, _| assert_eq!(ed.text(), "hellohello"));
+
+        let (frozen, cx) = cx
+            .add_window_view(|_w, cx| CodeEditor::read_only(cx, "frozen".into(), Lang::PlainText));
+        cx.run_until_parked();
+        let b = frozen.read_with(cx, |ed, _| ed.bounds).unwrap();
+        cx.simulate_mouse_down(
+            point(b.left() + b.size.width / 2.0, b.top() + px(4.0)),
+            MouseButton::Middle,
+            Modifiers::default(),
+        );
+        frozen.read_with(cx, |ed, _| assert_eq!(ed.text(), "frozen"));
+    }
+
+    /// A single-line input in a box taller than its line (the find / search boxes) sits
+    /// centred in it, not at the top.
+    #[gpui::test]
+    fn single_line_input_centres_its_line(cx: &mut gpui::TestAppContext) {
+        struct Box40(Entity<CodeEditor>);
+        impl Render for Box40 {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().h(px(40.0)).w(px(200.0)).child(self.0.clone())
+            }
+        }
+        let (host, cx) =
+            cx.add_window_view(|_w, cx| Box40(cx.new(|cx| CodeEditor::single_line(cx, "Find"))));
+        cx.run_until_parked();
+        let ed = host.read_with(cx, |h, _| h.0.clone());
+        let line = ed.read_with(cx, |ed, _| ed.bounds).unwrap();
+        let above = f32::from(line.top());
+        let below = 40.0 - f32::from(line.bottom());
+        assert!(
+            above > 1.0 && (above - below).abs() <= 1.0,
+            "line at {above}px from the top, {below}px from the bottom"
+        );
+    }
+
+    /// A soft-wrapped editor in a box that fits its content (the Settings prompts) is as tall
+    /// as its wrapped rows, so a long line doesn't paint past the box.
+    #[gpui::test]
+    fn soft_wrapped_editor_is_as_tall_as_its_rows(cx: &mut gpui::TestAppContext) {
+        struct Narrow(Entity<CodeEditor>);
+        impl Render for Narrow {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().w(px(120.0)).child(self.0.clone())
+            }
+        }
+        let (host, cx) = cx.add_window_view(|_w, cx| {
+            Narrow(cx.new(|cx| {
+                let mut e = CodeEditor::new(cx, "word ".repeat(40), Lang::PlainText, "");
+                e.soft_wrap = true;
+                e.fill_height = true;
+                e
+            }))
+        });
+        cx.run_until_parked();
+        let ed = host.read_with(cx, |h, _| h.0.clone());
+        // The frame after the wrap is known (the test platform runs no frame callbacks).
+        ed.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        let (rows, lh, b) = ed.read_with(cx, |ed, _| (ed.display_rows, ed.line_height, ed.bounds));
+        assert!(rows > 1, "the line wraps");
+        assert_eq!(b.unwrap().size.height, lh * rows as f32);
+    }
+
+    /// A long message pasted into a small scrolling box (the commit / comment boxes) scrolls
+    /// to keep the caret at its end in view, though the wrap is only known a frame later.
+    #[gpui::test]
+    fn caret_stays_in_view_as_the_text_wraps(cx: &mut gpui::TestAppContext) {
+        struct SmallBox(Entity<CodeEditor>, ScrollHandle);
+        impl Render for SmallBox {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().w(px(120.0)).h(px(40.0)).child(
+                    div()
+                        .id("box")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.1)
+                        .child(self.0.clone()),
+                )
+            }
+        }
+        let (host, cx) = cx.add_window_view(|_w, cx| {
+            let scroll = ScrollHandle::new();
+            let ed = cx.new(|cx| {
+                let mut e = CodeEditor::new(cx, String::new(), Lang::PlainText, "");
+                e.soft_wrap = true;
+                e.set_scroll_handle(scroll.clone());
+                e
+            });
+            SmallBox(ed, scroll)
+        });
+        cx.run_until_parked();
+        let (ed, scroll) = host.read_with(cx, |h, _| (h.0.clone(), h.1.clone()));
+        ed.update(cx, |e, cx| {
+            let text = "word ".repeat(40);
+            let end = text.len();
+            e.set_content(text, Lang::PlainText, cx);
+            e.select_range(end..end, cx);
+        });
+        cx.run_until_parked();
+        // The frame after the wrap is known (the test platform runs no frame callbacks).
+        ed.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        let max = scroll.max_offset().height;
+        assert!(max > px(0.0), "the text outgrows the box");
+        assert_eq!(
+            scroll.offset().y,
+            -max,
+            "scrolled to the caret on the last row"
+        );
+    }
+
+    /// A read-only editor (the diff base pane) rejects edits and stays clean.
+    #[gpui::test]
+    fn read_only_rejects_edits(cx: &mut gpui::TestAppContext) {
+        let editor = cx
+            .update(|cx| cx.new(|cx| CodeEditor::read_only(cx, "frozen".into(), Lang::PlainText)));
+        editor.update(cx, |ed, cx| {
+            ed.replace_range_text(0..6, "changed", cx);
+            assert_eq!(ed.text(), "frozen");
+            assert!(!ed.dirty);
+        });
+    }
+
+    /// Typing through the OS input handler inserts at the caret, and a run of single-char
+    /// inserts coalesces into one undo step — so one Undo wipes the whole run (not char by
+    /// char), and Redo restores it.
+    #[gpui::test]
+    fn typing_coalesces_into_one_undo_step(cx: &mut gpui::TestAppContext) {
+        let win = cx.add_window(|_w, cx| CodeEditor::new(cx, String::new(), Lang::PlainText, ""));
+        win.update(cx, |ed, window, cx| {
+            for ch in ["h", "i"] {
+                ed.replace_text_in_range(None, ch, window, cx);
+            }
+            assert_eq!(ed.text(), "hi");
+            ed.undo(&Undo, window, cx);
+            assert_eq!(ed.text(), "", "one undo wipes the coalesced typing run");
+            ed.redo(&Redo, window, cx);
+            assert_eq!(ed.text(), "hi");
+        })
+        .unwrap();
+    }
+
+    /// Backspace with no selection deletes the character before the caret.
+    #[gpui::test]
+    fn backspace_deletes_previous_char(cx: &mut gpui::TestAppContext) {
+        let win = cx.add_window(|_w, cx| CodeEditor::new(cx, "abc".into(), Lang::PlainText, ""));
+        win.update(cx, |ed, window, cx| {
+            ed.selected_range = 3..3; // caret at end
+            ed.backspace(&Backspace, window, cx);
+            assert_eq!(ed.text(), "ab");
+            assert_eq!(ed.selected_range, 2..2);
+        })
+        .unwrap();
+    }
+
+    /// Enter inserts a newline at the caret.
+    #[gpui::test]
+    fn enter_inserts_newline_at_caret(cx: &mut gpui::TestAppContext) {
+        let win = cx.add_window(|_w, cx| CodeEditor::new(cx, "ab".into(), Lang::PlainText, ""));
+        win.update(cx, |ed, window, cx| {
+            ed.selected_range = 1..1; // between 'a' and 'b'
+            ed.enter(&Enter, window, cx);
+            assert_eq!(ed.text(), "a\nb");
+        })
+        .unwrap();
+    }
+
+    /// ⌘-click / ⌘-hover is Ctrl off macOS: holding the platform's secondary modifier arms the
+    /// link affordance; Super (⌘'s key on a Linux keyboard) doesn't.
+    #[gpui::test]
+    fn link_modifier_is_secondary(cx: &mut gpui::TestAppContext) {
+        let win = cx.add_window(|_w, cx| CodeEditor::new(cx, "a".into(), Lang::PlainText, ""));
+        let mv = |modifiers: gpui::Modifiers| MouseMoveEvent {
+            position: point(px(1.0), px(1.0)),
+            pressed_button: None,
+            modifiers,
+        };
+        win.update(cx, |ed, window, cx| {
+            ed.on_mouse_move(&mv(gpui::Modifiers::secondary_key()), window, cx);
+            assert!(ed.cmd_held);
+            ed.on_mouse_move(&mv(gpui::Modifiers::none()), window, cx);
+            assert!(!ed.cmd_held);
+            let super_key = gpui::Modifiers {
+                platform: true,
+                ..Default::default()
+            };
+            ed.on_mouse_move(&mv(super_key), window, cx);
+            assert_eq!(ed.cmd_held, cfg!(target_os = "macos"));
+        })
+        .unwrap();
+    }
+
+    /// Word stops: whitespace is skipped, then one run of word characters or of symbols.
+    #[test]
+    fn word_motion_stops() {
+        let s = "let foo_bar = baz.qux();\n  héllo";
+        let mut at = s.len();
+        let mut back = Vec::new();
+        while at > 0 {
+            at = prev_word(s, at);
+            back.push(&s[at..]);
+        }
+        let words: Vec<&str> = back
+            .iter()
+            .map(|t| t.split(|c: char| c.is_whitespace()).next().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            words,
+            [
+                "héllo",
+                "();",
+                "qux();",
+                ".qux();",
+                "baz.qux();",
+                "=",
+                "foo_bar",
+                "let"
+            ]
+        );
+        let mut at = 0;
+        let mut ends = Vec::new();
+        while at < s.len() {
+            at = next_word(s, at);
+            ends.push(at);
+        }
+        let firsts: Vec<&str> = ends.iter().map(|&e| &s[..e]).collect();
+        assert!(firsts[0].ends_with("let") && firsts[1].ends_with("foo_bar"));
+        assert!(firsts[2].ends_with(" =") && firsts[3].ends_with("baz"));
+        assert_eq!(firsts.last().copied(), Some(s), "ends at the end");
+        assert_eq!(prev_word("   ", 3), 0);
+        assert_eq!(next_word("ab  ", 2), 4);
+    }
+
+    /// Off macOS Ctrl+←/→ move by word and Ctrl+Backspace deletes one, through the real
+    /// bindings (on macOS ⌘←/→ stay the line ends).
+    #[cfg(not(target_os = "macos"))]
+    #[gpui::test]
+    fn ctrl_arrows_move_by_word_off_macos(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        let win =
+            cx.add_window(|_w, cx| CodeEditor::new(cx, "foo bar baz".into(), Lang::PlainText, ""));
+        win.update(cx, |ed, window, _cx| {
+            ed.selected_range = 11..11;
+            window.focus(&ed.focus_handle);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let press = |cx: &mut gpui::TestAppContext, key: &str| {
+            cx.update_window(win.into(), |_, window, cx| {
+                window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+            })
+            .unwrap();
+        };
+        press(cx, "ctrl-left");
+        win.update(cx, |ed, _w, _cx| assert_eq!(ed.selected_range, 8..8))
+            .unwrap();
+        press(cx, "ctrl-shift-left");
+        win.update(cx, |ed, _w, _cx| assert_eq!(ed.selected_range, 4..8))
+            .unwrap();
+        press(cx, "ctrl-right");
+        press(cx, "ctrl-right");
+        win.update(cx, |ed, _w, _cx| assert_eq!(ed.selected_range, 11..11))
+            .unwrap();
+        press(cx, "ctrl-backspace");
+        win.update(cx, |ed, _w, _cx| assert_eq!(ed.text(), "foo bar "))
+            .unwrap();
+    }
+}
