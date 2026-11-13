@@ -45,6 +45,18 @@ See [RELEASING.md](RELEASING.md) for how releases are cut.
 * use the system command shell when opening the embedded terminal on Windows
 * **linux:** the AppImage starts on glibc 2.35 and newer (Ubuntu 22.04, Debian 12, Linux Mint 21), not only on 2.39+
 
+## [2.15.0](https://github.com/Cattens-Roses/FerriteMCU/compare/ferritemcu-v2.14.1...ferritemcu-v2.15.0) (2026-11-13)
+
+
+### Features
+
+* **releases:** use GitHub release feeds by default ([2abd2bd](https://github.com/Cattens-Roses/FerriteMCU/commit/2abd2bdbcb5debeff72511cd7a5870a11f6f1c9d))
+
+
+### Bug Fixes
+
+* **ci:** install libudev and clean documentation lints ([a7e4074](https://github.com/Cattens-Roses/FerriteMCU/commit/a7e4074d4986317e75f2524dbe640631d2531612))
+
 ## [2.14.1](https://github.com/kyle-ssg/kyde/compare/kyde-v2.14.0...kyde-v2.14.1) (2026-11-10)
 
 
