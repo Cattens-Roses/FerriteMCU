@@ -52,11 +52,15 @@ The binary is `ferritemcu` (`ferritemcu.exe` on Windows). Settings are stored in
 
 On first launch, FerriteMCU offers to enable the bundled JSON, Rust, Markdown, TOML, and YAML language plugins. You can skip the offer or change your selection later in Language Plugins.
 
+## Releases and updates
+
+Browse [FerriteMCU releases](https://github.com/Cattens-Roses/FerriteMCU/releases) for downloads and release notes. Each release includes Windows, macOS (Apple Silicon and Intel), and Linux packages with SHA-256 checksums. The in-app **What's New** view and update check use the public GitHub Releases API by default; `FERRITEMCU_RELEASES_FEED_URL` and `FERRITEMCU_UPDATE_FEED_URL` can override those feeds for mirrors or development.
+
+Release PRs and packaging are automated with [release-please](RELEASING.md). Conventional Commit messages on `main` determine version bumps; merging its release PR creates the version tag and GitHub Release, then builds and attaches the platform packages.
+
 ## Project structure
 
 The application lives in `src/`; reusable editor, Git, configuration, syntax, UI, and update components live in the `crates/` workspace. Future board integrations can be added as separate components without coupling hardware-specific logic to the UI.
-
-No release feed is configured by default. `FERRITEMCU_UPDATE_FEED_URL` and `FERRITEMCU_RELEASES_FEED_URL` can point to compatible feeds when releases are available.
 
 ## Contributing and support
 

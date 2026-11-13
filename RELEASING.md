@@ -19,10 +19,17 @@ FerriteMCU follows [Semantic Versioning](https://semver.org/) — `MAJOR.MINOR.P
    `.sha256` — Developer ID signs, notarizes and staples them (a no-op that leaves the
    ad-hoc signature if the signing secrets aren't set), and attaches them to the release.
    A Linux job does the same for `ferritemcu-linux-x86_64.AppImage` (+ `.sha256`), built on a
-   pinned Ubuntu so its glibc floor stays put. Windows packaging's matrix entry and package
-   step are **commented out** in `release.yml`; uncomment both to revive it.
+   pinned Ubuntu so its glibc floor stays put. Windows ships
+   `ferritemcu-windows-x86_64.zip` (+ `.sha256`). All packages are attached to the GitHub
+   Release automatically.
 
 That's it. Cutting a release = merging one PR.
+
+The release list and latest-release metadata also power FerriteMCU's **What's New** view and
+update checker. Both use the public GitHub Releases API by default; set
+`FERRITEMCU_RELEASES_FEED_URL` or `FERRITEMCU_UPDATE_FEED_URL` to use a mirror. The macOS
+updater verifies the published SHA-256 before replacing the app; Windows and Linux open the
+release page for their platform's download.
 
 ## Conventional Commits (this is the only discipline required)
 
@@ -64,5 +71,7 @@ yourself too: bump both `version` fields in `Cargo.toml` (and `Cargo.lock`), upd
 the artifacts locally (`TARGET=aarch64-apple-darwin ./scripts/bundle-macos.sh`, then
 again for `x86_64-apple-darwin`, zipping each `dist/FerriteMCU.app` as `ferritemcu-macos.zip` /
 `ferritemcu-macos-x86_64.zip`; on Ubuntu 22.04, `./scripts/bundle-linux.sh` renamed to
-`ferritemcu-linux-x86_64.AppImage`) and `gh release upload` each one with a `.sha256`. Locally
-built apps are ad-hoc-signed, not notarized. The automated path is strongly preferred.
+`ferritemcu-linux-x86_64.AppImage`; and on Windows, `cargo build --locked --release` followed by
+zipping `target/release/ferritemcu.exe` as `ferritemcu-windows-x86_64.zip`) and `gh release upload`
+each package with its `.sha256`. Locally built macOS apps are ad-hoc-signed, not notarized. The
+automated path is strongly preferred.

@@ -1,5 +1,5 @@
 #![deny(missing_docs)]
-//! A tiny opaque-friendly RGBA colour value (`f32` channels, `0.0..=1.0`), shared by FerriteMCU's
+//! A tiny opaque-friendly RGBA colour value (`f32` channels, `0.0..=1.0`), shared by `FerriteMCU`'s
 //! pure model crates (`ferritemcu-theme`, `ferritemcu-syntax`) so they don't depend on a GUI framework just
 //! to name a colour. Enable the **`gpui`** feature (the binary + `ferritemcu-ui` do) for conversions
 //! into gpui's `Rgba`/`Hsla`/`Fill`/`Background`, so gpui builders accept a [`Color`] directly:

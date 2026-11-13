@@ -14,6 +14,8 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
+const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/Cattens-Roses/FerriteMCU/releases";
+
 /// Everything self-update can fail with. Each variant carries context — which external command
 /// failed and its stderr, or the I/O operation + underlying error. (Library crate → typed
 /// errors via `thiserror`, never `anyhow`.)
@@ -116,10 +118,11 @@ pub fn current_version() -> String {
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
 }
 
-fn feed_url() -> Option<String> {
+fn feed_url() -> String {
     std::env::var("FERRITEMCU_UPDATE_FEED_URL")
         .ok()
         .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("{GITHUB_RELEASES_API}/latest"))
 }
 
 /// Parse a release tag → `(major, minor, patch)`. Handles `1.2.3`, `v1.2.3`, the
@@ -170,10 +173,7 @@ pub fn running_bundle() -> Option<PathBuf> {
 /// Pull the latest-release metadata and return it only when it's newer than what's running.
 /// `Ok(None)` = already up to date; `Err` = network/parse failure (callers stay quiet).
 pub fn check() -> Result<Option<Release>> {
-    let Some(url) = feed_url() else {
-        return Ok(None);
-    };
-    let body = curl_text(&url)?;
+    let body = curl_text(&feed_url())?;
     Ok(parse_feed(&body, &current_version()).map(|r| for_os(r, std::env::consts::OS)))
 }
 
@@ -227,18 +227,18 @@ pub fn parse_feed(body: &str, current: &str) -> Option<Release> {
 
 /// Where the changelog window reads its release list from (`FERRITEMCU_RELEASES_FEED_URL`
 /// overrides it — a `file://` fixture works, same dev seam as [`feed_url`]).
-fn releases_feed_url() -> Option<String> {
+fn releases_feed_url() -> String {
     std::env::var("FERRITEMCU_RELEASES_FEED_URL")
         .ok()
         .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("{GITHUB_RELEASES_API}?per_page=100"))
 }
 
 /// Fetch every published release, newest first — the changelog window's data (issue #71).
 /// Network I/O: run it off the UI thread. `Err` = network/HTTP failure (the caller shows a
 /// retry + an "Open on GitHub" link).
 pub fn release_notes() -> Result<Vec<ReleaseNote>> {
-    let url = releases_feed_url().ok_or(UpdateError::FeedNotConfigured)?;
-    let body = curl_text(&url)?;
+    let body = curl_text(&releases_feed_url())?;
     Ok(parse_releases(&body))
 }
 
