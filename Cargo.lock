@@ -2400,7 +2400,7 @@ dependencies = [
 
 [[package]]
 name = "espup"
-version = "0.19.0"
+version = "2.15.0"
 dependencies = [
  "async-trait",
  "clap",
@@ -2543,7 +2543,7 @@ dependencies = [
 
 [[package]]
 name = "ferritemcu"
-version = "2.14.1"
+version = "2.15.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -2591,14 +2591,14 @@ dependencies = [
 
 [[package]]
 name = "ferritemcu-color"
-version = "2.14.1"
+version = "2.15.0"
 dependencies = [
  "gpui",
 ]
 
 [[package]]
 name = "ferritemcu-config"
-version = "2.14.1"
+version = "2.15.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2607,21 +2607,21 @@ dependencies = [
 
 [[package]]
 name = "ferritemcu-diff"
-version = "2.14.1"
+version = "2.15.0"
 dependencies = [
  "similar 3.2.1",
 ]
 
 [[package]]
 name = "ferritemcu-git"
-version = "2.14.1"
+version = "2.15.0"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "ferritemcu-local-history"
-version = "2.14.1"
+version = "2.15.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2631,7 +2631,7 @@ dependencies = [
 
 [[package]]
 name = "ferritemcu-lsp"
-version = "2.14.1"
+version = "2.15.0"
 dependencies = [
  "flate2",
  "serde_json",
@@ -2643,14 +2643,14 @@ dependencies = [
 
 [[package]]
 name = "ferritemcu-markdown"
-version = "2.14.1"
+version = "2.15.0"
 dependencies = [
  "pulldown-cmark",
 ]
 
 [[package]]
 name = "ferritemcu-syntax"
-version = "2.14.1"
+version = "2.15.0"
 dependencies = [
  "codebook-tree-sitter-latex",
  "ferritemcu-color",
@@ -2675,7 +2675,7 @@ dependencies = [
 
 [[package]]
 name = "ferritemcu-theme"
-version = "2.14.1"
+version = "2.15.0"
 dependencies = [
  "ferritemcu-color",
  "serde",
@@ -2684,11 +2684,11 @@ dependencies = [
 
 [[package]]
 name = "ferritemcu-tree"
-version = "2.14.1"
+version = "2.15.0"
 
 [[package]]
 name = "ferritemcu-ui"
-version = "2.14.1"
+version = "2.15.0"
 dependencies = [
  "ferritemcu-color",
  "ferritemcu-theme",
@@ -2697,7 +2697,7 @@ dependencies = [
 
 [[package]]
 name = "ferritemcu-update"
-version = "2.14.1"
+version = "2.15.0"
 dependencies = [
  "serde_json",
  "sha2 0.11.1",
@@ -4665,7 +4665,7 @@ dependencies = [
 
 [[package]]
 name = "lzma-sys"
-version = "0.1.20"
+version = "2.15.0"
 dependencies = [
  "cc",
  "libc",
