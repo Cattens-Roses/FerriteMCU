@@ -45,6 +45,21 @@ See [RELEASING.md](RELEASING.md) for how releases are cut.
 * use the system command shell when opening the embedded terminal on Windows
 * **linux:** the AppImage starts on glibc 2.35 and newer (Ubuntu 22.04, Debian 12, Linux Mint 21), not only on 2.39+
 
+## [2.15.0](https://github.com/Cattens-Roses/FerriteMCU/compare/ferritemcu-v2.14.1...ferritemcu-v2.15.0) (2026-11-24)
+
+
+### Features
+
+* **editor:** add smart indentation and bracket pairing ([1f39473](https://github.com/Cattens-Roses/FerriteMCU/commit/1f39473af920c074f370377002010bd531d1501c))
+* **releases:** use GitHub release feeds by default ([2abd2bd](https://github.com/Cattens-Roses/FerriteMCU/commit/2abd2bdbcb5debeff72511cd7a5870a11f6f1c9d))
+
+
+### Bug Fixes
+
+* **ci:** handle platform-specific window drag parameter ([4959be2](https://github.com/Cattens-Roses/FerriteMCU/commit/4959be26a270b75717bac6247931532d9c526767))
+* **ci:** install libudev and clean documentation lints ([a7e4074](https://github.com/Cattens-Roses/FerriteMCU/commit/a7e4074d4986317e75f2524dbe640631d2531612))
+* **editor:** improve Rust suggestions and hover panels, repair CI ([236ae12](https://github.com/Cattens-Roses/FerriteMCU/commit/236ae12ebe6e160e1430da49c0731e30e988f474))
+
 ## [2.14.1](https://github.com/kyle-ssg/kyde/compare/kyde-v2.14.0...kyde-v2.14.1) (2026-11-10)
 
 
