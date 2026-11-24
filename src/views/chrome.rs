@@ -121,7 +121,9 @@ pub(crate) fn client_decorations(window: &Window) -> Option<gpui::Tiling> {
 /// (maximizes, matching macOS — not fullscreen). Under client-side decorations (`client`), a
 /// press-and-drag moves the window, a double-click maximizes and a right-click opens the
 /// window menu. Under the window manager's own title bar it is a plain spacer.
-pub(crate) fn drag_area(_client: bool, armed: &Rc<DragState>) -> gpui::Div {
+pub(crate) fn drag_area(client: bool, armed: &Rc<DragState>) -> gpui::Div {
+    #[cfg(target_os = "windows")]
+    let _ = client;
     let area = div().flex_1().h_full();
     // Windows starts a native move on mouse motion below; don't mark the area as a native
     // hit-test target, which would prevent GPUI from receiving the mouse events.
@@ -160,7 +162,7 @@ pub(crate) fn drag_area(_client: bool, armed: &Rc<DragState>) -> gpui::Div {
         })
     }
     #[cfg(not(target_os = "windows"))]
-    if !_client {
+    if !client {
         return area;
     }
     #[cfg(not(target_os = "windows"))]
