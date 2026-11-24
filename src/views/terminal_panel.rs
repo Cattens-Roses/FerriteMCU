@@ -138,7 +138,10 @@ impl FerriteMCU {
                             if let Some(terminal) =
                                 this.term.tabs.get(this.term.panel.active).cloned()
                             {
-                                terminal.update(cx, |terminal, cx| terminal.copy_selection(cx));
+                                terminal.update(
+                                    cx,
+                                    super::super::widgets::terminal::TerminalView::copy_selection,
+                                );
                             }
                         }),
                     ),
@@ -159,7 +162,7 @@ impl FerriteMCU {
                                 this.term.tabs.get(this.term.panel.active).cloned()
                             {
                                 terminal.update(cx, |terminal, cx| {
-                                    terminal.clear_screen_from_panel(cx)
+                                    terminal.clear_screen_from_panel(cx);
                                 });
                             }
                         }),

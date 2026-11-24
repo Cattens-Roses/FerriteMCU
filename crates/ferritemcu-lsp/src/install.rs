@@ -49,7 +49,7 @@ fn fetch(agent: &ureq::Agent, url: &str, max: u64) -> io::Result<Vec<u8>> {
 pub fn install(cache: &Path) -> io::Result<PathBuf> {
     let asset = asset_name()?;
     let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(120)))
+        .timeout_global(Some(Duration::from_mins(2)))
         .build()
         .into();
     let metadata: serde_json::Value =
@@ -96,7 +96,10 @@ pub fn install(cache: &Path) -> io::Result<PathBuf> {
         ));
     }
     let mut binary = Vec::new();
-    if asset.ends_with(".zip") {
+    if Path::new(asset)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+    {
         let mut zip = zip::ZipArchive::new(io::Cursor::new(archive)).map_err(io::Error::other)?;
         let member = zip.by_name("rust-analyzer.exe").map_err(io::Error::other)?;
         member.take(MAX_BINARY + 1).read_to_end(&mut binary)?;

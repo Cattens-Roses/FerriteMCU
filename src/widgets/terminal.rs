@@ -2509,23 +2509,6 @@ mod tests {
         assert_eq!(shifted(&term, &cur), None);
     }
 
-    /// A headless terminal that has been sent `bytes`.
-    fn term_with(
-        cols: usize,
-        rows: usize,
-        bytes: &[u8],
-    ) -> Term<alacritty_terminal::event::VoidListener> {
-        let mut term = Term::new(
-            Config::default(),
-            &TermSize::new(cols, rows),
-            alacritty_terminal::event::VoidListener,
-        );
-        let mut parser: alacritty_terminal::vte::ansi::Processor =
-            alacritty_terminal::vte::ansi::Processor::new();
-        parser.advance(&mut term, bytes);
-        term
-    }
-
     #[test]
     fn link_in_finds_urls_and_file_paths_under_the_column() {
         let at = |line: &str, col| link_in(&line.chars().collect::<Vec<_>>(), col);

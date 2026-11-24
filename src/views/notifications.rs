@@ -183,11 +183,11 @@ impl FerriteMCU {
                 // it in Finder; only fall back to the release page if there's no zip asset
                 // (always the case off macOS, see `update::check`), in the system browser.
                 if rel.zip_url.is_empty() {
-                    if !rel.page_url.is_empty() {
-                        cx.open_url(&rel.page_url);
-                    } else {
+                    if rel.page_url.is_empty() {
                         self.op_error = Some("No release page is available.".into());
                         cx.notify();
+                    } else {
+                        cx.open_url(&rel.page_url);
                     }
                     return;
                 }

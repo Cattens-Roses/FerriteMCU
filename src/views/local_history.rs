@@ -72,7 +72,7 @@ fn tz_offset_min() -> i32 {
     *TZ.get_or_init(|| {
         #[cfg(target_os = "windows")]
         {
-            return crate::platform::windows::timezone_offset_minutes().unwrap_or(0);
+            crate::platform::windows::timezone_offset_minutes().unwrap_or(0)
         }
         #[cfg(not(target_os = "windows"))]
         {

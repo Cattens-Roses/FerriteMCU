@@ -796,14 +796,13 @@ impl FerriteMCU {
                 .tabs
                 .iter()
                 .position(|tab| tab.read(cx).output_only);
-            let console = match console {
-                Some(index) => index,
-                None => {
-                    let view = cx.new(|cx| crate::terminal::TerminalView::output_only(cx));
-                    self.term.tabs.push(view);
-                    self.term.panel.on_tab_added(self.term.tabs.len());
-                    self.term.tabs.len() - 1
-                }
+            let console = if let Some(index) = console {
+                index
+            } else {
+                let view = cx.new(crate::terminal::TerminalView::output_only);
+                self.term.tabs.push(view);
+                self.term.panel.on_tab_added(self.term.tabs.len());
+                self.term.tabs.len() - 1
             };
             if self.term.panel.active != console || !self.term.panel.open {
                 self.term.panel.active = console;
@@ -1261,9 +1260,8 @@ fn flash_firmware(
         .into_iter()
         .find(|info| info.port_name == port_name)
         .ok_or_else(|| format!("Serial port {port_name} is no longer available"))?;
-    let usb_info = match port_info.port_type {
-        serialport::SerialPortType::UsbPort(info) => info,
-        _ => return Err("espflash requires a USB serial port with USB VID/PID information".into()),
+    let serialport::SerialPortType::UsbPort(usb_info) = port_info.port_type else {
+        return Err("espflash requires a USB serial port with USB VID/PID information".into());
     };
     let serial = open_espflash_port(port_name)?;
     let connection = Connection::new(
@@ -1476,7 +1474,7 @@ fn generate_esp_hal_project(
     }
     let renderer = process::Renderer::new(&selected, &groups_selected, &facts);
     let mut files = Vec::new();
-    for (source_path, contents) in loaded.source.files().map_err(|e| e.to_string())? {
+    for (source_path, contents) in loaded.source.files().map_err(|e| e.clone())? {
         let Emit::When { condition, output } = loaded.manifest.emit(&source_path) else {
             continue;
         };

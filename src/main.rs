@@ -1425,10 +1425,10 @@ impl BrowseView {
                 this.open_definition_at(path.clone(), range.clone(), cx);
             }
             EditorEvent::CompletionRequested(offset) => {
-                this.request_lsp(lsp::RequestMethod::Completion, *offset)
+                this.request_lsp(lsp::RequestMethod::Completion, *offset);
             }
             EditorEvent::DefinitionRequested(offset) => {
-                this.request_lsp(lsp::RequestMethod::Definition, *offset)
+                this.request_lsp(lsp::RequestMethod::Definition, *offset);
             }
             EditorEvent::FormatRequested => this.request_lsp(lsp::RequestMethod::Formatting, 0),
             EditorEvent::HoverRequested(offset) => {
@@ -3167,6 +3167,7 @@ fn reexec_with_proper_name() {}
 
 /// The most recent of `recents` that's still a folder on disk — its repo's top level when it's
 /// in git, else the folder itself (non-git folders open too).
+#[cfg(feature = "terminal")]
 fn last_project(recents: &[PathBuf]) -> Option<PathBuf> {
     recents
         .iter()

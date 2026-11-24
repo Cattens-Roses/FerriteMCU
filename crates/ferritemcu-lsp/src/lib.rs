@@ -92,7 +92,7 @@ pub fn write_message(writer: &mut impl Write, message: &serde_json::Value) -> io
 }
 
 /// Optional wire trace, enabled by setting `FERRITEMCU_LSP_TRACE` to a file path (or `1` to
-/// use FerriteMCU's local app-data log). It records full JSON-RPC payloads for diagnosis.
+/// use `FerriteMCU`'s local app-data log). It records full JSON-RPC payloads for diagnosis.
 fn trace_wire_message(direction: &str, message: &serde_json::Value) {
     static TRACE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
     let Some(file) = TRACE
@@ -101,8 +101,7 @@ fn trace_wire_message(direction: &str, message: &serde_json::Value) {
             let configured = PathBuf::from(&setting);
             let path = if configured == Path::new("1") || configured == Path::new("true") {
                 std::env::var_os("LOCALAPPDATA")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(std::env::temp_dir)
+                    .map_or_else(std::env::temp_dir, PathBuf::from)
                     .join("FerriteMCU")
                     .join("logs")
                     .join("rust-analyzer-lsp.jsonl")
@@ -163,7 +162,7 @@ pub fn uri_to_path(uri: &str) -> io::Result<PathBuf> {
     let url =
         url::Url::parse(uri).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     url.to_file_path()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "LSP URI is not a local file"))
+        .map_err(|()| io::Error::new(io::ErrorKind::InvalidInput, "LSP URI is not a local file"))
 }
 
 /// Probe the PATH-resolved rust-analyzer in a project directory. Rustup proxies can exist

@@ -1,27 +1,27 @@
 use std::path::Path;
 use std::time::Duration;
 
-fn remove_fixture(root: &Path) {
+fn remove_fixture(root: &Path) -> std::io::Result<()> {
     for _ in 0..50 {
         match std::fs::remove_dir_all(root) {
-            Ok(()) => return,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(_) => std::thread::sleep(Duration::from_millis(100)),
         }
     }
-    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(root)
 }
 
 fn reply_to_server_request(
     session: &mut ferritemcu_lsp::Session,
     root: &Path,
     message: &serde_json::Value,
-) {
+) -> std::io::Result<()> {
     let Some(id) = message
         .get("id")
         .filter(|_| message.get("method").is_some())
     else {
-        return;
+        return Ok(());
     };
     let method = message["method"].as_str().unwrap_or_default();
     let params = &message["params"];
@@ -33,20 +33,17 @@ fn reply_to_server_request(
                 .unwrap_or_default(),
         ),
         "workspace/workspaceFolders" => {
-            serde_json::json!([{"uri":ferritemcu_lsp::path_to_uri(root).unwrap(),"name":root.file_name().unwrap_or_default().to_string_lossy()}])
+            serde_json::json!([{"uri":ferritemcu_lsp::path_to_uri(root)?,"name":root.file_name().unwrap_or_default().to_string_lossy()}])
         }
         "window/workDoneProgress/create"
         | "client/registerCapability"
         | "client/unregisterCapability"
         | "window/showMessageRequest" => serde_json::Value::Null,
         other => {
-            session.send(&serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":format!("Method not found: {other}")}})).unwrap();
-            return;
+            return session.send(&serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":format!("Method not found: {other}")}}));
         }
     };
-    session
-        .send(&serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}))
-        .unwrap();
+    session.send(&serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}))
 }
 
 #[test]
@@ -67,7 +64,7 @@ fn real_rust_analyzer_handshake() {
     let session =
         ferritemcu_lsp::Session::start(Path::new(&binary), &root, Duration::from_secs(30)).unwrap();
     session.shutdown(Duration::from_secs(15)).unwrap();
-    remove_fixture(&root);
+    remove_fixture(&root).unwrap();
 }
 
 #[test]
@@ -93,7 +90,7 @@ fn official_download_starts() {
         ferritemcu_lsp::Session::start(&binary, &root.join("project"), Duration::from_secs(30))
             .unwrap();
     session.shutdown(Duration::from_secs(15)).unwrap();
-    remove_fixture(&root);
+    remove_fixture(&root).unwrap();
 }
 
 #[test]
@@ -128,7 +125,7 @@ fn real_server_receives_document_changes() {
     .unwrap();
     assert_eq!(doc.version(), 9);
     session.send(&serde_json::json!({"jsonrpc":"2.0","id": 100, "method":"textDocument/documentSymbol", "params":{"textDocument":{"uri":doc.uri()}}})).unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
     let mut response = None;
     while std::time::Instant::now() < deadline {
         let message = session
@@ -164,7 +161,7 @@ fn real_server_receives_document_changes() {
     doc.save(&mut session).unwrap();
     doc.close(&mut session).unwrap();
     session.shutdown(Duration::from_secs(15)).unwrap();
-    remove_fixture(&root);
+    remove_fixture(&root).unwrap();
 }
 
 #[test]
@@ -213,7 +210,7 @@ fn real_server_editor_features() {
             {
                 return message;
             }
-            reply_to_server_request(session, root, &message);
+            reply_to_server_request(session, root, &message).unwrap();
         }
     }
     let uri = ferritemcu_lsp::path_to_uri(&path).unwrap();
@@ -274,7 +271,7 @@ fn real_server_editor_features() {
     );
     doc.close(&mut session).unwrap();
     session.shutdown(Duration::from_secs(15)).unwrap();
-    remove_fixture(&root);
+    remove_fixture(&root).unwrap();
 }
 
 #[test]
@@ -295,7 +292,7 @@ fn trace_real_workspace_progress_and_server_status() {
     let file = root.join("src/main.rs");
     let text = std::fs::read_to_string(&file).unwrap();
     let mut session =
-        ferritemcu_lsp::Session::start(Path::new(&binary), &root, Duration::from_secs(60)).unwrap();
+        ferritemcu_lsp::Session::start(Path::new(&binary), &root, Duration::from_mins(1)).unwrap();
     let document = ferritemcu_lsp::Document::open(&mut session, &file, &text).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(90);
     let mut progress: HashMap<serde_json::Value, String> = HashMap::new();

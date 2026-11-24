@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 mod element;
+mod intellisense;
 use element::EditorElement;
 
 /// Width of the fold gutter (chevron column) drawn left of the text, when the
@@ -63,6 +64,7 @@ actions!(
         LspCompletion,
         LspDefinition,
         LspFormat,
+        DismissSuggestions,
     ]
 );
 
@@ -140,6 +142,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-space", LspCompletion, Some(CONTEXT)),
         KeyBinding::new("f12", LspDefinition, Some(CONTEXT)),
         KeyBinding::new("alt-shift-f", LspFormat, Some(CONTEXT)),
+        KeyBinding::new("escape", DismissSuggestions, Some(CONTEXT)),
     ]);
 }
 
@@ -364,6 +367,10 @@ pub struct CodeEditor {
     lsp_hover: Option<String>,
     lsp_hover_offset: Option<usize>,
     lsp_completions: Vec<(String, String, String, Range<usize>)>,
+    completion_selected: usize,
+    completion_request: Option<(u64, usize)>,
+    completion_scroll: ScrollHandle,
+    hover_epoch: u64,
     /// Error highlighting for this editor's language — the app pushes it from the
     /// pack's plugins.json toggle (on by default for installed packs, per-pack
     /// opt-out). Editors nothing ever pushes to (commit box, single-line inputs,
@@ -529,6 +536,10 @@ impl CodeEditor {
             lsp_hover: None,
             lsp_hover_offset: None,
             lsp_completions: Vec::new(),
+            completion_selected: 0,
+            completion_request: None,
+            completion_scroll: ScrollHandle::new(),
+            hover_epoch: 0,
             errors_on: false,
             import_links: Vec::new(),
             import_bound: std::collections::HashMap::new(),
@@ -621,12 +632,15 @@ impl CodeEditor {
         self.lsp_error_ranges = ranges;
         self.lsp_messages = messages;
         self.diagnostic_hover = None;
-        self.lsp_completions.clear();
         cx.notify();
     }
 
     pub(crate) fn set_lsp_hover(&mut self, hover: Option<String>, cx: &mut Context<Self>) {
-        self.lsp_hover = hover;
+        self.lsp_hover = if self.lsp_hover_offset.is_some() && self.lsp_completions.is_empty() {
+            hover
+        } else {
+            None
+        };
         cx.notify();
     }
     pub(crate) fn set_lsp_completions(
@@ -634,12 +648,17 @@ impl CodeEditor {
         items: Vec<(String, String, String, Range<usize>)>,
         cx: &mut Context<Self>,
     ) {
+        if self.completion_request != Some((self.compute_gen, self.cursor())) {
+            return;
+        }
         self.lsp_completions = items;
+        self.completion_selected = 0;
+        self.completion_scroll.scroll_to_item(0);
+        self.lsp_hover = None;
         cx.notify();
     }
     fn lsp_completion(&mut self, _: &LspCompletion, _: &mut Window, cx: &mut Context<Self>) {
-        self.lsp_completions.clear();
-        cx.emit(EditorEvent::CompletionRequested(self.selected_range.end));
+        self.request_completion(cx);
     }
     fn lsp_definition(&mut self, _: &LspDefinition, _: &mut Window, cx: &mut Context<Self>) {
         cx.emit(EditorEvent::DefinitionRequested(self.selected_range.end));
@@ -710,6 +729,7 @@ impl CodeEditor {
 
     /// Select a byte range (used by find/replace to highlight the current match).
     pub fn select_range(&mut self, range: std::ops::Range<usize>, cx: &mut Context<Self>) {
+        self.dismiss_intellisense();
         let len = self.content.len();
         self.selected_range = range.start.min(len)..range.end.min(len);
         self.selection_reversed = false;
@@ -807,6 +827,7 @@ impl CodeEditor {
     /// Re-derive foldable regions from the current text + language, dropping any
     /// folded entry whose start line is no longer a foldable region (after edits).
     fn recompute_folds(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_intellisense();
         // Bump the generation on EVERY recompute (not just async ones) so a pending
         // big-file background job can never land its stale spans on content that was
         // since replaced — via the inline path (big file → small file open) or emptied.
@@ -1109,6 +1130,7 @@ impl CodeEditor {
     }
 
     fn move_to(&mut self, off: usize, cx: &mut Context<Self>) {
+        self.dismiss_intellisense();
         self.selected_range = off..off;
         // Navigating ends the current typing run, so the next character starts a
         // fresh undo step rather than coalescing across the cursor jump.
@@ -1179,6 +1201,7 @@ impl CodeEditor {
     }
 
     fn select_to(&mut self, off: usize, cx: &mut Context<Self>) {
+        self.dismiss_intellisense();
         if self.selection_reversed {
             self.selected_range.start = off;
         } else {
@@ -1264,9 +1287,15 @@ impl CodeEditor {
         self.move_to(start + line_len, cx);
     }
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        if self.navigate_completion(-1, cx) {
+            return;
+        }
         self.vertical(-1, false, cx);
     }
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        if self.navigate_completion(1, cx) {
+            return;
+        }
         self.vertical(1, false, cx);
     }
     fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
@@ -1352,9 +1381,7 @@ impl CodeEditor {
         self.replace_text_in_range(None, "", window, cx);
     }
     fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some((_, _, insert, range)) = self.lsp_completions.first().cloned() {
-            self.replace_range_text(range, &insert, cx);
-            self.lsp_completions.clear();
+        if self.accept_completion(cx) {
             return;
         }
         self.replace_text_in_range(None, "\n", window, cx);
@@ -1371,6 +1398,9 @@ impl CodeEditor {
     }
 
     fn indent(&mut self, _: &Indent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.accept_completion(cx) {
+            return;
+        }
         if self.read_only {
             return;
         }
@@ -1606,7 +1636,7 @@ impl CodeEditor {
         if hover_offset != self.lsp_hover_offset {
             self.lsp_hover_offset = hover_offset;
             self.lsp_hover = None;
-            cx.emit(EditorEvent::HoverRequested(hover_offset));
+            self.schedule_hover(hover_offset, cx);
         }
         if self.cmd_held != ev.modifiers.secondary() {
             self.cmd_held = ev.modifiers.secondary();
@@ -1760,6 +1790,10 @@ impl CodeEditor {
     /// this just notes the held key and kicks off the repeat loop. OS key-repeat is
     /// unreliable here (it wasn't moving while held at all), so we self-pace with a timer.
     fn on_key_down_nav(&mut self, ev: &gpui::KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.lsp_completions.is_empty() {
+            self.nav = None;
+            return;
+        }
         if self.single_line {
             return;
         }
@@ -1981,6 +2015,7 @@ impl EntityInputHandler for CodeEditor {
         self.restart_blink(cx);
         cx.notify();
         cx.emit(EditorEvent::Changed);
+        self.schedule_completion(new_text, cx);
     }
     fn replace_and_mark_text_in_range(
         &mut self,
@@ -2072,6 +2107,7 @@ impl Render for CodeEditor {
             if focused {
                 self.restart_blink(cx);
             } else {
+                self.dismiss_intellisense();
                 self.blink_epoch = self.blink_epoch.wrapping_add(1);
                 self.blink_on = true;
             }
@@ -2094,43 +2130,7 @@ impl Render for CodeEditor {
         // Fill the parent (clickable full-box) for single-line inputs and the commit box;
         // content-size (so a tall file overflows + scrolls) for the file editor + diff panes.
         let fill = self.single_line || self.fill_height;
-        let completion_popup = (!self.lsp_completions.is_empty()).then(|| {
-            div()
-                .absolute()
-                .top_8()
-                .left_16()
-                .max_h(px(280.0))
-                .rounded_md()
-                .border_1()
-                .border_color(theme::get().divider)
-                .bg(theme::get().bg_light)
-                .children(self.lsp_completions.iter().take(12).map(
-                    |(label, detail, insert, range)| {
-                        let label = label.clone();
-                        let detail = detail.clone();
-                        let insert = insert.clone();
-                        let range = range.clone();
-                        div()
-                            .flex()
-                            .justify_between()
-                            .gap_3()
-                            .px_2()
-                            .py_1()
-                            .text_color(theme::get().text)
-                            .cursor(CursorStyle::PointingHand)
-                            .child(label)
-                            .child(div().child(detail))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                                    this.replace_range_text(range.clone(), &insert, cx);
-                                    this.lsp_completions.clear();
-                                    cx.notify();
-                                }),
-                            )
-                    },
-                ))
-        });
+        let intellisense = self.render_intellisense(window, cx);
         div()
             .key_context(ctx.as_str())
             .track_focus(&self.focus_handle)
@@ -2151,41 +2151,7 @@ impl Render for CodeEditor {
             .text_color(theme::get().text)
             .font_family(theme::font::family())
             .text_size(px(theme::get().editor_font_size))
-            .when_some(self.diagnostic_hover.clone(), |d, message| {
-                d.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .right_0()
-                        .max_w(px(520.0))
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .bg(theme::get().bg_light)
-                        .border_1()
-                        .border_color(theme::get().divider)
-                        .text_color(theme::get().text)
-                        .child(message),
-                )
-            })
-            .when_some(self.lsp_hover.clone(), |d, message| {
-                d.child(
-                    div()
-                        .absolute()
-                        .top_6()
-                        .right_0()
-                        .max_w(px(520.0))
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .bg(theme::get().bg_light)
-                        .border_1()
-                        .border_color(theme::get().divider)
-                        .text_color(theme::get().text)
-                        .child(message),
-                )
-            })
-            .when_some(completion_popup, |d, popup| d.child(popup))
+            .when_some(intellisense, gpui::ParentElement::child)
             .line_height(px(line_height_px()))
             .on_action(cx.listener(Self::left))
             .on_action(cx.listener(Self::right))
@@ -2211,6 +2177,7 @@ impl Render for CodeEditor {
             .on_action(cx.listener(Self::lsp_completion))
             .on_action(cx.listener(Self::lsp_definition))
             .on_action(cx.listener(Self::lsp_format))
+            .on_action(cx.listener(Self::dismiss_suggestions))
             // Enter / Up / Down only for multi-line editors; single-line inputs let
             // these bubble to the surrounding context (e.g. the file finder).
             .when(!self.single_line, |d| {

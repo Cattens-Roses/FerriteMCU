@@ -140,25 +140,24 @@ pub(crate) fn drag_area(_client: bool, armed: &Rc<DragState>) -> gpui::Div {
     #[cfg(target_os = "windows")]
     {
         let (down, up, out, moved) = (armed.clone(), armed.clone(), armed.clone(), armed.clone());
-        return area
-            .on_mouse_down(MouseButton::Left, move |e, _window, _cx| {
-                if e.click_count == 1 {
-                    down.moved.set(false);
-                }
-                down.armed.set(true);
-            })
-            .on_mouse_up(MouseButton::Left, move |e, window, _cx| {
-                if up.armed.replace(false) && !up.moved.get() && e.click_count == 2 {
-                    window.zoom_window();
-                }
-            })
-            .on_mouse_down_out(move |_e, _w, _cx| out.armed.set(false))
-            .on_mouse_move(move |e: &gpui::MouseMoveEvent, window, _cx| {
-                if e.pressed_button == Some(MouseButton::Left) && moved.armed.replace(false) {
-                    moved.moved.set(true);
-                    crate::platform::windows::start_window_move(window);
-                }
-            });
+        area.on_mouse_down(MouseButton::Left, move |e, _window, _cx| {
+            if e.click_count == 1 {
+                down.moved.set(false);
+            }
+            down.armed.set(true);
+        })
+        .on_mouse_up(MouseButton::Left, move |e, window, _cx| {
+            if up.armed.replace(false) && !up.moved.get() && e.click_count == 2 {
+                window.zoom_window();
+            }
+        })
+        .on_mouse_down_out(move |_e, _w, _cx| out.armed.set(false))
+        .on_mouse_move(move |e: &gpui::MouseMoveEvent, window, _cx| {
+            if e.pressed_button == Some(MouseButton::Left) && moved.armed.replace(false) {
+                moved.moved.set(true);
+                crate::platform::windows::start_window_move(window);
+            }
+        })
     }
     #[cfg(not(target_os = "windows"))]
     if !_client {

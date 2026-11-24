@@ -302,14 +302,14 @@ impl FerriteMCU {
                 self.move_path(&path, &dst, "Renaming", cx);
             }
             NamePrompt::NewEspProject => {
-                if !name
+                if name
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
                 {
+                    self.generate_esp_project(name, cx);
+                } else {
                     self.embedded.message =
                         "Project names may contain only ASCII letters, numbers, _ and -".into();
-                } else {
-                    self.generate_esp_project(name, cx);
                 }
             }
         }

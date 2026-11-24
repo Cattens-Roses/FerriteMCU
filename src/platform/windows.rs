@@ -9,7 +9,7 @@ pub(crate) fn timezone_offset_minutes() -> Option<i32> {
 
     let mut info = TIME_ZONE_INFORMATION::default();
     // SAFETY: `info` is a valid writable Windows time-zone structure.
-    let state = unsafe { GetTimeZoneInformation(&mut info) };
+    let state = unsafe { GetTimeZoneInformation(&raw mut info) };
     if state == u32::MAX {
         return None;
     }
@@ -41,11 +41,11 @@ pub(crate) fn start_window_move(window: &gpui::Window) {
     // SAFETY: the handle belongs to this live window and position points to valid storage.
     // Posting (rather than sending) avoids re-entering GPUI during mouse event dispatch.
     unsafe {
-        if GetCursorPos(&mut position) == 0 {
+        if GetCursorPos(&raw mut position) == 0 {
             return;
         }
         ReleaseCapture();
-        let coords = (position.x as u16 as u32) | ((position.y as u16 as u32) << 16);
+        let coords = u32::from(position.x as u16) | (u32::from(position.y as u16) << 16);
         PostMessageW(
             handle.hwnd.get() as _,
             WM_SYSCOMMAND,
@@ -81,6 +81,7 @@ pub(crate) fn open_terminal(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Open a URL or file path with its registered Windows application.
+#[cfg(feature = "terminal")]
 pub(crate) fn open_with_system(target: &str) -> std::io::Result<()> {
     Command::new("explorer.exe").arg(target).spawn().map(|_| ())
 }

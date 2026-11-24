@@ -124,10 +124,18 @@ impl Client {
         events: futures::channel::mpsc::UnboundedSender<Event>,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
-        let _worker = std::thread::Builder::new()
+        let failure_events = events.clone();
+        let failure_root = root.clone();
+        if let Err(error) = std::thread::Builder::new()
             .name("ferritemcu-rust-analyzer".into())
             .spawn(move || worker(rx, events))
-            .expect("failed to create rust-analyzer worker");
+        {
+            send_status(
+                &failure_events,
+                &failure_root,
+                Status::Error(format!("Could not start rust-analyzer worker: {error}")),
+            );
+        }
         let client = Self(tx);
         let _ = client.0.send(Command::Start(root));
         client
@@ -211,7 +219,7 @@ fn worker(rx: mpsc::Receiver<Command>, events: futures::channel::mpsc::Unbounded
                                 documents.insert(path.clone(), document);
                             }
                             Err(error) => {
-                                send_status(&events, server_root, Status::Error(error.to_string()))
+                                send_status(&events, server_root, Status::Error(error.to_string()));
                             }
                         }
                     }
@@ -242,12 +250,10 @@ fn worker(rx: mpsc::Receiver<Command>, events: futures::channel::mpsc::Unbounded
             }
         }
 
-        let wait = restart_at
-            .map(|at: std::time::Instant| {
-                at.saturating_duration_since(std::time::Instant::now())
-                    .min(Duration::from_millis(20))
-            })
-            .unwrap_or(Duration::from_millis(20));
+        let wait = restart_at.map_or(Duration::from_millis(20), |at: std::time::Instant| {
+            at.saturating_duration_since(std::time::Instant::now())
+                .min(Duration::from_millis(20))
+        });
         match rx.recv_timeout(wait) {
             Ok(Command::Start(new_root)) => {
                 if let Some(old) = session.take() {
@@ -288,7 +294,7 @@ fn worker(rx: mpsc::Receiver<Command>, events: futures::channel::mpsc::Unbounded
                             }
                         }
                         Err(error) => {
-                            send_status(&events, server_root, Status::Error(error.to_string()))
+                            send_status(&events, server_root, Status::Error(error.to_string()));
                         }
                     }
                 }
@@ -360,7 +366,8 @@ fn worker(rx: mpsc::Receiver<Command>, events: futures::channel::mpsc::Unbounded
                         if let Some(id_value) = message.get("id") {
                             let key = id_value.as_str().unwrap_or_default().to_owned();
                             if let Some((id, path, version, method)) = pending.remove(&key) {
-                                let error = message.get("error").map(|e| e.to_string());
+                                let error =
+                                    message.get("error").map(std::string::ToString::to_string);
                                 let result = message
                                     .get("result")
                                     .cloned()
@@ -456,8 +463,7 @@ fn worker(rx: mpsc::Receiver<Command>, events: futures::channel::mpsc::Unbounded
 
 fn launch(root: &std::path::Path) -> std::io::Result<ferritemcu_lsp::Session> {
     let cache = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
+        .map_or_else(std::env::temp_dir, PathBuf::from)
         .join("FerriteMCU")
         .join("rust-analyzer");
     ferritemcu_lsp::resolve_rust_analyzer(root, &cache)
@@ -494,15 +500,15 @@ fn update_progress(
     } else {
         ""
     };
-    let task = if !token_task.is_empty() {
-        token_task.to_owned()
-    } else {
+    let task = if token_task.is_empty() {
         value["message"]
             .as_str()
             .filter(|s| !s.is_empty())
             .or_else(|| value["title"].as_str())
             .unwrap_or("Indexing")
             .to_owned()
+    } else {
+        token_task.to_owned()
     };
     let percentage = value["percentage"].as_u64().map(|n| n.min(100) as u32);
     progress.insert(token, (task.clone(), percentage));
@@ -563,15 +569,15 @@ fn server_request_response(
                 .map(|items| vec![serde_json::Value::Null; items.len()])
                 .unwrap_or_default(),
         ),
-        "workspace/workspaceFolders" => ferritemcu_lsp::path_to_uri(root)
-            .ok()
-            .map(|uri| {
+        "workspace/workspaceFolders" => ferritemcu_lsp::path_to_uri(root).ok().map_or_else(
+            || serde_json::json!([]),
+            |uri| {
                 serde_json::json!([{
                     "uri": uri,
                     "name": root.file_name().unwrap_or_default().to_string_lossy()
                 }])
-            })
-            .unwrap_or_else(|| serde_json::json!([])),
+            },
+        ),
         "window/workDoneProgress/create"
         | "client/registerCapability"
         | "client/unregisterCapability"

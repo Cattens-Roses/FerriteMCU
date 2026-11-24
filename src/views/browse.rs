@@ -22,13 +22,13 @@ impl FerriteMCU {
             }
             if chars.peek() == Some(&'{') {
                 chars.next();
-                while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                while chars.peek().is_some_and(char::is_ascii_digit) {
                     chars.next();
                 }
                 if chars.peek() == Some(&':') {
                     chars.next();
                     let mut depth = 0usize;
-                    while let Some(c) = chars.next() {
+                    for c in chars.by_ref() {
                         match c {
                             '{' => {
                                 depth += 1;
@@ -50,7 +50,7 @@ impl FerriteMCU {
                     }
                 }
             } else {
-                while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                while chars.peek().is_some_and(char::is_ascii_digit) {
                     chars.next();
                 }
             }
@@ -76,9 +76,8 @@ impl FerriteMCU {
             offset.min(doc.last_synced_text.len()),
         )
         .unwrap_or_default();
-        let uri = match ferritemcu_lsp::path_to_uri(&doc.path) {
-            Ok(uri) => uri,
-            Err(_) => return,
+        let Ok(uri) = ferritemcu_lsp::path_to_uri(&doc.path) else {
+            return;
         };
         let params = match method {
             lsp::RequestMethod::Formatting => {
@@ -105,7 +104,7 @@ impl FerriteMCU {
                 }
             }
             self.browse.editor.update(cx, |e, cx| {
-                e.set_lsp_diagnostics(Vec::new(), Vec::new(), cx)
+                e.set_lsp_diagnostics(Vec::new(), Vec::new(), cx);
             });
         }
     }
@@ -155,7 +154,12 @@ impl FerriteMCU {
             return;
         }
         self.lsp_close_active(cx);
-        if self.browse.lsp_root.as_ref() != Some(&root) {
+        if self.browse.lsp_root.as_ref() == Some(&root) {
+            self.browse.lsp_status = lsp::Status::Indexing {
+                task: String::new(),
+                percentage: None,
+            };
+        } else {
             if let Some(client) = self.browse.lsp_client.take() {
                 client.stop();
             }
@@ -208,7 +212,7 @@ impl FerriteMCU {
                                     let messages =
                                         mapped.into_iter().map(|(r, m, _)| (r, m)).collect();
                                     app.browse.editor.update(cx, |e, cx| {
-                                        e.set_lsp_diagnostics(ranges, messages, cx)
+                                        e.set_lsp_diagnostics(ranges, messages, cx);
                                     });
                                 }
                             }
@@ -244,12 +248,45 @@ impl FerriteMCU {
                                 }
                                 match method {
                                     lsp::RequestMethod::Completion => {
-                                        let items = result
+                                        let caret = app
+                                            .browse
+                                            .editor
+                                            .read(cx)
+                                            .selection()
+                                            .end
+                                            .min(text.len());
+                                        let start = text[..caret]
+                                            .char_indices()
+                                            .rev()
+                                            .take_while(|(_, c)| c.is_alphanumeric() || *c == '_')
+                                            .last()
+                                            .map_or(caret, |(index, _)| index);
+                                        let prefix = text[start..caret].to_lowercase();
+                                        let mut candidates = result
                                             .as_array()
                                             .cloned()
                                             .or_else(|| result["items"].as_array().cloned())
-                                            .unwrap_or_default()
+                                            .unwrap_or_default();
+                                        candidates.sort_by(|a, b| {
+                                            let key = |item: &serde_json::Value| {
+                                                item["sortText"]
+                                                    .as_str()
+                                                    .or_else(|| item["label"].as_str())
+                                                    .unwrap_or("")
+                                                    .to_owned()
+                                            };
+                                            key(a).cmp(&key(b))
+                                        });
+                                        let items = candidates
                                             .into_iter()
+                                            .filter(|item| {
+                                                item["filterText"]
+                                                    .as_str()
+                                                    .or_else(|| item["label"].as_str())
+                                                    .is_some_and(|label| {
+                                                        label.to_lowercase().starts_with(&prefix)
+                                                    })
+                                            })
                                             .filter_map(|item| {
                                                 let label = item["label"].as_str()?.to_owned();
                                                 let detail = item["detail"]
@@ -293,8 +330,7 @@ impl FerriteMCU {
                                                                 c.is_alphanumeric() || *c == '_'
                                                             })
                                                             .last()
-                                                            .map(|(i, _)| i)
-                                                            .unwrap_or(caret);
+                                                            .map_or(caret, |(i, _)| i);
                                                         start..caret
                                                     });
                                                 Some((label, detail, insert, range))
@@ -364,7 +400,7 @@ impl FerriteMCU {
                                                     )
                                                     .unwrap_or(0);
                                                 app.browse.editor.update(cx, |e, cx| {
-                                                    e.select_range(offset..offset + 1, cx)
+                                                    e.select_range(offset..offset + 1, cx);
                                                 });
                                             } else if uri == path {
                                                 let offset =
@@ -373,7 +409,7 @@ impl FerriteMCU {
                                                     )
                                                     .unwrap_or(0);
                                                 app.browse.editor.update(cx, |e, cx| {
-                                                    e.select_range(offset..offset + 1, cx)
+                                                    e.select_range(offset..offset + 1, cx);
                                                 });
                                             }
                                         }
@@ -412,11 +448,6 @@ impl FerriteMCU {
                 }
             })
             .detach();
-        } else {
-            self.browse.lsp_status = lsp::Status::Indexing {
-                task: String::new(),
-                percentage: None,
-            };
         }
         let path = full_path;
         let doc = self
@@ -437,7 +468,7 @@ impl FerriteMCU {
         }
         self.browse.lsp_active = Some(rel.clone());
         self.browse.editor.update(cx, |e, cx| {
-            e.set_lsp_diagnostics(Vec::new(), Vec::new(), cx)
+            e.set_lsp_diagnostics(Vec::new(), Vec::new(), cx);
         });
     }
 

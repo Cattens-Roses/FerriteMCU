@@ -7,3 +7,5 @@
 # non-test code instead of forcing an `#[allow]` onto every test module.
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
+# The application's proper name is prose, not a Rust identifier.
+doc-valid-idents = ["FerriteMCU", ".."]
