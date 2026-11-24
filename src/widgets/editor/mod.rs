@@ -23,6 +23,7 @@ use std::ops::Range;
 
 mod element;
 mod intellisense;
+mod typing;
 use element::EditorElement;
 
 /// Width of the fold gutter (chevron column) drawn left of the text, when the
@@ -65,6 +66,12 @@ actions!(
         LspDefinition,
         LspFormat,
         DismissSuggestions,
+        SelectHome,
+        SelectEnd,
+        BufferHome,
+        BufferEnd,
+        SelectBufferHome,
+        SelectBufferEnd,
     ]
 );
 
@@ -99,6 +106,8 @@ pub fn bind_keys(cx: &mut App) {
             KeyBinding::new("right", Right, Some(ctx)),
             KeyBinding::new("home", Home, Some(ctx)),
             KeyBinding::new("end", End, Some(ctx)),
+            KeyBinding::new("shift-home", SelectHome, Some(ctx)),
+            KeyBinding::new("shift-end", SelectEnd, Some(ctx)),
             KeyBinding::new("shift-left", SelectLeft, Some(ctx)),
             KeyBinding::new("shift-right", SelectRight, Some(ctx)),
             // `secondary` is ⌘ on macOS and Ctrl elsewhere.
@@ -129,6 +138,7 @@ pub fn bind_keys(cx: &mut App) {
                 KeyBinding::new("ctrl-shift-right", SelectWordRight, Some(ctx)),
                 KeyBinding::new("ctrl-backspace", DeleteWordLeft, Some(ctx)),
                 KeyBinding::new("ctrl-delete", DeleteWordRight, Some(ctx)),
+                KeyBinding::new("ctrl-y", Redo, Some(ctx)),
             ]);
         }
     }
@@ -143,6 +153,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("f12", LspDefinition, Some(CONTEXT)),
         KeyBinding::new("alt-shift-f", LspFormat, Some(CONTEXT)),
         KeyBinding::new("escape", DismissSuggestions, Some(CONTEXT)),
+        KeyBinding::new("ctrl-home", BufferHome, Some(CONTEXT)),
+        KeyBinding::new("ctrl-end", BufferEnd, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-home", SelectBufferHome, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-end", SelectBufferEnd, Some(CONTEXT)),
     ]);
 }
 
@@ -217,6 +231,7 @@ struct Snapshot {
     content: String,
     selected_range: Range<usize>,
     selection_reversed: bool,
+    auto_pairs: Vec<typing::AutoPair>,
 }
 
 /// Classifies an edit so consecutive single-character typing coalesces into one
@@ -331,6 +346,7 @@ pub struct CodeEditor {
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
+    auto_pairs: Vec<typing::AutoPair>,
 
     // Undo/redo. Snapshot-based (whole-buffer); fine until the rope buffer lands.
     /// Oldest first; capped at 1000 by dropping from the front (a deque — `Vec::remove(0)`
@@ -521,6 +537,7 @@ impl CodeEditor {
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
+            auto_pairs: Vec::new(),
             undo_stack: std::collections::VecDeque::new(),
             redo_stack: Vec::new(),
             last_edit: EditKind::Other,
@@ -608,6 +625,7 @@ impl CodeEditor {
         self.selected_range = 0..0;
         self.selection_reversed = false;
         self.marked_range = None;
+        self.auto_pairs.clear();
         self.lsp_hover = None;
         self.lsp_completions.clear();
         self.dirty = false;
@@ -750,14 +768,8 @@ impl CodeEditor {
         }
         let len = self.content.len();
         let r = range.start.min(len)..range.end.min(len);
-        self.record_undo(EditKind::Other);
-        self.content.replace_range(r.clone(), text);
         let caret = r.start + text.len();
-        self.selected_range = caret..caret;
-        self.dirty = true;
-        self.recompute_folds(cx);
-        cx.notify();
-        cx.emit(EditorEvent::Changed);
+        self.edit_text(r, text, caret..caret, EditKind::Other, cx);
     }
 
     /// Apply a set of non-overlapping LSP edits against one original document snapshot.
@@ -807,6 +819,7 @@ impl CodeEditor {
         let caret =
             new_cursor.unwrap_or_else(|| (old_cursor as isize + preceding_delta).max(0) as usize);
         self.record_undo(EditKind::Other);
+        self.auto_pairs.clear();
         for (range, replacement) in edits {
             self.content.replace_range(range, &replacement);
         }
@@ -1145,6 +1158,7 @@ impl CodeEditor {
             content: self.content.clone(),
             selected_range: self.selected_range.clone(),
             selection_reversed: self.selection_reversed,
+            auto_pairs: self.auto_pairs.clone(),
         }
     }
 
@@ -1167,6 +1181,7 @@ impl CodeEditor {
         self.content = s.content;
         self.selected_range = s.selected_range;
         self.selection_reversed = s.selection_reversed;
+        self.auto_pairs = s.auto_pairs;
         self.marked_range = None;
         self.last_edit = EditKind::Other;
         self.dirty = true;
@@ -1174,6 +1189,7 @@ impl CodeEditor {
         // The restored caret may land inside a region that's still folded — don't
         // strand it on a hidden line (next Up/Down would otherwise jump to line 0).
         self.ensure_caret_visible();
+        self.reveal_pending = true;
         cx.notify();
         cx.emit(EditorEvent::Changed);
     }
@@ -1278,13 +1294,14 @@ impl CodeEditor {
         self.select_to(self.content.len(), cx);
     }
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
-        let (_, start) = self.locate(self.cursor());
-        self.move_to(start, cx);
+        self.move_to(self.smart_line_start(), cx);
     }
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
-        let (li, start) = self.locate(self.cursor());
-        let line_len = self.content.split('\n').nth(li).map_or(0, str::len);
-        self.move_to(start + line_len, cx);
+        let caret = self.cursor();
+        let end = self.content[caret..]
+            .find(['\r', '\n'])
+            .map_or(self.content.len(), |i| caret + i);
+        self.move_to(end, cx);
     }
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
         if self.navigate_completion(-1, cx) {
@@ -1345,6 +1362,9 @@ impl CodeEditor {
         }
     }
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        if self.smart_backspace(cx) {
+            return;
+        }
         if self.selected_range.is_empty() {
             self.select_to(self.prev_boundary(self.cursor()), cx);
         }
@@ -1384,7 +1404,9 @@ impl CodeEditor {
         if self.accept_completion(cx) {
             return;
         }
-        self.replace_text_in_range(None, "\n", window, cx);
+        if !self.smart_enter(cx) {
+            self.replace_text_in_range(None, "\n", window, cx);
+        }
     }
     /// cmd-backspace: delete from the caret back to the start of the current line
     /// (or just delete the selection if there is one).
@@ -1404,13 +1426,27 @@ impl CodeEditor {
         if self.read_only {
             return;
         }
-        if self.selected_range.start == self.selected_range.end {
-            // No selection: insert one indent unit at the caret.
-            let c = self.cursor();
-            self.record_undo(EditKind::Other);
-            self.content.insert_str(c, "  ");
-            self.selected_range = (c + 2)..(c + 2);
-            self.finish_indent(cx);
+        if self.selected_range.is_empty() {
+            let caret = self.cursor();
+            let unit = self.indent_unit();
+            let column = self.content[..caret]
+                .rsplit('\n')
+                .next()
+                .unwrap_or("")
+                .chars()
+                .count();
+            let text = if unit == "\t" {
+                unit
+            } else {
+                " ".repeat(unit.len() - column % unit.len())
+            };
+            self.edit_text(
+                caret..caret,
+                &text,
+                caret + text.len()..caret + text.len(),
+                EditKind::Other,
+                cx,
+            );
         } else {
             self.shift_lines(true, cx);
         }
@@ -1420,49 +1456,9 @@ impl CodeEditor {
             self.shift_lines(false, cx);
         }
     }
-    /// Indent/outdent every line the selection touches by one unit (2 spaces).
+    /// Indent/outdent selected lines using the file's indentation style.
     fn shift_lines(&mut self, indent: bool, cx: &mut Context<Self>) {
-        let unit = "  ";
-        let (s, e) = (self.selected_range.start, self.selected_range.end);
-        let region_start = self.content[..s].rfind('\n').map_or(0, |i| i + 1);
-        let region_end = self.content[e..]
-            .find('\n')
-            .map_or(self.content.len(), |i| e + i);
-        let region = self.content[region_start..region_end].to_string();
-        let mut out = String::new();
-        for (i, line) in region.split('\n').enumerate() {
-            if i > 0 {
-                out.push('\n');
-            }
-            if indent {
-                out.push_str(unit);
-                out.push_str(line);
-            } else {
-                let strip = if line.starts_with(unit) {
-                    2
-                } else {
-                    usize::from(line.starts_with(' ') || line.starts_with('\t'))
-                };
-                out.push_str(&line[strip..]);
-            }
-        }
-        self.record_undo(EditKind::Other);
-        self.content = format!(
-            "{}{}{}",
-            &self.content[..region_start],
-            out,
-            &self.content[region_end..]
-        );
-        self.selected_range = region_start..(region_start + out.len());
-        self.selection_reversed = false;
-        self.finish_indent(cx);
-    }
-    fn finish_indent(&mut self, cx: &mut Context<Self>) {
-        self.marked_range = None;
-        self.last_edit = EditKind::Other;
-        self.dirty = true;
-        cx.notify();
-        cx.emit(EditorEvent::Changed);
+        self.change_line_indent(indent, cx);
     }
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
@@ -1479,9 +1475,14 @@ impl CodeEditor {
             self.replace_text_in_range(None, "", window, cx);
         }
     }
-    fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+    fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
-            self.replace_text_in_range(None, &text, window, cx);
+            let range = self
+                .marked_range
+                .clone()
+                .unwrap_or(self.selected_range.clone());
+            let caret = range.start + text.len();
+            self.edit_text(range, &text, caret..caret, EditKind::Other, cx);
         }
     }
 
@@ -1996,6 +1997,9 @@ impl EntityInputHandler for CodeEditor {
             .map(|r| self.range_from_utf16(r))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
+        if range_utf16.is_none() && self.marked_range.is_none() && self.smart_type(new_text, cx) {
+            return;
+        }
         // A single character typed over a collapsed caret = a "Type" run (coalesces);
         // everything else (paste, delete, newline, replacing a selection) is its own step.
         let kind = if range.start == range.end && new_text != "\n" && new_text.chars().count() == 1
@@ -2004,17 +2008,8 @@ impl EntityInputHandler for CodeEditor {
         } else {
             EditKind::Other
         };
-        self.record_undo(kind);
-        self.content =
-            self.content[..range.start].to_owned() + new_text + &self.content[range.end..];
         let caret = range.start + new_text.len();
-        self.selected_range = caret..caret;
-        self.marked_range = None;
-        self.dirty = true;
-        self.recompute_folds(cx);
-        self.restart_blink(cx);
-        cx.notify();
-        cx.emit(EditorEvent::Changed);
+        self.edit_text(range, new_text, caret..caret, kind, cx);
         self.schedule_completion(new_text, cx);
     }
     fn replace_and_mark_text_in_range(
@@ -2039,6 +2034,7 @@ impl EntityInputHandler for CodeEditor {
         }
         self.content =
             self.content[..range.start].to_owned() + new_text + &self.content[range.end..];
+        self.auto_pairs.clear();
         self.marked_range =
             (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
         self.selected_range = new_sel_utf16
@@ -2060,6 +2056,7 @@ impl EntityInputHandler for CodeEditor {
                 },
             );
         self.dirty = true;
+        self.reveal_pending = true;
         self.recompute_folds(cx);
         cx.notify();
         cx.emit(EditorEvent::Changed);
@@ -2157,6 +2154,8 @@ impl Render for CodeEditor {
             .on_action(cx.listener(Self::right))
             .on_action(cx.listener(Self::home))
             .on_action(cx.listener(Self::end))
+            .on_action(cx.listener(Self::select_home))
+            .on_action(cx.listener(Self::select_end))
             .on_action(cx.listener(Self::select_left))
             .on_action(cx.listener(Self::select_right))
             .on_action(cx.listener(Self::select_all))
@@ -2188,6 +2187,10 @@ impl Render for CodeEditor {
                     .on_action(cx.listener(Self::enter))
                     .on_action(cx.listener(Self::indent))
                     .on_action(cx.listener(Self::outdent))
+                    .on_action(cx.listener(Self::buffer_home))
+                    .on_action(cx.listener(Self::buffer_end))
+                    .on_action(cx.listener(Self::select_buffer_home))
+                    .on_action(cx.listener(Self::select_buffer_end))
                     // Held ↑/↓ → accelerating auto-repeat (OS key-repeat wasn't moving).
                     .on_key_down(cx.listener(Self::on_key_down_nav))
                     .on_key_up(cx.listener(Self::on_key_up_nav))
